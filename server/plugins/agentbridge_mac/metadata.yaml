@@ -1,0 +1,4 @@
+name: agentbridge_mac
+desc: 把 /mac 指令路由到本机执行器（AgentBridge → Mac 上的 DSH agent）
+author: agentbridge
+version: 0.1.0

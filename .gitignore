@@ -1,0 +1,17 @@
+/*
+!/.gitignore
+!/worker.py
+!/shim.py
+!/test_*.py
+!/tools/
+/tools/*
+!/tools/*.py
+!/server/
+/server/*
+!/server/plugins/
+/server/plugins/*
+!/server/plugins/agentbridge_mac/
+/server/plugins/agentbridge_mac/*
+!/server/plugins/agentbridge_mac/main.py
+!/server/plugins/agentbridge_mac/metadata.yaml
+!/IMPLEMENTATION-20261026.md
