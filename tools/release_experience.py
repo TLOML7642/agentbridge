@@ -19,8 +19,10 @@ import urllib.error
 import urllib.request
 
 ROOT = Path('/opt/agentbridge')
-STAGE = Path('/var/tmp/agentbridge-stability-experience')
-BACKUP = Path('/var/backups/agentbridge/20261026-stability-experience')
+RELEASE_ID = os.environ.get('AGENTBRIDGE_RELEASE_ID', '20261026-stability-experience')
+assert re.fullmatch(r'[a-z0-9-]+', RELEASE_ID), 'Invalid release identifier'
+STAGE = Path('/var/tmp/agentbridge-stability-experience') if RELEASE_ID == '20261026-stability-experience' else Path('/var/tmp/agentbridge-' + RELEASE_ID)
+BACKUP = Path('/var/backups/agentbridge') / RELEASE_ID
 MAPPING = {'shim.py': ROOT / 'shim/shim.py',
            'main.py': ROOT / 'astrbot/data/plugins/agentbridge_mac/main.py'}
 EXPECTED = {
@@ -40,6 +42,19 @@ def run(args, **kwargs):
 
 def containers():
     return json.loads(run(['docker', 'inspect', 'agentbridge-astrbot', 'agentbridge-shim']))
+
+
+def runtime():
+    rows = containers()
+    env = dict(value.split('=', 1) for row in reversed(rows)
+               for value in row['Config']['Env'] if '=' in value)
+    cfg = json.loads((ROOT / 'astrbot/data/cmd_config.json').read_text(encoding='utf-8-sig'))
+    actors = [s.strip() for s in env.get('AGENTBRIDGE_ALLOWED_SENDERS', '').split(',') if s.strip()]
+    assert actors, 'No explicitly allowed actor for release probes'
+    channels = cfg.get('platform_settings', {}).get('id_whitelist', [])
+    # Maintenance probes are not WeChat messages or notification subscriptions.
+    channel = channels[0] if channels else 'agentbridge-release-readonly'
+    return rows, env, {'X-AgentBridge-Sender': actors[0], 'X-AgentBridge-Channel': channel}
 
 
 def manifest():
@@ -133,10 +148,7 @@ def request(url, token, body=None, headers=None, timeout=12):
 
 def probe():
     invariant()
-    spec = importlib.util.spec_from_file_location('previous_release', '/var/tmp/agentbridge-s1-s5-validation/release/server_release.py')
-    previous = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(previous)
-    rows, env, headers = previous.runtime()
+    rows, env, headers = runtime()
     assert all(row['State']['Running'] and not row['State']['OOMKilled'] for row in rows)
     url = 'http://127.0.0.1:8787/v1/agentbridge/control'
     checks = {}
@@ -164,11 +176,8 @@ def probe():
 
 
 def readonly():
-    spec = importlib.util.spec_from_file_location('previous_release', '/var/tmp/agentbridge-s1-s5-validation/release/server_release.py')
-    previous = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(previous)
-    _, env, headers = previous.runtime()
-    job_id = 'release-20261026-experience-readonly'
+    _, env, headers = runtime()
+    job_id = 'release-' + RELEASE_ID + '-readonly'
     headers.update({'X-AgentBridge-Job-Id': job_id, 'X-AgentBridge-Id-Stable': '1'})
     body = {'model': 'agentbridge', 'messages': [{'role': 'user', 'content':
             '只读核验：报告 macOS 系统类型和 /etc/hosts 的行数。仅查询，只返回这两项摘要，不输出文件正文。'}]}
@@ -196,6 +205,8 @@ def readonly():
 
 def enable_notifications():
     invariant()
+    cfg = json.loads((ROOT / 'astrbot/data/cmd_config.json').read_text(encoding='utf-8-sig'))
+    assert cfg.get('platform_settings', {}).get('id_whitelist'), 'No notification context is explicitly allowed'
     path = ROOT / 'compose.yaml'
     assert digest(path) == manifest()['files'][str(path)]['sha256'], 'Concurrent compose edit'
     text = path.read_text()

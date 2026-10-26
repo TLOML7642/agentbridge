@@ -4,13 +4,16 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import sqlite3
 import subprocess
 import sys
 
 HOME = Path.home()
 ROOT = HOME / 'agentbridge'
-BACKUP = HOME / '.local/share/agentbridge-releases/20261026-stability-experience'
+RELEASE_ID = os.environ.get('AGENTBRIDGE_RELEASE_ID', '20261026-stability-experience')
+assert re.fullmatch(r'[a-z0-9-]+', RELEASE_ID), 'Invalid release identifier'
+BACKUP = HOME / '.local/share/agentbridge-releases' / RELEASE_ID
 PLIST = HOME / 'Library/LaunchAgents/com.agentbridge.worker.plist'
 LABEL = f'gui/{os.getuid()}/com.agentbridge.worker'
 

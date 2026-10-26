@@ -60,6 +60,16 @@ class TestReleasePreconditions(unittest.TestCase):
             release.install()
         self.assertEqual((self.live / 'shim.py').read_text(), 'VERSION = 1\n')
 
+    def test_empty_whitelist_does_not_invent_notification_context(self):
+        config = self.live / 'astrbot/data/cmd_config.json'
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({'platform_settings': {'id_whitelist': []}}))
+        self.rows[0]['Config']['Env'] = ['AGENTBRIDGE_ALLOWED_SENDERS=synthetic-owner']
+        _, _, headers = release.runtime()
+        self.assertEqual(headers['X-AgentBridge-Channel'], 'agentbridge-release-readonly')
+        with self.assertRaisesRegex(AssertionError, 'No notification context'):
+            release.enable_notifications()
+
 
 if __name__ == '__main__':
     unittest.main()
