@@ -9,6 +9,11 @@
 !/server/
 /server/*
 !/server/plugins/
+!/server/docker_control/
+/server/docker_control/*
+!/server/docker_control/agentbridge_set_credentials.sh
+!/server/docker_control/agentbridge_set_password.sh
+!/server/docker_control/agentbridge_reset_password.sh
 /server/plugins/*
 !/server/plugins/agentbridge_mac/
 /server/plugins/agentbridge_mac/*
