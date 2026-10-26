@@ -81,6 +81,7 @@ CONFIRM_TTL = int(os.environ.get("AGENTBRIDGE_CONFIRM_TTL", "300"))
 PRIV_PLAN_TTL = int(os.environ.get("AGENTBRIDGE_PRIV_PLAN_TTL", "1800"))
 # HTTP 连接读写时限（秒）：防止慢速客户端长期占用服务线程
 HTTP_TIMEOUT = int(os.environ.get("AGENTBRIDGE_HTTP_TIMEOUT", "30"))
+RUNNING_CANCEL_ENABLED = os.environ.get("AGENTBRIDGE_RUNNING_CANCEL", "0") == "1"
 
 # 允许的来源通道。非空时请求必须携带白名单内的 channel，缺失同样拒绝，
 # 不能用「缺字段」表示无限制。
@@ -283,6 +284,16 @@ CREATE TABLE IF NOT EXISTS control_receipts (
     response TEXT,
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS attempts (
+    attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, status TEXT NOT NULL,
+    created_at REAL NOT NULL, started_at REAL, ended_at REAL, cancel_requested_at REAL
+);
+CREATE TABLE IF NOT EXISTS completion_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+    job_id TEXT NOT NULL, attempt_id TEXT NOT NULL, sender TEXT, channel TEXT,
+    status TEXT NOT NULL, created_at REAL NOT NULL, elapsed_seconds REAL,
+    UNIQUE(job_id, attempt_id)
+);
 """
 
 
@@ -313,6 +324,7 @@ class DB:
         """补齐执行器身份、启动状态与隔离路径；旧身份缺失记录保持保守。"""
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)")}
         for col, decl in (("sender", "TEXT"), ("task_digest", "TEXT"), ("kind", "TEXT"), ("lock_key", "TEXT"),
+                          ("attempt_id", "TEXT"), ("cancel_requested_at", "REAL"),
                           ("exec_pgid", "INTEGER"), ("exec_boot", "TEXT"),
                           ("exec_identity", "TEXT"),
                           ("exec_state", "TEXT NOT NULL DEFAULT 'unknown'")):
@@ -336,6 +348,25 @@ class DB:
             "(SELECT cwd FROM jobs WHERE jobs.lock_key=quarantine.lock_key AND cwd IS NOT NULL LIMIT 1),"
             "(SELECT normalized FROM projects WHERE projects.lock_key=quarantine.lock_key LIMIT 1)) "
             "WHERE cwd IS NULL")
+        # Triggers keep terminal state and event atomic, including crash recovery and expiry.
+        self._conn.executescript("""
+        CREATE TRIGGER IF NOT EXISTS attempt_lifecycle AFTER UPDATE ON jobs
+        WHEN NEW.attempt_id IS NOT NULL BEGIN
+          UPDATE attempts SET status=NEW.status, started_at=NEW.started_at,
+            ended_at=NEW.ended_at, cancel_requested_at=NEW.cancel_requested_at
+          WHERE attempt_id=NEW.attempt_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS completion_event AFTER UPDATE OF status ON jobs
+        WHEN OLD.status IN ('queued','running','pending-confirm')
+          AND NEW.status IN ('done','failed','cancelled','uncertain') BEGIN
+          INSERT OR IGNORE INTO completion_events
+            (event_id,job_id,attempt_id,sender,channel,status,created_at,elapsed_seconds)
+          VALUES (lower(hex(randomblob(16))),NEW.job_id,
+            COALESCE(NEW.attempt_id,'pending:'||NEW.job_id),NEW.sender,NEW.channel,NEW.status,
+            COALESCE(NEW.ended_at,strftime('%s','now')),
+            max(0,COALESCE(NEW.ended_at,strftime('%s','now'))-COALESCE(NEW.started_at,NEW.created_at)));
+        END;
+        """)
 
     def execute(self, sql: str, args: tuple = ()):
         with self._lock:
@@ -594,13 +625,17 @@ class ResourceGate:
             self._cv.notify_all()
             return ticket
 
-    def enter(self, ticket: _Ticket) -> None:
+    def enter(self, ticket: _Ticket, cancelled=None) -> None:
         """阻塞直到轮到该票据并获得持有权。"""
         with self._cv:
             try:
                 # 双条件：无人持有，且自己是队首（按序 FIFO + 互斥）
                 while self._owner is not None or self._waiters[0] is not ticket:
-                    self._cv.wait()
+                    if cancelled is not None and cancelled.is_set():
+                        raise _CancelledStart()
+                    self._cv.wait(0.05)
+                if cancelled is not None and cancelled.is_set():
+                    raise _CancelledStart()
             except BaseException:
                 self.abandon(ticket)
                 raise
@@ -658,13 +693,15 @@ class Scheduler:
                 self._gates[key] = ResourceGate()
             return self._gates[key]
 
-    def begin_running(self) -> None:
+    def begin_running(self, cancelled=None) -> None:
         """取得全局运行名额，并立即归还等待位。
 
         释放等待位是关键：排队上限只统计「等待中」的任务，不含运行中的，
         否则长任务会把排队名额长期占用，使队列上限失去意义。
         """
-        self._sem.acquire()
+        while not self._sem.acquire(timeout=0.05):
+            if cancelled is not None and cancelled.is_set():
+                raise _CancelledStart()
         self.release_reservation()
 
     def end_running(self) -> None:
@@ -722,6 +759,10 @@ class _ProcBSDInfo(ctypes.Structure):
 
 def _executor_identity(pgid: int) -> str | None:
     """Read the group leader's OS birth identity; uncertainty never authorizes kill."""
+    return _process_identity(pgid, pgid)
+
+
+def _process_identity(pid: int, pgid: int) -> str | None:
     try:
         if sys.platform == "darwin":
             libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
@@ -731,22 +772,64 @@ def _executor_identity(pgid: int) -> str | None:
             query.restype = ctypes.c_int
             info = _ProcBSDInfo()
             size = ctypes.sizeof(info)
-            if query(pgid, 3, 0, ctypes.byref(info), size) != size:
+            if query(pid, 3, 0, ctypes.byref(info), size) != size:
                 return None
-            if info.pid != pgid or info.pgid != pgid:
+            if info.pid != pid or info.pgid != pgid:
                 return None
-            return f"darwin:{pgid}:{info.start_sec}:{info.start_usec}"
+            return f"darwin:{pid}:{info.start_sec}:{info.start_usec}"
         if sys.platform.startswith("linux"):
-            with open(f"/proc/{pgid}/stat", encoding="ascii") as fh:
+            with open(f"/proc/{pid}/stat", encoding="ascii") as fh:
                 fields = fh.read().rsplit(")", 1)[1].split()
             if int(fields[2]) != pgid:  # field 5: process group
                 return None
             with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
                 boot = fh.read().strip()
-            return f"linux:{boot}:{pgid}:{fields[19]}"  # field 22: start ticks
+            return f"linux:{boot}:{pid}:{fields[19]}"  # field 22: start ticks
     except (OSError, ValueError, IndexError, AttributeError):
         pass
     return None
+
+
+def _group_members(pgid: int) -> dict:
+    try:
+        output = subprocess.check_output(["ps", "-axo", "pid=,pgid="], text=True, timeout=2)
+        members = {}
+        for line in output.splitlines():
+            pid, group = map(int, line.split())
+            if group == pgid:
+                identity = _process_identity(pid, pgid)
+                if identity:
+                    members[pid] = identity
+        return members
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
+def _stop_owned_group(pgid: int, members: dict) -> bool:
+    """Only the executor supervisor signals a still-identifiable owned group."""
+    for sig, seconds in ((signal.SIGTERM, 5), (signal.SIGKILL, 2)):
+        if not _group_alive(pgid):
+            return True
+        current = _group_members(pgid)
+        if not any(current.get(pid) == identity for pid, identity in members.items()):
+            return False
+        members.update(current)
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if not _group_alive(pgid):
+                return True
+            time.sleep(0.05)
+    return not _group_alive(pgid)
+
+
+class _CancelledStart(Exception):
+    pass
 
 
 _EXEC_GATE = (
@@ -774,7 +857,8 @@ def _supervise_group(pgid: int, deadline: float) -> bool:
     return True
 
 
-def run_task(cmd: list[str], cwd: str, timeout: int, on_start=None) -> dict:
+def run_task(cmd: list[str], cwd: str, timeout: int, on_start=None,
+             on_release=None, cancel_check=None) -> dict:
     """执行子进程，超时回收整个进程组，返回有界输出与峰值内存。
 
     采集上限：stdout 保留至多 CAPTURE_MAX 字节、stderr 至多 STDERR_MAX
@@ -818,6 +902,7 @@ def run_task(cmd: list[str], cwd: str, timeout: int, on_start=None) -> dict:
     # 先记下初始 PGID：父进程被回收后 os.getpgid(pid) 会失败，
     # 而组可能仍有忽略 SIGTERM 的后代存活。
     pgid = proc.pid
+    owner_identity = _executor_identity(pgid)
     try:
         if on_start is not None:
             on_start(pgid)
@@ -872,7 +957,10 @@ def run_task(cmd: list[str], cwd: str, timeout: int, on_start=None) -> dict:
         for t in readers:
             t.start()
         waiter.start()
-        os.write(gate_write, b"1")
+        if on_release is None:
+            os.write(gate_write, b"1")
+        else:
+            on_release(lambda: os.write(gate_write, b"1"))
     except BaseException:
         _killpg(pgid, signal.SIGKILL)
         if waiter.ident is not None:
@@ -890,25 +978,45 @@ def run_task(cmd: list[str], cwd: str, timeout: int, on_start=None) -> dict:
     finally:
         os.close(gate_write)
     deadline = time.monotonic() + timeout
-    waiter.join(timeout)
-
     timed_out = False
     group_reaped = False
-    if waiter.is_alive():
+    cancelled = False
+    group_stopped = True
+    if cancel_check is not None:
+        members = {pgid: owner_identity} if owner_identity is not None else {}
+        while True:
+            if cancel_check():
+                cancelled = True
+                group_stopped = _stop_owned_group(pgid, members)
+                waiter.join(2)
+                break
+            if not waiter.is_alive() and not _group_alive(pgid):
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                group_stopped = _stop_owned_group(pgid, members)
+                waiter.join(2)
+                break
+            # Keep identities of descendants while the registered group is still owned.
+            current = _group_members(pgid)
+            if any(current.get(pid) == identity for pid, identity in members.items()):
+                members.update(current)
+            time.sleep(0.05)
+    else:
+        waiter.join(timeout)
+    if cancel_check is None and waiter.is_alive():
         timed_out = True
         _killpg(pgid, signal.SIGTERM)
         waiter.join(5)
         # 无论直接父进程是否已退出，都探测并强杀整个组：
         # 父进程先死、后代忽略 SIGTERM 时，waiter 已返回但组仍存活。
-        # （组探测+kill 之间存在极小的 PID 复用窗口，此处选择宁可误杀
-        # 复用组也不放过残留进程。）
         try:
             os.killpg(pgid, 0)
             _killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
         waiter.join(5)
-    else:
+    elif cancel_check is None:
         # 父进程正常退出 ≠ 任务结束：同组的普通后台后代仍在期限预算内
         # 运行、持有输出管道、可能继续改文件。一次性任务语义下监督整组
         # 到期限；逾期先 TERM 后 KILL。有意常驻的服务需等显式登记机制，
@@ -945,6 +1053,8 @@ def run_task(cmd: list[str], cwd: str, timeout: int, on_start=None) -> dict:
         "out_truncated": drained["out"] > capture_out,
         "err_truncated": drained["err"] > capture_err,
         "group_reaped": group_reaped,
+        "cancelled": cancelled,
+        "group_stopped": group_stopped,
     }
 
 
@@ -1032,7 +1142,8 @@ class App:
         # 接纳线性化锁：数据库认领 + 项目复核 + 取号 + 入队 + 粘性写
         # 在同一临界区内完成，保证「接纳顺序 = 执行顺序 = 路由生效顺序」
         # （同资源）。锁只持有到入队完成，不跨实际执行。
-        self._admit_lock = threading.Lock()
+        self._admit_lock = threading.RLock()
+        self._cancellations = {}
         # 项目注册/改绑/删除的检查与写入同锁（内部再取 admit 锁与任务
         # 接纳协调，锁序固定 projects → admit），防止并发绕过重叠检查
         self._projects_lock = threading.Lock()
@@ -1095,14 +1206,15 @@ class App:
         """
         now = time.time()
         rows = self.db.query(
-            "SELECT job_id, project, cwd, lock_key, exec_pgid, exec_identity, exec_state "
+            "SELECT job_id, project, cwd, lock_key, exec_pgid, exec_identity, exec_state,cancel_requested_at "
             "FROM jobs WHERE status IN ('queued','running')")
         for r in rows:
             verdict = self._settle_stale_executor(r)
+            cancelled = r["cancel_requested_at"] is not None and verdict in ("dead", "killed")
             self.db.execute(
-                "UPDATE jobs SET status='uncertain', error_code='INTERRUPTED', "
+                "UPDATE jobs SET status=?, error_code='INTERRUPTED', "
                 "ended_at=? WHERE job_id=? AND status IN ('queued','running')",
-                (now, r["job_id"]),
+                ("cancelled" if cancelled else "uncertain", now, r["job_id"]),
             )
             self.audit.write({
                 "job_id": r["job_id"], "project": r["project"],
@@ -1119,9 +1231,7 @@ class App:
             return "dead"
         identity = row["exec_identity"]
         if pgid and identity and _executor_identity(pgid) == identity:
-            _killpg(pgid, signal.SIGKILL)
-            time.sleep(0.2)
-            if not _group_alive(pgid):
+            if _stop_owned_group(pgid, {pgid: identity}):
                 return "killed"
         # Missing legacy identity, absent leader, or a reused PID is never kill authority.
         self.db.execute(
@@ -1171,11 +1281,12 @@ class App:
                 "(SELECT job_id FROM pending WHERE expires_at > ?)",
                 (now, now),
             )
-            conn.execute(
-                "DELETE FROM jobs WHERE (ended_at IS NOT NULL AND ended_at < ?) "
-                "OR (ended_at IS NULL AND created_at < ?)", (cutoff, cutoff))
+            conn.execute("DELETE FROM jobs WHERE status IN ('done','failed','cancelled','uncertain') "
+                         "AND ended_at < ?", (cutoff,))
             conn.execute("DELETE FROM pending WHERE expires_at < ?", (now,))
             conn.execute("DELETE FROM aliases WHERE created_at < ?", (cutoff,))
+            conn.execute("DELETE FROM completion_events WHERE created_at < ?", (now - 7 * 86400,))
+            conn.execute("DELETE FROM attempts WHERE ended_at < ?", (now - 7 * 86400,))
 
     def get_job(self, job_id: str) -> dict | None:
         """按 job_id 查询任务状态/结果（供 shim 轮询）。
@@ -1358,6 +1469,7 @@ def _snap_from_row(row) -> dict:
         "job_id": row["job_id"],
         "channel": row["channel"] or "",
         "sender": row["sender"] or "",
+        "attempt_id": row["attempt_id"],
         "project": row["project"],
         "cwd": row["cwd"],
         "lock_key": row["lock_key"] or (lock_key_for(row["cwd"]) if row["cwd"] else ""),
@@ -1380,6 +1492,7 @@ def _busy_response(row, message: str | None = None) -> dict:
 
 def _check_source(row, sender: str, channel: str) -> None:
     if ((row["channel"] or "") != channel
+            or (sender and not row["sender"])
             or (row["sender"] and row["sender"] != sender)):
         raise AgentBridgeError("AUTH_FAIL", "来源与任务发起者或会话不一致")
 
@@ -1390,13 +1503,32 @@ def _control_job(app: App, job_id: str, sender: str, channel: str):
         alias = app.db.one("SELECT job_id FROM aliases WHERE alias=?", (job_id,))
         if alias:
             row = app.db.one("SELECT * FROM jobs WHERE job_id=?", (alias["job_id"],))
-    if row is None:
-        raise AgentBridgeError("NOT_FOUND", "任务不存在")
-    _check_source(row, sender, channel)
-    return row
+    if row is not None:
+        if not row["sender"] or not row["channel"]:
+            raise AgentBridgeError("AUTH_FAIL", "旧任务缺少可信来源，只能在本机人工核查")
+        _check_source(row, sender, channel)
+        return row
+    if len(job_id) >= 8:
+        rows = app.db.query(
+            "SELECT DISTINCT j.* FROM jobs j LEFT JOIN aliases a ON a.job_id=j.job_id "
+            "WHERE j.sender=? AND j.channel=? AND "
+            "(substr(j.job_id,1,?)=? OR substr(a.alias,1,?)=?)",
+            (sender, channel, len(job_id), job_id, len(job_id), job_id))
+        if len(rows) > 1:
+            raise AgentBridgeError("AMBIGUOUS_ID", "短 ID 不唯一，请提供更长 ID")
+        if rows:
+            return rows[0]
+    raise AgentBridgeError("NOT_FOUND", "任务不存在或来源不匹配；短 ID 至少 8 位")
 
 
-CONTROL_OPS = frozenset(("status", "confirm", "force", "project.add", "project.rm", "project.list", "use"))
+CONTROL_FIELDS = {
+    "status": {"job_id"}, "status.batch": {"job_ids"}, "jobs": set(), "pending": set(), "diag": set(),
+    "confirm": {"token", "delivery_id"}, "force": {"job_id", "delivery_id"},
+    "deny": {"job_id", "delivery_id"}, "cancel": {"job_id", "delivery_id"},
+    "project.add": {"name", "dir", "delivery_id"}, "project.rm": {"name", "delivery_id"},
+    "project.list": set(), "use": {"project", "delivery_id"},
+}
+CONTROL_OPS = frozenset(CONTROL_FIELDS)
 
 
 def do_control(app: App, payload: dict) -> dict:
@@ -1407,12 +1539,33 @@ def do_control(app: App, payload: dict) -> dict:
     op = payload.get("op")
     if op not in CONTROL_OPS:
         raise AgentBridgeError("EXEC_FAIL", "不支持的控制操作")
+    if set(payload) - CONTROL_FIELDS[op] - {"op", "sender", "channel"}:
+        raise AgentBridgeError("EXEC_FAIL", "控制请求含非白名单字段")
+    if any(not isinstance(value, str) for key, value in payload.items() if key != "job_ids"):
+        raise AgentBridgeError("EXEC_FAIL", "控制字段类型错误")
     job_id = str(payload.get("job_id") or "").strip()
-    if op == "status":
+    if op == "diag":
+        return {"ok": True, "worker": "healthy", "healthy_at": time.time(),
+                "event_seq": app.db.one("SELECT COALESCE(max(seq),0) AS seq FROM completion_events WHERE sender=? AND channel=?", (sender, channel))["seq"],
+                "message": "worker 当前可达；手机收取状态未知。", "running_cancel_enabled": RUNNING_CANCEL_ENABLED}
+    if op == "status.batch":
+        ids = payload.get("job_ids")
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or any(not isinstance(i, str) or not i for i in ids):
+            raise AgentBridgeError("EXEC_FAIL", "批量查询须提供 1 至 50 个任务 ID")
+        rows = [_control_job(app, value, sender, channel) for value in ids]
+        return {"ok": True, "jobs": [{**_job_response(app, row), "requested_id": value}
+                                      for value, row in zip(ids, rows)]}
+    if op == "pending":
+        rows = app.db.query("SELECT j.job_id,j.project,j.status,p.expires_at FROM jobs j "
+                            "JOIN pending p ON p.job_id=j.job_id WHERE j.sender=? AND j.channel=? "
+                            "AND j.status='pending-confirm' AND p.expires_at>? ORDER BY j.created_at DESC",
+                            (sender, channel, time.time()))
+        return {"ok": True, "pending": [{**dict(r), "remaining_seconds": max(0, int(r["expires_at"] - time.time()))} for r in rows]}
+    if op in ("status", "jobs"):
         if job_id:
             return _job_response(app, _control_job(app, job_id, sender, channel))
         recent = app.db.query(
-            "SELECT job_id,project,status FROM jobs WHERE channel=? AND (sender=? OR sender IS NULL OR sender='') "
+            "SELECT job_id,project,status FROM jobs WHERE channel=? AND sender=? "
             "ORDER BY created_at DESC LIMIT 10", (channel, sender))
         return {"ok": True, "current": app.current_project(channel),
                 "recent": [dict(row) for row in recent]}
@@ -1437,18 +1590,20 @@ def do_control(app: App, payload: dict) -> dict:
                 return _job_response(app, _control_job(app, alias["job_id"], sender, channel), reused=True)
             return {"ok": False, "code": "CONTROL_UNKNOWN", "reused": True,
                     "message": "原控制操作结果未知，不会重复授权；请先查询状态。"}
-        if op == "force":
+        if op in ("force", "deny", "cancel"):
             row = _control_job(app, job_id, sender, channel)
-            if row["status"] != "uncertain":
+            if op == "force" and row["status"] != "uncertain":
                 raise AgentBridgeError("EXEC_FAIL", "仅可显式重跑 uncertain 任务")
         if op == "confirm" and not str(payload.get("token") or "").strip():
             raise AgentBridgeError("AUTH_FAIL", "缺少确认令牌")
         # Durable intent before side effects. After a crash, an incomplete receipt fails closed.
         app.db.execute("INSERT INTO control_receipts VALUES (?,?,?,?,?,?,?)",
-                       (delivery, digest, sender, channel, row["job_id"] if op == "force" else None, None, time.time()))
+                       (delivery, digest, sender, channel, row["job_id"] if op in ("force", "deny", "cancel") else None, None, time.time()))
         try:
             if op == "force":
                 result = _rerun_uncertain(app, row, row["task"], wait=False)
+            elif op in ("deny", "cancel"):
+                result = _cancel_job(app, row, op == "deny")
             elif op == "confirm":
                 result = do_execute(app, {"task": "confirm", "sender": sender, "channel": channel,
                     "confirm": str(payload["token"]), "job_id": delivery, "wait": False})
@@ -1472,6 +1627,34 @@ def do_control(app: App, payload: dict) -> dict:
         app.db.execute("UPDATE control_receipts SET job_id=?,response=? WHERE delivery_id=?",
                        (result.get("job_id"), json.dumps(result, ensure_ascii=False), delivery))
         return result
+
+
+def _cancel_job(app: App, original, deny: bool) -> dict:
+    with app._admit_lock:
+        with app.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (original["job_id"],)).fetchone()
+            if row["attempt_id"] != original["attempt_id"]:
+                raise AgentBridgeError("EXEC_FAIL", "执行尝试已变化，请重新查询后明确取消")
+            if deny and row["status"] != "pending-confirm":
+                raise AgentBridgeError("EXEC_FAIL", "只能拒绝待确认任务，状态已变化")
+            if row["status"] in ("done", "failed", "cancelled", "uncertain"):
+                return {"ok": True, "job_id": row["job_id"], "status": row["status"],
+                        "message": "任务已结束，未提交新的取消。"}
+            if row["status"] == "running" and not RUNNING_CANCEL_ENABLED:
+                raise AgentBridgeError("EXEC_FAIL", "运行中取消尚未启用，任务继续执行")
+            now = time.time()
+            conn.execute("UPDATE jobs SET cancel_requested_at=COALESCE(cancel_requested_at,?) WHERE job_id=?", (now, row["job_id"]))
+            if row["status"] in ("pending-confirm", "queued"):
+                conn.execute("DELETE FROM pending WHERE job_id=?", (row["job_id"],))
+                conn.execute("UPDATE jobs SET status='cancelled',ended_at=?,error_code='CANCELLED',"
+                             "result='任务已取消；取消不撤销已经发生的副作用。' WHERE job_id=?", (now, row["job_id"]))
+            wake = app._cancellations.get(row["attempt_id"])
+            if wake is not None:
+                wake.set()
+    result = _job_response(app, app.db.one("SELECT * FROM jobs WHERE job_id=?", (row["job_id"],)))
+    if result["status"] == "running":
+        result.update(ok=True, code="CANCEL_REQUESTED", message="正在取消；尚未确认执行器停止。取消不撤销已发生的副作用。")
+    return result
 
 
 def do_execute(app: App, payload: dict) -> dict:
@@ -1622,6 +1805,12 @@ def _admit_and_enqueue(app: App, snap: dict, claim, sticky: bool = True) -> None
         _validate_admission(app, snap)
         with app.db.transaction() as conn:
             claim(conn)
+            snap["attempt_id"] = uuid.uuid4().hex
+            conn.execute("UPDATE jobs SET attempt_id=?,cancel_requested_at=NULL WHERE job_id=?",
+                         (snap["attempt_id"], snap["job_id"]))
+            conn.execute("INSERT INTO attempts(attempt_id,job_id,status,created_at) VALUES (?,?,'queued',?)",
+                         (snap["attempt_id"], snap["job_id"], time.time()))
+        app._cancellations[snap["attempt_id"]] = threading.Event()
         try:
             snap["seq"] = app.next_seq()
             snap["ticket"] = app.sched.resource_gate(snap["lock_key"]).enqueue(snap["seq"])
@@ -1632,6 +1821,7 @@ def _admit_and_enqueue(app: App, snap: dict, claim, sticky: bool = True) -> None
             # 否则队首票据无人认领，同资源后继任务永久阻塞
             if snap.get("ticket") is not None:
                 app.sched.resource_gate(snap["lock_key"]).abandon(snap["ticket"])
+            app._cancellations.pop(snap.get("attempt_id"), None)
             # The caller still owns the reservation until _finish_acceptance.
             _fail_job(app, snap, f"接纳中断：{type(exc).__name__}")
             raise
@@ -1663,15 +1853,15 @@ def _finish_acceptance(app: App, snap: dict, wait: bool,
             return _run_claimed(app, snap)
         threading.Thread(target=_run_claimed, args=(app, snap), daemon=True).start()
         handed_off = True
-        return {
-            "ok": True, "code": "ACCEPTED", "job_id": snap["job_id"],
-            "project": snap["project"], "backend": "dsh", "status": "queued",
-            "message": "任务已接纳，正在排队执行；可随时以相同 job_id 查询结果。",
-        }
+        result = _job_response(app, app.db.one("SELECT * FROM jobs WHERE job_id=?", (snap["job_id"],)))
+        if result["status"] in ("queued", "running"):
+            result.update(ok=True, code="ACCEPTED", message="任务已接纳，可用原 ID 查询；完成通知取决于订阅及发送 API 状态。")
+        return result
     except BaseException as exc:
         if not handed_off:
             app.sched.resource_gate(snap["lock_key"]).abandon(snap["ticket"])
             app.sched.release_reservation()
+            app._cancellations.pop(snap.get("attempt_id"), None)
             _fail_job(app, snap, f"派发失败：{type(exc).__name__}")
         raise
 
@@ -1905,10 +2095,11 @@ def _run_claimed(app: App, snap: dict) -> dict:
         ticket = gate.enqueue(snap.get("seq") or app.next_seq())
     entered = False
     began = False
+    cancelled = app._cancellations.get(snap.get("attempt_id"))
     try:
-        gate.enter(ticket)  # 同资源按接纳序号 FIFO
+        gate.enter(ticket, cancelled)  # 同资源按接纳序号 FIFO
         entered = True
-        app.sched.begin_running()
+        app.sched.begin_running(cancelled)
         began = True
         app.sched.mark_running(snap["job_id"], {
             "job_id": snap["job_id"], "project": snap["project"], "started": time.time(),
@@ -1932,12 +2123,16 @@ def _run_claimed(app: App, snap: dict) -> dict:
                     "只产出计划与命令，不执行。）\n" + final_task
                 )
             cmd, mode, _patch = build_cmd(final_task, kind)
-            app.db.execute(
-                "UPDATE jobs SET status='running', started_at=?, kind=?, sandbox_mode=?, "
-                "exec_pgid=NULL,exec_identity=NULL,exec_boot=?,exec_state='starting' "
-                "WHERE job_id=?",
-                (time.time(), kind, mode, app.boot_id, snap["job_id"]),
-            )
+            with app._admit_lock:
+                app._check_quarantine(snap["lock_key"], snap["cwd"])
+                cur = app.db.execute(
+                    "UPDATE jobs SET status='running', started_at=?, kind=?, sandbox_mode=?, "
+                    "exec_pgid=NULL,exec_identity=NULL,exec_boot=?,exec_state='starting' "
+                    "WHERE job_id=? AND attempt_id=? AND status='queued' AND cancel_requested_at IS NULL",
+                    (time.time(), kind, mode, app.boot_id, snap["job_id"], snap["attempt_id"]),
+                )
+                if cur.rowcount != 1:
+                    raise _CancelledStart()
             boot = app.boot_id
 
             def _persist_executor(pgid: int) -> None:
@@ -1945,23 +2140,44 @@ def _run_claimed(app: App, snap: dict) -> dict:
                 identity = _executor_identity(pgid)
                 if identity is None:
                     raise AgentBridgeError("EXEC_FAIL", "无法读取执行器启动身份，任务未启动")
-                cur = app.db.execute(
-                    "UPDATE jobs SET exec_pgid=?, exec_boot=?,exec_identity=?,exec_state='registered' "
-                    "WHERE job_id=? AND status='running'",
-                    (pgid, boot, identity, snap["job_id"]),
-                )
-                if cur.rowcount != 1:
-                    raise AgentBridgeError("EXEC_FAIL", "执行器登记失败，任务未启动")
+                with app._admit_lock:
+                    cur = app.db.execute(
+                        "UPDATE jobs SET exec_pgid=?, exec_boot=?,exec_identity=?,exec_state='registered' "
+                        "WHERE job_id=? AND attempt_id=? AND status='running' AND cancel_requested_at IS NULL",
+                        (pgid, boot, identity, snap["job_id"], snap["attempt_id"]),
+                    )
+                    if cur.rowcount != 1:
+                        raise _CancelledStart()
 
-            res = run_task(cmd, snap["cwd"], TASK_TIMEOUT, on_start=_persist_executor)
+            def _release(send):
+                with app._admit_lock:
+                    row = app.db.one("SELECT * FROM jobs WHERE job_id=?", (snap["job_id"],))
+                    if row["attempt_id"] != snap["attempt_id"] or row["cancel_requested_at"] is not None:
+                        raise _CancelledStart()
+                    send()
+                    app.db.execute("UPDATE jobs SET exec_state='released' WHERE job_id=? AND attempt_id=?",
+                                   (snap["job_id"], snap["attempt_id"]))
+
+            def _cancel_check():
+                row = app.db.one("SELECT attempt_id,cancel_requested_at FROM jobs WHERE job_id=?", (snap["job_id"],))
+                return row is None or row["attempt_id"] != snap["attempt_id"] or row["cancel_requested_at"] is not None
+
+            res = run_task(cmd, snap["cwd"], TASK_TIMEOUT, on_start=_persist_executor,
+                           on_release=_release, cancel_check=_cancel_check)
             return _finalize(app, snap, res, mode)
+        except _CancelledStart:
+            return _finalize(app, snap, {"cancelled": True, "group_stopped": True}, mode)
         except Exception as exc:  # noqa: BLE001
             # 执行异常必须落终态，否则该 job_id 永远 BUSY
             _fail_job(app, snap, f"执行异常：{type(exc).__name__}")
             raise
         finally:
             app.sched.clear_running(snap["job_id"])
+    except _CancelledStart:
+        return _job_response(app, app.db.one("SELECT * FROM jobs WHERE job_id=?", (snap["job_id"],)))
     finally:
+        with app._admit_lock:
+            app._cancellations.pop(snap.get("attempt_id"), None)
         if entered:
             gate.release(ticket)
         else:
@@ -1999,12 +2215,22 @@ def _finalize(app: App, snap: dict, res: dict, mode: str) -> dict:
     if res.get("group_reaped"):
         message += "\n（任务主进程退出后仍有同组后台进程存活，已在期限处回收整组。）"
 
-    app.db.execute(
-        "UPDATE jobs SET status=?, error_code=?, result=?, result_digest=?, ended_at=?, "
-        "exit_code=?, peak_rss_mb=? WHERE job_id=?",
-        (status, code, message, message[:200], time.time(), res.get("exit_code"),
-         res.get("peak_rss_mb"), snap["job_id"]),
-    )
+    with app._admit_lock:
+        row = app.db.one("SELECT * FROM jobs WHERE job_id=?", (snap["job_id"],))
+        if row["attempt_id"] != snap.get("attempt_id") or row["status"] not in ("queued", "running"):
+            return _job_response(app, row)
+        if res.get("group_stopped") is False:
+            status, code, message = "uncertain", "EXECUTOR_UNCERTAIN", "无法确认执行器身份或进程组已停止，资源保持隔离；不报告取消成功。"
+            app.db.execute("INSERT OR REPLACE INTO quarantine(lock_key,pgid,reason,created_at,cwd) VALUES (?,?,?,?,?)",
+                           (snap["lock_key"], row["exec_pgid"], code, time.time(), snap["cwd"]))
+        elif row["cancel_requested_at"] is not None or res.get("cancelled"):
+            status, code, message = "cancelled", "CANCELLED", "受控执行器已停止，任务已取消。取消不撤销已发生的副作用；主动脱离进程组的后代不在保证范围。"
+        app.db.execute(
+            "UPDATE jobs SET status=?, error_code=?, result=?, result_digest=?, ended_at=?, "
+            "exit_code=?, peak_rss_mb=? WHERE job_id=? AND attempt_id=? AND status IN ('queued','running')",
+            (status, code, message, message[:200], time.time(), res.get("exit_code"),
+             res.get("peak_rss_mb"), snap["job_id"], snap.get("attempt_id")),
+        )
     app.audit.write({
         "job_id": snap["job_id"], "project": snap["project"], "channel": snap["channel"],
         "backend": "dsh", "status": status, "error_code": code,
@@ -2023,15 +2249,24 @@ def _finalize(app: App, snap: dict, res: dict, mode: str) -> dict:
 
 def _fail_job(app: App, snap: dict, message: str) -> None:
     try:
-        app.db.execute(
-            "UPDATE jobs SET status='failed', error_code='EXEC_FAIL', result=?, "
-            "result_digest=?, ended_at=? WHERE job_id=?",
-            (message[:OUTPUT_MAX], message[:200], time.time(), snap["job_id"]),
-        )
+        with app._admit_lock, app.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (snap["job_id"],)).fetchone()
+            if row is None or row['attempt_id'] != snap.get('attempt_id') or row['status'] not in ('queued', 'running'):
+                return
+            status, code = 'failed', 'EXEC_FAIL'
+            if row['exec_pgid'] and _group_alive(row['exec_pgid']):
+                status, code = 'uncertain', 'EXECUTOR_UNCERTAIN'
+                conn.execute("INSERT OR REPLACE INTO quarantine(lock_key,pgid,reason,created_at,cwd) VALUES (?,?,?,?,?)",
+                             (snap['lock_key'], row['exec_pgid'], code, time.time(), snap['cwd']))
+            elif row['cancel_requested_at'] is not None:
+                status, code = 'cancelled', 'CANCELLED'
+            conn.execute(
+                "UPDATE jobs SET status=?,error_code=?,result=?,result_digest=?,ended_at=? WHERE job_id=? AND attempt_id=?",
+                (status, code, message[:OUTPUT_MAX], message[:200], time.time(), snap['job_id'], snap.get('attempt_id')))
         app.audit.write({
             "job_id": snap["job_id"], "project": snap["project"],
-            "channel": snap["channel"], "status": "failed",
-            "error_code": "EXEC_FAIL", "task": snap["task"],
+            "channel": snap["channel"], "status": status,
+            "error_code": code, "task": snap["task"],
         })
     except Exception:  # noqa: BLE001
         pass
@@ -2043,6 +2278,10 @@ def _job_response(app: App, row, reused: bool = False) -> dict:
         "job_id": row["job_id"], "project": row["project"], "backend": row["backend"],
         "status": row["status"], "exit_code": row["exit_code"],
         "peak_rss_mb": row["peak_rss_mb"], "message": row["result"] or "",
+        "attempt_id": row["attempt_id"], "cancel_requested_at": row["cancel_requested_at"],
+        "phase": "cancelling" if row["cancel_requested_at"] is not None and row["status"] == "running" else row["status"],
+        "elapsed_seconds": max(0, (row["ended_at"] or time.time()) - (row["started_at"] or row["created_at"])),
+        "events": [dict(r) for r in app.db.query("SELECT * FROM completion_events WHERE job_id=? ORDER BY seq", (row["job_id"],))],
     }
     if row["status"] == "pending-confirm":
         # 查询/对账也必须给出完整业务状态：待确认任务带明确的
@@ -2051,6 +2290,10 @@ def _job_response(app: App, row, reused: bool = False) -> dict:
         resp["code"] = "NEED_CONFIRM"
         resp["message"] = ("任务等待确认；若未收到令牌，用相同 job_id 与正文"
                            "重发原任务将重新签发确认令牌。")
+    elif row["status"] == "uncertain" and not resp['message']:
+        resp['message'] = "执行结果无法确认，不会自动重跑；请先在本机核查，重跑须新的显式 force 授权。"
+    elif row["status"] == "running" and row['cancel_requested_at'] is not None:
+        resp['message'] = "正在取消，尚未确认执行器停止；取消不撤销已发生的副作用。"
     return resp
 
 
@@ -2144,6 +2387,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._body()
             route = self.path.rstrip("/")
             if route == "/execute":
+                if payload.get("confirm") and (not payload.get("sender") or not payload.get("channel")):
+                    raise AgentBridgeError("AUTH_FAIL", "远程确认必须提供可信发送者与会话身份")
                 if _as_bool(payload.get("force")):
                     return self._json(200, do_control(APP, {
                         "op": "force", "sender": payload.get("sender"), "channel": payload.get("channel"),

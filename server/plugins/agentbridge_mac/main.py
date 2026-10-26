@@ -1,10 +1,13 @@
 """Deterministic delivery IDs and authenticated control routing."""
+import asyncio
+import fcntl
 import hashlib
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
 import os
 from pathlib import Path
 import sqlite3
+import re
 import time
 import uuid
 
@@ -17,8 +20,10 @@ SHIM_URL = os.environ.get("AGENTBRIDGE_SHIM_URL", "http://127.0.0.1:8787/v1/chat
 CONTROL_URL = SHIM_URL.rsplit("/v1/", 1)[0] + "/v1/agentbridge/control"
 TOKEN = os.environ.get("SHIM_TOKEN", "")
 TIMEOUT = int(os.environ.get("AGENTBRIDGE_MAC_TIMEOUT", "300"))
+NOTIFICATIONS_ENABLED = os.environ.get("AGENTBRIDGE_NOTIFICATIONS", "0") == "1"
 DATA_DIR = None
 USAGE = ("用法：/mac [@项目] <任务>；new <编号> [@项目] <任务>\n"
+         "/mac help；diag；jobs；pending；deny <ID>；cancel <ID>\n"
          "/mac status [任务ID]；confirm <令牌>；force <任务ID>\n"
          "/mac project add <名称> <绝对目录>；project ls；project rm <名称>；use <名称>")
 
@@ -30,6 +35,242 @@ def _fingerprint(parts):
 class Main(star.Star):
     def __init__(self, context: star.Context):
         self.context = context
+        self._sender_task = None
+        self._sender_stop = None
+        self._sender_lease = None
+
+    def _data_root(self):
+        root = Path(DATA_DIR) if DATA_DIR is not None else Path(star.StarTools.get_data_dir("agentbridge_mac"))
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
+        return root
+
+    @contextmanager
+    def _notification_db(self):
+        path = self._data_root() / "notifications.db"
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        path.chmod(0o600)
+        with closing(sqlite3.connect(path, timeout=10)) as db, db:
+            db.row_factory = sqlite3.Row
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    sender TEXT NOT NULL, channel TEXT NOT NULL, job_id TEXT NOT NULL,
+                    subscribed_at REAL NOT NULL, finished_at REAL, state TEXT NOT NULL DEFAULT 'active',
+                    after_seq INTEGER,
+                    PRIMARY KEY(sender,channel,job_id));
+                CREATE TABLE IF NOT EXISTS notifications (
+                    event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+                    sender TEXT NOT NULL, channel TEXT NOT NULL, status TEXT NOT NULL,
+                    created_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    first_seen_at REAL,
+                    tries INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
+                    claimed_at REAL, api_returned_at REAL, reason TEXT);
+            ''')
+            columns = {r[1] for r in db.execute('PRAGMA table_info(subscriptions)')}
+            if 'after_seq' not in columns:
+                db.execute('ALTER TABLE subscriptions ADD COLUMN after_seq INTEGER')
+                db.execute("UPDATE subscriptions SET state='blocked' WHERE after_seq IS NULL")
+            columns = {r[1] for r in db.execute('PRAGMA table_info(notifications)')}
+            if 'first_seen_at' not in columns:
+                db.execute('ALTER TABLE notifications ADD COLUMN first_seen_at REAL')
+                db.execute('UPDATE notifications SET first_seen_at=? WHERE first_seen_at IS NULL', (time.time(),))
+            yield db
+
+    def _subscribe(self, event, job_id, after_seq=0):
+        sender, channel = str(event.get_sender_id()), event.unified_msg_origin
+        if not sender or not channel or not job_id:
+            raise ValueError("通知订阅缺少可信来源，未下发执行。")
+        with self._notification_db() as db:
+            db.execute("INSERT INTO subscriptions(sender,channel,job_id,subscribed_at,after_seq) VALUES (?,?,?,?,?) "
+                       "ON CONFLICT(sender,channel,job_id) DO UPDATE SET finished_at=NULL,state='active',"
+                       "after_seq=COALESCE(subscriptions.after_seq,excluded.after_seq)",
+                       (sender, channel, job_id, time.time(), after_seq))
+
+    async def _prepare_subscription(self, event, job_id):
+        status, data = await self._control(event, {'op': 'diag'})
+        seq = data.get('event_seq')
+        if status != 200 or not data.get('ok') or type(seq) is not int or seq < 0:
+            raise ValueError('通知订阅对账失败，未下发执行；请稍后重试。')
+        self._subscribe(event, job_id, after_seq=seq)
+
+    def _recover_notifications(self):
+        with self._notification_db() as db:
+            db.execute("UPDATE notifications SET state='unknown',reason='sender_restarted' WHERE state='sending'")
+
+    async def initialize(self):
+        if not NOTIFICATIONS_ENABLED or self._sender_task is not None:
+            return
+        lease = open(self._data_root() / "notification-sender.lock", "a")
+        os.chmod(lease.name, 0o600)
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._recover_notifications()
+        except BaseException:
+            lease.close()
+            raise
+        self._sender_lease = lease
+        self._sender_stop = asyncio.Event()
+        self._sender_task = asyncio.create_task(self._notification_loop())
+
+    async def terminate(self):
+        try:
+            if self._sender_task is not None:
+                self._sender_stop.set()
+                await self._sender_task
+        finally:
+            self._sender_task = None
+            if self._sender_lease is not None:
+                self._sender_lease.close()
+                self._sender_lease = None
+
+    def _notification_allowed(self, sender, channel):
+        # Re-read both policies before every API call. Missing context fails closed.
+        allowed = {v.strip() for v in os.environ.get("AGENTBRIDGE_ALLOWED_SENDERS", "").split(",") if v.strip()}
+        if not sender or sender not in allowed or not channel or not TOKEN or self.context is None:
+            return False
+        try:
+            config = self.context.get_config(umo=channel)
+            whitelist = config.get("platform_settings", {}).get("id_whitelist", [])
+            return channel in whitelist and callable(getattr(self.context, "send_message", None))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _excerpt(text):
+        text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----", "[密钥已隐藏]", str(text))
+        text = re.sub(r"```[\s\S]*?(?:```|$)", "[代码已省略]", text)
+        text = re.sub(r"(?i)((?:password|passwd|token|secret|api[_-]?key)\s*[=:]\s*)\S+", r"\1[已隐藏]", text)
+        text = re.sub(r"(?i)\bBearer\s+\S+|sk-[A-Za-z0-9_-]{12,}", "[凭据已隐藏]", text)
+        text = re.sub(r"(?<!\w)/(?:[^\s，。；<>]+)", "[路径已隐藏]", text)
+        lines = [line for line in text.splitlines() if not re.search(
+            r"(?i)(?:^\s*[$>#]|\b(?:sudo|ssh|scp|curl|wget|rm|mv|cp|chmod|chown|git|python\d*|node|bash|sh|launchctl|docker|npm|pip)\s|[|;&`])", line)]
+        return "\n".join(lines).strip()[:300] or "结果摘要已省略，请查询详情。"
+
+    @staticmethod
+    def _record_event(db, event):
+        db.execute("INSERT OR IGNORE INTO notifications(event_id,job_id,attempt_id,sender,channel,status,created_at,first_seen_at) "
+                   "VALUES (?,?,?,?,?,?,?,?)", tuple(event[k] for k in (
+                       "event_id", "job_id", "attempt_id", "sender", "channel", "status", "created_at")) + (time.time(),))
+
+    async def _send_notification(self, channel, text):
+        from astrbot.core.message.message_event_result import MessageChain
+        from astrbot.api.message_components import Plain
+        return await self.context.send_message(channel, MessageChain(chain=[Plain(text)]))
+
+    async def _deliver_event(self, event, result):
+        with self._notification_db() as db:
+            self._record_event(db, event)
+            row = db.execute("SELECT * FROM notifications WHERE event_id=?", (event['event_id'],)).fetchone()
+        if row['state'] not in ('pending', 'retry') or row['next_at'] > time.time():
+            return
+        if time.time() - row['first_seen_at'] >= 86400:
+            with self._notification_db() as db:
+                db.execute("UPDATE notifications SET state='expired',reason='retry_budget_expired' WHERE event_id=? AND state IN ('pending','retry')", (event['event_id'],))
+            return
+        if not self._notification_allowed(event['sender'], event['channel']):
+            with self._notification_db() as db:
+                db.execute("UPDATE notifications SET state='blocked',reason='source_or_context_unavailable' WHERE event_id=? AND state IN ('pending','retry')", (event['event_id'],))
+            return
+        try:
+            text = (f"事件：{event['event_id']}\n任务：{event['job_id']} 状态：{event['status']}\n"
+                    f"耗时：{event.get('elapsed_seconds') or 0:.1f} 秒\n{self._excerpt(result)}\n"
+                    "发送 API 状态不代表手机已收到；详情用 /mac status 查询。")
+        except Exception:
+            # This path is provably before the send API, so delayed retry is safe.
+            tries = row['tries'] + 1
+            delay = (5, 15, 60)[tries - 1] if tries <= 3 else 300
+            with self._notification_db() as db:
+                db.execute("UPDATE notifications SET state=?,tries=?,next_at=?,reason='pre_api_failure' WHERE event_id=?",
+                           ('expired' if time.time() - row['first_seen_at'] >= 86400 else 'retry', tries, time.time() + delay, event['event_id']))
+            return
+        # A committed claim precedes any potentially sending call. A crash fails closed.
+        with self._notification_db() as db:
+            cur = db.execute("UPDATE notifications SET state='sending',claimed_at=? WHERE event_id=? AND state IN ('pending','retry') AND next_at<=?",
+                             (time.time(), event['event_id'], time.time()))
+            if cur.rowcount != 1:
+                return
+        if not self._notification_allowed(event['sender'], event['channel']):
+            state, reason = 'blocked', 'source_revoked_before_api'
+        else:
+            try:
+                returned = await asyncio.wait_for(self._send_notification(event['channel'], text), timeout=15)
+                state, reason = 'api_returned', 'platform_matched' if returned else 'platform_not_found'
+            except BaseException as exc:
+                with self._notification_db() as db:
+                    db.execute("UPDATE notifications SET state='unknown',reason='send_api_exception' WHERE event_id=?", (event['event_id'],))
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return
+        with self._notification_db() as db:
+            db.execute("UPDATE notifications SET state=?,reason=?,api_returned_at=? WHERE event_id=?",
+                       (state, reason, time.time() if state == 'api_returned' else None, event['event_id']))
+
+    async def _notification_tick(self):
+        with self._notification_db() as db:
+            subscriptions = [dict(r) for r in db.execute("SELECT * FROM subscriptions WHERE state='active'")]
+        groups = {}
+        for sub in subscriptions:
+            groups.setdefault((sub['sender'], sub['channel']), []).append(sub)
+        for (sender, channel), subs in groups.items():
+            if self._sender_stop is not None and self._sender_stop.is_set():
+                return
+            if not self._notification_allowed(sender, channel):
+                with self._notification_db() as db:
+                    db.execute("UPDATE subscriptions SET state='blocked' WHERE sender=? AND channel=?", (sender, channel))
+                continue
+            class Source:
+                unified_msg_origin = channel
+
+                def get_sender_id(self):
+                    return sender
+            for offset in range(0, len(subs), 50):
+                batch = subs[offset:offset + 50]
+                status, data = await self._control(Source(), {'op': 'status.batch', 'job_ids': [s['job_id'] for s in batch]})
+                jobs = data.get('jobs', []) if status == 200 and data.get('ok') else []
+                if data.get('code') == 'NOT_FOUND':
+                    # A not-yet-accepted subscription must not hide other accepted jobs.
+                    for sub in batch:
+                        status, item = await self._control(Source(), {'op': 'status', 'job_id': sub['job_id']})
+                        if status == 200 and item.get('job_id'):
+                            jobs.append({**item, 'requested_id': sub['job_id']})
+                        elif time.time() - sub['subscribed_at'] >= 86400 and item.get('code') == 'NOT_FOUND':
+                            with self._notification_db() as db:
+                                db.execute("UPDATE subscriptions SET state='unresolved',finished_at=? WHERE sender=? AND channel=? AND job_id=?",
+                                           (time.time(), sender, channel, sub['job_id']))
+                for job in jobs:
+                    sub = next((s for s in batch if s['job_id'] == job.get('requested_id')), None)
+                    if sub is None:
+                        continue
+                    for event in job.get('events', []):
+                        if (event.get('sender') != sender or event.get('channel') != channel
+                                or event.get('job_id') != job.get('job_id') or sub.get('after_seq') is None
+                                or type(event.get('seq')) is not int or event['seq'] <= sub['after_seq']):
+                            continue
+                        current = (event['attempt_id'] == job.get('attempt_id') or
+                                   job.get('attempt_id') is None and event['attempt_id'] == 'pending:' + job['job_id'])
+                        result = job.get('message', '') if current else '此尝试结果已由后续执行更新，请本机核查。'
+                        await self._deliver_event(event, result)
+                    if job.get('status') in ('done', 'failed', 'uncertain', 'cancelled'):
+                        with self._notification_db() as db:
+                            db.execute("UPDATE subscriptions SET finished_at=COALESCE(finished_at,?) WHERE sender=? AND channel=? AND job_id=?",
+                                       (time.time(), sender, channel, sub['job_id']))
+        with self._notification_db() as db:
+            cutoff = time.time() - 7 * 86400
+            db.execute("DELETE FROM notifications WHERE first_seen_at<? AND state NOT IN ('pending','retry','sending')", (cutoff,))
+            db.execute("DELETE FROM subscriptions WHERE finished_at<?", (cutoff,))
+
+    async def _notification_loop(self):
+        while not self._sender_stop.is_set():
+            try:
+                await self._notification_tick()
+            except Exception:
+                # No raw exception/config/result logging. Claimed events remain fail-closed.
+                pass
+            try:
+                await asyncio.wait_for(self._sender_stop.wait(), timeout=5)
+            except TimeoutError:
+                pass
 
     def _delivery(self, event, text, project="", new_number=""):
         source = [event.unified_msg_origin, str(event.get_sender_id()),
@@ -72,6 +313,7 @@ class Main(star.Star):
                    "X-AgentBridge-Channel": event.unified_msg_origin}
         if job_id:
             headers.update({"X-AgentBridge-Job-Id": job_id, "X-AgentBridge-Id-Stable": "1"})
+            headers["Prefer"] = "respond-async"
         if confirm:
             headers["X-AgentBridge-Confirm"] = confirm
         if project:
@@ -81,29 +323,39 @@ class Main(star.Star):
     async def _request(self, event, url, payload, **headers):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=self._headers(event, **headers),
-                                    timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as resp:
+                                    timeout=aiohttp.ClientTimeout(total=10 if payload.get('op') in ('status', 'diag', 'jobs', 'pending', 'project.list', 'status.batch') else TIMEOUT)) as resp:
                 try:
                     return resp.status, await resp.json()
                 except Exception:
                     return resp.status, {"error": {"message": "网关响应格式异常，请查询原任务。"}}
 
     async def _call(self, event, text, job_id=None, project=None):
+        if NOTIFICATIONS_ENABLED:
+            await self._prepare_subscription(event, job_id)
         return await self._request(event, SHIM_URL, {"model": "bridge",
             "messages": [{"role": "user", "content": text}]}, job_id=job_id, project=project)
 
     async def _control(self, event, payload):
         return await self._request(event, CONTROL_URL, payload)
 
-    @staticmethod
-    def _render(status, data):
+    def _render(self, status, data):
         if data.get("choices"):
             return str(data["choices"][0]["message"]["content"])
         if data.get("error"):
             return "调用本机执行器失败：" + str(data["error"].get("message", status))
-        if data.get("message"):
-            return str(data["message"]) + (f"\n任务ID：{data['job_id']} 状态：{data.get('status', 'unknown')}" if data.get("job_id") else "")
         if data.get("job_id"):
-            return f"任务ID：{data['job_id']} 状态：{data.get('status', 'unknown')}"
+            notify = "未订阅或未启用"
+            if (self._data_root() / 'notifications.db').exists():
+                with self._notification_db() as db:
+                    rows = db.execute("SELECT state FROM notifications WHERE job_id=? ORDER BY created_at DESC LIMIT 3", (data['job_id'],)).fetchall()
+                    labels = {'pending': '待尝试', 'retry': '待重试', 'sending': '发送中', 'api_returned': 'API 返回', 'unknown': '结果未知', 'blocked': '来源或上下文失效', 'expired': '重试已到期'}
+                    notify = '、'.join(labels.get(r['state'], r['state']) for r in rows) or "尚无完成通知"
+            return (str(data.get('message') or '') + f"\n任务ID：{data['job_id']} 状态：{data.get('phase', data.get('status', 'unknown'))}"
+                    f"\n耗时：{data.get('elapsed_seconds', 0):.1f} 秒；通知：{notify}（不代表手机收到）")
+        if data.get("message"):
+            return str(data["message"]) + (f"\n最近 worker 健康时间：{data.get('last_worker_healthy_at', data.get('healthy_at'))}" if 'healthy_at' in data or 'last_worker_healthy_at' in data else '')
+        if "pending" in data:
+            return "待确认：\n" + ("\n".join(f"{r['job_id']} @{r['project']} 剩余 {r['remaining_seconds']} 秒" for r in data["pending"]) or "暂无")
         if data.get("recent") is not None:
             rows = [f"{r['job_id']} {r['status']} @{r['project']}" for r in data["recent"]]
             return "当前项目：" + str(data.get("current")) + "\n" + ("\n".join(rows) or "暂无任务")
@@ -113,6 +365,8 @@ class Main(star.Star):
 
     async def _confirm(self, event, token):
         jid, reused = self._delivery(event, "confirm " + token, "control")
+        if NOTIFICATIONS_ENABLED:
+            await self._prepare_subscription(event, jid)
         status, data = await self._control(event, {"op": "confirm", "token": token, "delivery_id": jid})
         return ("60 秒内相同指令，正在复用任务。\n" if reused else "") + self._render(status, data)
 
@@ -137,20 +391,27 @@ class Main(star.Star):
                 raise ValueError("仅支持私聊。")
             parts = text.split()
             command = parts[0]
+            if command == "help":
+                yield event.plain_result(USAGE)
+                return
             payload = None
             if command == "confirm":
                 if len(parts) != 2:
                     raise ValueError("格式：/mac confirm <令牌>")
                 yield event.plain_result(await self._confirm(event, parts[1]))
                 return
-            if command == "status":
+            if command in ("diag", "jobs", "pending"):
+                if len(parts) != 1:
+                    raise ValueError("格式：/mac " + command)
+                payload = {"op": command}
+            elif command == "status":
                 if len(parts) > 2:
                     raise ValueError("格式：/mac status [任务ID]")
                 payload = {"op": "status", "job_id": parts[1] if len(parts) == 2 else ""}
-            elif command in ("force", "use"):
+            elif command in ("force", "use", "deny", "cancel"):
                 if len(parts) != 2:
                     raise ValueError("格式：/mac " + command + " <任务ID或项目名称>")
-                payload = {"op": command, "job_id" if command == "force" else "project": parts[1]}
+                payload = {"op": command, "project" if command == "use" else "job_id": parts[1]}
             elif command == "project":
                 if parts[1:] == ["ls"]:
                     payload = {"op": "project.list"}
@@ -161,9 +422,16 @@ class Main(star.Star):
                 else:
                     raise ValueError(USAGE)
             if payload is not None:
-                if payload["op"] not in ("status", "project.list"):
+                if payload["op"] not in ("status", "project.list", "diag", "jobs", "pending"):
                     jid, _ = self._delivery(event, text, "control")
                     payload["delivery_id"] = jid
+                    if payload['op'] == 'force' and NOTIFICATIONS_ENABLED:
+                        check_status, job = await self._control(event, {'op': 'status', 'job_id': payload['job_id']})
+                        if check_status != 200 or not job.get('job_id'):
+                            yield event.plain_result(self._render(check_status, job))
+                            return
+                        payload['job_id'] = job['job_id']
+                        await self._prepare_subscription(event, job['job_id'])
                 status, data = await self._control(event, payload)
                 yield event.plain_result(self._render(status, data))
                 return
@@ -190,4 +458,7 @@ class Main(star.Star):
         except ValueError as exc:
             yield event.plain_result(str(exc))
         except Exception:
-            yield event.plain_result("未能确认投递结果。" + (f"请用 /mac status {jid} 查询，勿盲目新建。" if jid else "未下发执行；请稍后重试。"))
+            if text.split()[0] in ("status", "jobs", "pending", "diag"):
+                yield event.plain_result("查询失败，查询未创建任务；请稍后查询原 ID。")
+            else:
+                yield event.plain_result("未能确认投递结果。" + (f"请用 /mac status {jid} 查询，勿盲目新建。" if jid else "未下发执行；请稍后重试。"))

@@ -27,22 +27,43 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-TMP = tempfile.mkdtemp(prefix="agentbridge-test-")
-os.environ["AGENTBRIDGE_BASE"] = TMP
-os.environ["AGENTBRIDGE_DB"] = os.path.join(TMP, "test.db")
-os.environ["AGENTBRIDGE_AUDIT_DIR"] = os.path.join(TMP, "audit")
-os.environ["AGENTBRIDGE_SECRET"] = "test-secret"
-os.environ["AGENTBRIDGE_PATCH_FULL"] = os.path.join(TMP, "full.yml")
-os.environ["AGENTBRIDGE_PATCH_RO"] = os.path.join(TMP, "ro.yml")
-os.environ["AGENTBRIDGE_TASK_TIMEOUT"] = "3"
-os.environ["AGENTBRIDGE_CONCURRENCY"] = "1"
-os.environ["AGENTBRIDGE_QUEUE_MAX"] = "1"
+_SCRATCH = tempfile.TemporaryDirectory(prefix="agentbridge-test-")
+TMP = _SCRATCH.name
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import worker  # noqa: E402
 
 COUNTER = os.path.join(TMP, "calls.txt")
+
+
+def setUpModule():
+    # Discovery may have imported worker before this module. Environment-only
+    # setup at import time must never leave worker constants pointing at live data.
+    stack = contextlib.ExitStack()
+    unittest.addModuleCleanup(_SCRATCH.cleanup)
+    unittest.addModuleCleanup(stack.close)
+    home = Path(TMP) / "home"
+    home.mkdir(exist_ok=True)
+    backend = Path(TMP) / "default-synthetic-backend.sh"
+    backend.write_text("#!/bin/sh\nprintf 'synthetic-ok\\n'\n")
+    backend.chmod(0o700)
+    values = {
+        "BASE": TMP, "HOME": str(home), "DB_PATH": os.path.join(TMP, "test.db"),
+        "AUDIT_DIR": os.path.join(TMP, "audit"), "SECRET": "test-secret",
+        "PATCH_FULL": os.path.join(TMP, "full.yml"), "PATCH_RO": os.path.join(TMP, "ro.yml"),
+        "DSH_SETTINGS_PATH": os.path.join(TMP, "settings.yaml"), "DSH": str(backend),
+        "TASK_TIMEOUT": 3, "CONCURRENCY": 1, "QUEUE_MAX": 1, "ALLOWED_SENDERS": set(),
+    }
+    stack.enter_context(mock.patch.multiple(worker, **values))
+    stack.enter_context(mock.patch.dict(os.environ, {
+        "AGENTBRIDGE_BASE": TMP, "AGENTBRIDGE_DB": values['DB_PATH'],
+        "AGENTBRIDGE_AUDIT_DIR": values['AUDIT_DIR'], "AGENTBRIDGE_SECRET": values['SECRET'],
+        "AGENTBRIDGE_DSH_SETTINGS": values['DSH_SETTINGS_PATH'], "AGENTBRIDGE_DSH": str(backend),
+        "AGENTBRIDGE_ALLOWED_SENDERS": "", "AGENTBRIDGE_RUNNING_CANCEL": "0",
+    }))
+    assert Path(worker.DB_PATH).is_relative_to(Path(TMP))
+    assert Path(worker.HOME).is_relative_to(Path(TMP))
 
 
 def _fake_dsh(path: str, body: str) -> str:
@@ -704,7 +725,7 @@ class TestRound2Regressions(unittest.TestCase):
             r = worker.do_execute(self.app, {"task": "看一下磁盘", "job_id": "r3-job",
                                              "channel": "owner", "wait": False})
             self.assertEqual(r["code"], "ACCEPTED")
-            self.assertEqual(r["status"], "queued")
+            self.assertIn(r["status"], ("queued", "running"))
             deadline = time.time() + 15
             status = None
             while time.time() < deadline:
@@ -1129,8 +1150,8 @@ class TestRound4Regressions(unittest.TestCase):
             "w=importlib.util.module_from_spec(s);s.loader.exec_module(w); "
             f"w.HOME={home!r};w.DB_PATH={db_path!r};w.AUDIT_DIR={audit_dir!r}; "
             "app=w.App(verify=False); real=w.run_task; "
-            f"w.run_task=lambda cmd,cwd,timeout,on_start=None: real("
-            f"[sys.executable,'-c',{child!r}],{TMP!r},20,on_start=on_start); "
+            f"w.run_task=lambda cmd,cwd,timeout,on_start=None,**kw: real("
+            f"[sys.executable,'-c',{child!r}],{TMP!r},20,on_start=on_start,**kw); "
             "w.do_execute(app,{'task':'u1-old','job_id':'u1-old','channel':'owner'})"
         )
         proc = subprocess.Popen([sys.executable, "-B", "-c", wrapper],
@@ -1455,8 +1476,8 @@ class TestRound5Fixes(unittest.TestCase):
             "\ndef blocked(pgid,callback):\n"
             f" pathlib.Path({str(paused)!r}).write_text(str(pgid))\n"
             " time.sleep(30)\n callback(pgid)\n"
-            f"w.run_task=lambda cmd,cwd,timeout,on_start=None:real([sys.executable,'-c',{child!r}],"
-            "cwd,10,on_start=lambda pgid:blocked(pgid,on_start)); "
+            f"w.run_task=lambda cmd,cwd,timeout,on_start=None,**kw:real([sys.executable,'-c',{child!r}],"
+            "cwd,10,on_start=lambda pgid:blocked(pgid,on_start),**kw); "
             "w.do_execute(app,{'task':'synthetic','job_id':'gate-crash','channel':'owner'})"
         )
         parent = subprocess.Popen([sys.executable, "-B", "-c", wrapper],

@@ -444,7 +444,7 @@ class TestShim(unittest.TestCase):
                 body = json.loads(exc.read().decode())
                 exc.close()
                 self.assertEqual(body["error"]["code"], "OFFLINE")
-                self.assertIn("没开机", body["error"]["message"])
+                self.assertIn("隧道或 worker 不可达", body["error"]["message"])
                 self.assertNotIn("choices", body, "失败不得伪装成 assistant 回复")
         finally:
             proc.terminate()

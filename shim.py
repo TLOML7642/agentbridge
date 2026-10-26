@@ -112,36 +112,63 @@ def _worker_base() -> str:
 
 CONTROL_FIELDS = {
     "status": {"job_id"}, "confirm": {"token", "delivery_id"},
+    "status.batch": {"job_ids"}, "diag": set(), "jobs": set(), "pending": set(),
+    "deny": {"job_id", "delivery_id"}, "cancel": {"job_id", "delivery_id"},
     "force": {"job_id", "delivery_id"}, "project.add": {"name", "dir", "delivery_id"},
     "project.rm": {"name", "delivery_id"}, "project.list": set(),
     "use": {"project", "delivery_id"},
 }
+QUERY_OPS = frozenset(("status", "project.list", "diag", "jobs", "pending", "status.batch"))
+_HEALTH_LOCK = threading.Lock()
+_LAST_WORKER_HEALTH = None
 
 
 def control_worker(payload: dict, meta: dict) -> dict:
+    global _LAST_WORKER_HEALTH
     op = payload.get("op")
     if not isinstance(op, str) or op not in CONTROL_FIELDS:
         raise ApiError(400, "不支持的控制操作", "invalid_control")
     if set(payload) - CONTROL_FIELDS[op] - {"op"}:
         raise ApiError(400, "控制请求含非白名单字段", "invalid_control")
-    if any(not isinstance(value, str) for value in payload.values()):
+    if any(not isinstance(value, str) for key, value in payload.items() if key != "job_ids"):
         raise ApiError(400, "控制字段必须是字符串", "invalid_control")
+    if op == "status.batch":
+        ids = payload.get("job_ids")
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or any(not isinstance(i, str) or not i for i in ids):
+            raise ApiError(400, "批量查询须提供 1 至 50 个任务 ID", "invalid_control")
     body = {**payload, "sender": meta["sender"], "channel": meta["channel"]}
     req = urllib.request.Request(
         _worker_base() + "/control", data=json.dumps(body, ensure_ascii=False).encode(),
         headers={"Content-Type": "application/json", "X-AgentBridge-Secret": WORKER_SECRET})
-    try:
-        with urllib.request.urlopen(req, timeout=ACCEPT_TIMEOUT) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
+    query = op in QUERY_OPS
+    deadline = time.monotonic() + 10
+    for attempt in range(3 if query else 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            result = json.loads(exc.read())
-            return result if isinstance(result, dict) else {"ok": False, "code": "EXEC_FAIL"}
-        finally:
-            exc.close()
-    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
-        return {"ok": False, "code": "ACCEPT_UNKNOWN", "job_id": payload.get("job_id") or payload.get("delivery_id"),
-                "message": "控制结果暂时无法确认，请查询状态或重试同一投递，不要新建授权。"}
+            with urllib.request.urlopen(req, timeout=min(ACCEPT_TIMEOUT, remaining, 3) if query else ACCEPT_TIMEOUT) as resp:
+                result = json.loads(resp.read())
+            with _HEALTH_LOCK:
+                _LAST_WORKER_HEALTH = time.time()
+            if op == "diag":
+                result["last_worker_healthy_at"] = _LAST_WORKER_HEALTH
+            return result
+        except urllib.error.HTTPError as exc:
+            try:
+                result = json.loads(exc.read())
+                return result if isinstance(result, dict) else {"ok": False, "code": "EXEC_FAIL"}
+            finally:
+                exc.close()
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+            if query and attempt < 2:
+                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+    if query:
+        return {"ok": False, "code": "QUERY_UNAVAILABLE",
+                "last_worker_healthy_at": _LAST_WORKER_HEALTH,
+                "message": "隧道或 worker 不可达，查询未创建任务。请稍后查询原 ID。"}
+    return {"ok": False, "code": "ACCEPT_UNKNOWN", "job_id": payload.get("job_id") or payload.get("delivery_id"),
+            "message": "修改结果未知；不会自动重试，请先查询原任务，不要新建授权。"}
 
 
 def _accept_worker(task: str, meta: dict) -> dict:
@@ -180,7 +207,7 @@ def _accept_worker(task: str, meta: dict) -> dict:
         if isinstance(reason, (ConnectionRefusedError, socket.timeout, TimeoutError)):
             # 连接未建立：请求没有到达 worker，可以确定未被接纳
             return {"ok": False, "code": "OFFLINE", "job_id": job_id,
-                    "message": "我这台 Mac 现在没开机或断网了，等它上线再试。"}
+                    "message": "隧道或 worker 不可达，连接未建立，任务未被接纳。"}
         return _accept_unknown(job_id)
     except (socket.timeout, TimeoutError):
         # 请求已发出、读响应超时：接纳结果未知
@@ -378,6 +405,9 @@ class Handler(BaseHTTPRequestHandler):
             "status": result.get("status"),
             "code": result.get("code"),
             "reused": result.get("reused", False),
+            "attempt_id": result.get("attempt_id"),
+            "phase": result.get("phase"),
+            "elapsed_seconds": result.get("elapsed_seconds"),
         }
 
     # ---- 路由 ----
@@ -422,7 +452,8 @@ class Handler(BaseHTTPRequestHandler):
                 meta = self._worker_meta()
                 result = control_worker(payload, meta)
                 code = result.get("code")
-                status = 403 if code == "AUTH_FAIL" else 404 if code == "NOT_FOUND" else FAILURE_STATUS.get(code, 200)
+                status = (403 if code == "AUTH_FAIL" else 404 if code == "NOT_FOUND" else
+                          409 if code == "AMBIGUOUS_ID" else 503 if code == "QUERY_UNAVAILABLE" else FAILURE_STATUS.get(code, 200))
                 return self._json(status, result)
             except ApiError as exc:
                 self.close_connection = True
@@ -446,7 +477,7 @@ class Handler(BaseHTTPRequestHandler):
         task = PREAMBLE + "\n对话如下：\n" + conversation
 
         stream = bool(payload.get("stream"))
-        if stream:
+        if stream and self.headers.get("Prefer", "").lower() != "respond-async":
             return self._stream(task, meta)
         return self._blocking(task, meta)
 
@@ -454,7 +485,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _blocking(self, task: str, meta: dict) -> None:
         try:
-            result = call_worker(task, meta, wait_sec=WORKER_TIMEOUT)
+            result = (_accept_worker(task, meta) if self.headers.get("Prefer", "").lower() == "respond-async"
+                      else call_worker(task, meta, wait_sec=WORKER_TIMEOUT))
         except Exception as exc:  # noqa: BLE001
             # 传输层之外的意外异常也要结构化返回，不能裸断客户端连接
             result = {"ok": False, "code": "EXEC_FAIL",
