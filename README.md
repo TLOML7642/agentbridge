@@ -4,6 +4,8 @@
 
 > 当前是可审计的个人远程任务桥接器，不是已经完成“人格、长期记忆、日常聊天与电脑操作统一”的完整 Agent。公开仓库保存源码、测试和文档，不包含个人运行数据，也不是开箱即用的生产部署包。
 
+统一 Agent 的阶段 A 已增加原生会话、人格作用域、取消和工具守卫验证。持续会话检查通过，但审批后工具名/参数可被中间件替换的安全断言失败，按计划停止后续接入，未部署新能力。详情和复现命令见 [阶段 A 停止记录](NATIVE-STAGE-A-20261027.md)。这不是普通微信消息已可利用的结论，也不是完整 Agent 已交付。
+
 ## 目标与当前状态
 
 长期目标是让同一个 DSH Agent 承担日常聊天和远程电脑操作，拥有连续会话及可配置的性格。AstrBot 作为微信消息入口，而不是另外维护一套互不相通的助手记忆。
@@ -182,6 +184,7 @@ python3 -B tools/run_regressions.py
 | `server/docker_control/` | 原部署的凭据维护脚本，运行前需审查环境 |
 | `test_*.py` | 合成回归测试 |
 | `tools/` | 观察、验证、发布和定向修复工具，不应盲目执行 |
+| `tools/check_native_stage.py`、`tools/probe_native_dsh.mjs` | 阶段 A 隔离原生验证；安全失败返回非零，不启动或更新桥接服务 |
 | [CHANGELOG.md](CHANGELOG.md) | 按提交阶段记录改动、测试与部署状态 |
 | [IMPLEMENTATION-20261026.md](IMPLEMENTATION-20261026.md) | 原始交付证据及已知事故、修复和验收边界 |
 | [ASTRBOT-INTEGRATION-20261026.md](ASTRBOT-INTEGRATION-20261026.md) | 当前聊天、记忆和执行链路调查 |

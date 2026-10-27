@@ -6,6 +6,7 @@
 !/tools/
 /tools/*
 !/tools/*.py
+!/tools/probe_native_dsh.mjs
 !/server/
 /server/*
 !/server/plugins/
@@ -21,6 +22,7 @@
 !/server/plugins/agentbridge_mac/metadata.yaml
 !/IMPLEMENTATION-20261026.md
 !/ASTRBOT-INTEGRATION-20261026.md
+!/NATIVE-STAGE-A-20261027.md
 !/README.md
 !/LICENSE
 !/CHANGELOG.md
