@@ -42,6 +42,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from agent_runtime import AgentError, AgentRuntime, NativeExecutor
 
 # --------------------------------------------------------------------------
 # 配置
@@ -82,6 +83,9 @@ PRIV_PLAN_TTL = int(os.environ.get("AGENTBRIDGE_PRIV_PLAN_TTL", "1800"))
 # HTTP 连接读写时限（秒）：防止慢速客户端长期占用服务线程
 HTTP_TIMEOUT = int(os.environ.get("AGENTBRIDGE_HTTP_TIMEOUT", "30"))
 RUNNING_CANCEL_ENABLED = os.environ.get("AGENTBRIDGE_RUNNING_CANCEL", "0") == "1"
+AGENT_ENABLED = os.environ.get("AGENTBRIDGE_AGENT_MESSAGES", "0") == "1"
+AGENT_LEARNING = os.environ.get('AGENTBRIDGE_AGENT_LEARNING', '0') == '1'
+AGENT_CHANNELS = {s.strip() for s in os.environ.get("AGENTBRIDGE_AGENT_CHANNELS", "").split(",") if s.strip()}
 
 # 允许的来源通道。非空时请求必须携带白名单内的 channel，缺失同样拒绝，
 # 不能用「缺字段」表示无限制。
@@ -1158,6 +1162,21 @@ class App:
         self._ensure_default_project()
         self._recover_stale_jobs()
         self.prune_data()
+        self.agent = None
+        if AGENT_ENABLED:
+            if not ALLOWED_SENDERS or not AGENT_CHANNELS:
+                raise AgentBridgeError('AUTH_FAIL', '持续对话必须显式配置发送者和灰度会话')
+            root = os.path.join(BASE, 'agent')
+            executor = NativeExecutor(root, run_task, redact)
+            self.agent = AgentRuntime(root, executor, lambda name: self.get_project(name)['dir'],
+                                      self._agent_evidence, recover=executor.recover, allow_learning=AGENT_LEARNING)
+
+    def _agent_evidence(self, sender, channel, project):
+        rows = self.db.query('SELECT job_id,status,result,exit_code,sandbox_mode FROM jobs '
+                             'WHERE sender=? AND channel=? AND project=? ORDER BY created_at DESC LIMIT 5',
+                             (sender, channel, project))
+        return [{**dict(row), 'result': redact(row['result'] or '')[:1200],
+                 'evidence_level': 'process_exit_only' if row['status'] == 'done' else row['status']} for row in rows]
 
     def next_seq(self) -> int:
         """任务接纳序号：全局单调递增，驱动同资源按接纳顺序执行。"""
@@ -1527,6 +1546,13 @@ CONTROL_FIELDS = {
     "deny": {"job_id", "delivery_id"}, "cancel": {"job_id", "delivery_id"},
     "project.add": {"name", "dir", "delivery_id"}, "project.rm": {"name", "delivery_id"},
     "project.list": set(), "use": {"project", "delivery_id"},
+    "agent.status": {"message_id"}, "agent.new": {"delivery_id"},
+    "agent.cancel": {"message_id", "delivery_id"},
+    "agent.lookup": {"delivery_id"},
+    "agent.memory": set(), "agent.persona": set(),
+    "agent.memory.on": {"delivery_id"}, "agent.memory.off": {"delivery_id"},
+    "agent.forget": {"memory_id", "delivery_id"},
+    "agent.persona.set": {"name", "delivery_id"},
 }
 CONTROL_OPS = frozenset(CONTROL_FIELDS)
 
@@ -1544,6 +1570,14 @@ def do_control(app: App, payload: dict) -> dict:
     if any(not isinstance(value, str) for key, value in payload.items() if key != "job_ids"):
         raise AgentBridgeError("EXEC_FAIL", "控制字段类型错误")
     job_id = str(payload.get("job_id") or "").strip()
+    if op.startswith('agent.'):
+        _agent_source(app, sender, channel)
+        try:
+            return app.agent.control(sender, channel, op, app.current_project(channel),
+                                     payload.get('message_id', ''), payload.get('delivery_id', ''),
+                                     payload.get('memory_id', ''), payload.get('name', ''))
+        except AgentError as exc:
+            raise AgentBridgeError(exc.code, exc.message) from None
     if op == "diag":
         return {"ok": True, "worker": "healthy", "healthy_at": time.time(),
                 "event_seq": app.db.one("SELECT COALESCE(max(seq),0) AS seq FROM completion_events WHERE sender=? AND channel=?", (sender, channel))["seq"],
@@ -2301,6 +2335,24 @@ def _job_response(app: App, row, reused: bool = False) -> dict:
 # HTTP
 # --------------------------------------------------------------------------
 
+def _agent_source(app, sender, channel):
+    if not AGENT_ENABLED or app.agent is None:
+        raise AgentBridgeError('AGENT_DISABLED', '持续对话入口尚未启用')
+    if not isinstance(sender, str) or sender not in ALLOWED_SENDERS or not isinstance(channel, str) or channel not in AGENT_CHANNELS:
+        raise AgentBridgeError('AUTH_FAIL', '来源未获持续对话灰度授权')
+
+
+def do_agent_message(app, payload):
+    if set(payload) - {'sender', 'channel', 'delivery_id', 'text'}:
+        raise AgentBridgeError('INVALID_MESSAGE', '消息含非白名单字段')
+    sender, channel = payload.get('sender'), payload.get('channel')
+    _agent_source(app, sender, channel)
+    try:
+        return app.agent.submit(sender, channel, payload.get('delivery_id'), payload.get('text'),
+                                app.current_project(channel))
+    except AgentError as exc:
+        raise AgentBridgeError(exc.code, exc.message) from None
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "agentbridge-worker"
     protocol_version = "HTTP/1.1"
@@ -2386,6 +2438,8 @@ class Handler(BaseHTTPRequestHandler):
             # 都在 JSON body 里，不读取任何 X-AgentBridge-* 转发头
             payload = self._body()
             route = self.path.rstrip("/")
+            if route == '/agent/messages':
+                return self._json(200, do_agent_message(APP, payload))
             if route == "/execute":
                 if payload.get("confirm") and (not payload.get("sender") or not payload.get("channel")):
                     raise AgentBridgeError("AUTH_FAIL", "远程确认必须提供可信发送者与会话身份")

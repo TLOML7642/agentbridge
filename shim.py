@@ -57,6 +57,8 @@ POLL_INTERVAL = float(os.environ.get("SHIM_POLL_INTERVAL", "1"))
 KEEPALIVE_SEC = int(os.environ.get("SHIM_KEEPALIVE_SEC", "10"))
 BODY_MAX = int(os.environ.get("SHIM_BODY_MAX", str(64 * 1024)))
 HTTP_TIMEOUT = int(os.environ.get("SHIM_HTTP_TIMEOUT", "60"))
+AGENT_ENABLED = os.environ.get('AGENTBRIDGE_AGENT_MESSAGES', '0') == '1'
+AGENT_CHANNELS = {s.strip() for s in os.environ.get('AGENTBRIDGE_AGENT_CHANNELS', '').split(',') if s.strip()}
 
 MODEL_ID = "agentbridge"
 
@@ -117,8 +119,15 @@ CONTROL_FIELDS = {
     "force": {"job_id", "delivery_id"}, "project.add": {"name", "dir", "delivery_id"},
     "project.rm": {"name", "delivery_id"}, "project.list": set(),
     "use": {"project", "delivery_id"},
+    "agent.status": {"message_id"}, "agent.new": {"delivery_id"},
+    "agent.cancel": {"message_id", "delivery_id"},
+    "agent.lookup": {"delivery_id"},
+    "agent.memory": set(), "agent.persona": set(),
+    "agent.memory.on": {"delivery_id"}, "agent.memory.off": {"delivery_id"},
+    "agent.forget": {"memory_id", "delivery_id"},
+    "agent.persona.set": {"name", "delivery_id"},
 }
-QUERY_OPS = frozenset(("status", "project.list", "diag", "jobs", "pending", "status.batch"))
+QUERY_OPS = frozenset(("status", "project.list", "diag", "jobs", "pending", "status.batch", "agent.status", "agent.lookup", "agent.memory", "agent.persona"))
 _HEALTH_LOCK = threading.Lock()
 _LAST_WORKER_HEALTH = None
 
@@ -132,6 +141,11 @@ def control_worker(payload: dict, meta: dict) -> dict:
         raise ApiError(400, "控制请求含非白名单字段", "invalid_control")
     if any(not isinstance(value, str) for key, value in payload.items() if key != "job_ids"):
         raise ApiError(400, "控制字段必须是字符串", "invalid_control")
+    if op.startswith('agent.'):
+        if not AGENT_ENABLED:
+            raise ApiError(404, '持续对话入口尚未启用', 'AGENT_DISABLED')
+        if not meta.get('sender') or meta['sender'] not in SENDER_ALLOW or meta.get('channel') not in AGENT_CHANNELS:
+            raise ApiError(403, '消息来源未获灰度授权', 'AUTH_FAIL')
     if op == "status.batch":
         ids = payload.get("job_ids")
         if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or any(not isinstance(i, str) or not i for i in ids):
@@ -440,6 +454,30 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._oai_error(401, "缺少或错误的 Bearer token", "auth_failed")
         route = self.path.rstrip("/")
+        if route == '/v1/agentbridge/messages':
+            try:
+                if not AGENT_ENABLED:
+                    raise ApiError(404, '持续对话入口尚未启用', 'AGENT_DISABLED')
+                sender = self.headers.get('X-AgentBridge-Sender', '').strip()
+                channel = self.headers.get('X-AgentBridge-Channel', '').strip()
+                if not sender or sender not in SENDER_ALLOW or not channel or channel not in AGENT_CHANNELS:
+                    raise ApiError(403, '消息来源未获灰度授权', 'AUTH_FAIL')
+                payload = self._read_body()
+                if set(payload) != {'delivery_id', 'text'}:
+                    raise ApiError(400, '消息字段必须是 delivery_id 与 text', 'INVALID_MESSAGE')
+                req = urllib.request.Request(_worker_base() + '/agent/messages',
+                    data=json.dumps({**payload, 'sender': sender, 'channel': channel}, ensure_ascii=False).encode(),
+                    headers={'X-AgentBridge-Secret': WORKER_SECRET, 'Content-Type': 'application/json'})
+                with urllib.request.urlopen(req, timeout=ACCEPT_TIMEOUT) as response:
+                    result = json.load(response)
+                code = result.get('code')
+                status = 403 if code == 'AUTH_FAIL' else 409 if code in ('DELIVERY_CONFLICT', 'SESSION_UNCERTAIN') else 404 if code == 'AGENT_DISABLED' else 400 if code == 'INVALID_MESSAGE' else 429 if code == 'BUSY' else 503 if result.get('ok') is not True else 202
+                return self._json(status, result)
+            except ApiError as exc:
+                self.close_connection = True
+                return self._oai_error(exc.status, exc.message, exc.code)
+            except Exception:
+                return self._oai_error(503, '消息受理结果未知，请以原投递 ID 查询或重试，勿新建', 'ACCEPT_UNKNOWN')
         if route == "/v1/responses":
             return self._oai_error(
                 404, "/v1/responses 未实现；请使用 /v1/chat/completions", "unsupported_endpoint")
@@ -452,8 +490,8 @@ class Handler(BaseHTTPRequestHandler):
                 meta = self._worker_meta()
                 result = control_worker(payload, meta)
                 code = result.get("code")
-                status = (403 if code == "AUTH_FAIL" else 404 if code == "NOT_FOUND" else
-                          409 if code == "AMBIGUOUS_ID" else 503 if code == "QUERY_UNAVAILABLE" else FAILURE_STATUS.get(code, 200))
+                status = (403 if code == "AUTH_FAIL" else 404 if code in ("NOT_FOUND", 'AGENT_DISABLED') else
+                          409 if code in ("AMBIGUOUS_ID", 'DELIVERY_CONFLICT', 'SESSION_UNCERTAIN') else 503 if code == "QUERY_UNAVAILABLE" else FAILURE_STATUS.get(code, 200))
                 return self._json(status, result)
             except ApiError as exc:
                 self.close_connection = True

@@ -18,6 +18,9 @@ from astrbot.core.star.filter.command import GreedyStr
 
 SHIM_URL = os.environ.get("AGENTBRIDGE_SHIM_URL", "http://127.0.0.1:8787/v1/chat/completions")
 CONTROL_URL = SHIM_URL.rsplit("/v1/", 1)[0] + "/v1/agentbridge/control"
+MESSAGES_URL = SHIM_URL.rsplit('/v1/', 1)[0] + '/v1/agentbridge/messages'
+AGENT_ENABLED = os.environ.get('AGENTBRIDGE_AGENT_MESSAGES', '0') == '1'
+AGENT_CHANNELS = {s.strip() for s in os.environ.get('AGENTBRIDGE_AGENT_CHANNELS', '').split(',') if s.strip()}
 TOKEN = os.environ.get("SHIM_TOKEN", "")
 TIMEOUT = int(os.environ.get("AGENTBRIDGE_MAC_TIMEOUT", "300"))
 NOTIFICATIONS_ENABLED = os.environ.get("AGENTBRIDGE_NOTIFICATIONS", "0") == "1"
@@ -38,6 +41,8 @@ class Main(star.Star):
         self._sender_task = None
         self._sender_stop = None
         self._sender_lease = None
+        self._agent_task = None
+        self._agent_stop = None
 
     def _data_root(self):
         root = Path(DATA_DIR) if DATA_DIR is not None else Path(star.StarTools.get_data_dir("agentbridge_mac"))
@@ -99,6 +104,11 @@ class Main(star.Star):
             db.execute("UPDATE notifications SET state='unknown',reason='sender_restarted' WHERE state='sending'")
 
     async def initialize(self):
+        if AGENT_ENABLED and self._agent_task is None:
+            self._agent_stop = asyncio.Event()
+            with self._agent_db() as db:
+                db.execute("UPDATE agent_outbox SET state='unknown' WHERE state='sending'")
+            self._agent_task = asyncio.create_task(self._agent_loop())
         if not NOTIFICATIONS_ENABLED or self._sender_task is not None:
             return
         lease = open(self._data_root() / "notification-sender.lock", "a")
@@ -115,6 +125,10 @@ class Main(star.Star):
 
     async def terminate(self):
         try:
+            if self._agent_task is not None:
+                self._agent_stop.set()
+                await self._agent_task
+                self._agent_task = None
             if self._sender_task is not None:
                 self._sender_stop.set()
                 await self._sender_task
@@ -136,6 +150,175 @@ class Main(star.Star):
         except Exception:
             return False
 
+    @contextmanager
+    def _agent_db(self):
+        path = self._data_root() / 'agent-outbox.db'
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        path.chmod(0o600)
+        with closing(sqlite3.connect(path, timeout=10)) as db, db:
+            db.row_factory = sqlite3.Row
+            db.execute('CREATE TABLE IF NOT EXISTS agent_outbox('
+                       'sender TEXT,channel TEXT,delivery TEXT,message_id TEXT,state TEXT,created REAL,'
+                       'PRIMARY KEY(sender,channel,delivery))')
+            yield db
+
+    def _agent_allowed(self, sender, channel):
+        return AGENT_ENABLED and channel in AGENT_CHANNELS and self._notification_allowed(sender, channel)
+
+    def _agent_delivery(self, event, text, project):
+        raw = getattr(event.message_obj, 'raw_message', None)
+        if not isinstance(raw, dict) or not (raw.get('message_id') or raw.get('msg_id')):
+            raise ValueError('stable adapter delivery id is required')
+        return self._delivery(event, text, project)
+
+    async def _agent_tick(self):
+        with self._agent_db() as db:
+            rows = [dict(row) for row in db.execute("SELECT * FROM agent_outbox WHERE state='watch' ORDER BY created LIMIT 50")]
+        for row in rows:
+            if not self._agent_allowed(row['sender'], row['channel']):
+                with self._agent_db() as db:
+                    db.execute("UPDATE agent_outbox SET state='blocked' WHERE sender=? AND channel=? AND delivery=?", (row['sender'], row['channel'], row['delivery']))
+                continue
+            source = type('AgentSource', (), {'get_sender_id': lambda self, value=row['sender']: value,
+                                            'unified_msg_origin': row['channel']})()
+            payload = ({'op': 'agent.status', 'message_id': row['message_id']} if row['message_id']
+                       else {'op': 'agent.lookup', 'delivery_id': row['delivery']})
+            try:
+                status, data = await self._control(source, payload)
+            except Exception:
+                continue
+            if status != 200 or not data.get('ok'):
+                continue
+            if data.get('state') not in ('done', 'failed', 'cancelled', 'uncertain'):
+                continue
+            text = data.get('reply') if data['state'] == 'done' else (
+                '这轮对话未完成，状态：' + data['state'] + '。不会自动重跑；可用 /agent status 查询，/agent new 开新会话。')
+            key = (row['sender'], row['channel'], row['delivery'])
+            with self._agent_db() as db:
+                claim = db.execute("UPDATE agent_outbox SET state='sending',message_id=? "
+                                   "WHERE sender=? AND channel=? AND delivery=? AND state='watch'", (data['message_id'], *key))
+                if claim.rowcount != 1:
+                    continue
+            state = 'blocked'
+            if self._agent_allowed(row['sender'], row['channel']):
+                try:
+                    result = await asyncio.wait_for(self._send_notification(row['channel'], str(text)), timeout=15)
+                    state = 'api_returned' if result else 'unknown'
+                except BaseException as exc:
+                    with self._agent_db() as db:
+                        db.execute("UPDATE agent_outbox SET state='unknown' WHERE sender=? AND channel=? AND delivery=?", key)
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    continue
+            with self._agent_db() as db:
+                db.execute('UPDATE agent_outbox SET state=? WHERE sender=? AND channel=? AND delivery=?', (state, *key))
+
+    async def _agent_loop(self):
+        while not self._agent_stop.is_set():
+            try:
+                await self._agent_tick()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self._agent_stop.wait(), timeout=2)
+            except TimeoutError:
+                pass
+
+    async def _agent_local(self, event, text):
+        sender, channel = str(event.get_sender_id()), event.unified_msg_origin
+        if not self._agent_allowed(sender, channel):
+            return
+        raw = getattr(event.message_obj, 'raw_message', None)
+        mid = (raw.get('message_id') or raw.get('msg_id')) if isinstance(raw, dict) else None
+        mid = mid or getattr(event.message_obj, 'message_id', '')
+        delivery = 'local-' + _fingerprint([sender, channel, str(mid)])[:32]
+        key = (sender, channel, delivery)
+        with self._agent_db() as db:
+            db.execute("INSERT OR IGNORE INTO agent_outbox VALUES (?,?,?,NULL,'pending',?)", (*key, time.time()))
+            claim = db.execute("UPDATE agent_outbox SET state='sending' WHERE sender=? AND channel=? AND delivery=? AND state='pending'", key)
+            if claim.rowcount != 1:
+                return
+        state = 'blocked'
+        if self._agent_allowed(sender, channel):
+            try:
+                returned = await asyncio.wait_for(self._send_notification(channel, str(text)), timeout=15)
+                state = 'api_returned' if returned else 'unknown'
+            except BaseException as exc:
+                with self._agent_db() as db:
+                    db.execute("UPDATE agent_outbox SET state='unknown' WHERE sender=? AND channel=? AND delivery=?", key)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return
+        with self._agent_db() as db:
+            db.execute('UPDATE agent_outbox SET state=? WHERE sender=? AND channel=? AND delivery=?', (state, *key))
+
+    @filter.regex(r'(?s)^.*$', priority=100)
+    async def agent_message(self, event: AstrMessageEvent):
+        sender, channel = str(event.get_sender_id()), event.unified_msg_origin
+        if not self._agent_allowed(sender, channel):
+            return
+        if not callable(getattr(event, 'is_private_chat', None)) or not event.is_private_chat():
+            return
+        text = event.get_message_str().strip()
+        if text.startswith('/mac') or re.fullmatch(r'确认\s+[0-9a-zA-Z]{6,}', text):
+            return
+        # Stop AstrBot's ordinary model path BEFORE network calls, including failures.
+        event.stop_event()
+        try:
+            components = getattr(event.message_obj, 'message', [])
+            if not text or not components or any(type(part).__name__ != 'Plain' for part in components):
+                await self._agent_local(event, '当前统一入口仅支持文字，图片和语音暂不处理。')
+                return
+            if text.startswith('/agent'):
+                parts = text.split()
+                if parts == ['/agent', 'new']:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.new', 'delivery_id': delivery})
+                elif parts in (['/agent', 'memory'], ['/agent', 'persona']):
+                    status, data = await self._control(event, {'op': 'agent.' + parts[1]})
+                elif parts[:3] == ['/agent', 'persona', 'name'] and len(parts) >= 4:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.persona.set', 'name': ' '.join(parts[3:]), 'delivery_id': delivery})
+                elif parts[:2] == ['/agent', 'memory'] and len(parts) == 3 and parts[2] in ('on', 'off'):
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.memory.' + parts[2], 'delivery_id': delivery})
+                elif parts[:2] == ['/agent', 'forget'] and len(parts) == 3:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.forget', 'memory_id': parts[2], 'delivery_id': delivery})
+                elif parts[:2] == ['/agent', 'status'] and len(parts) <= 3:
+                    status, data = await self._control(event, {'op': 'agent.status', **({'message_id': parts[2]} if len(parts) == 3 else {})})
+                elif parts[:2] == ['/agent', 'cancel'] and len(parts) == 3:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.cancel', 'message_id': parts[2], 'delivery_id': delivery})
+                else:
+                    await self._agent_local(event, '用法：/agent new；/agent status [消息ID]；/agent cancel <消息ID>；/agent memory [on|off]；/agent forget <偏好ID>；/agent persona。当前写入未启用。')
+                    return
+                if data.get('preferences') is not None:
+                    reply = (data['core']['name'] + '；自动学习：' + ('开' if data['learning'] else '关')
+                             + '\n' + ('\n'.join(f"{item['id']} {item['category']}={item['value']} 来源:{item['source']}" for item in data['preferences']) or '暂无有效长期偏好。'))
+                elif data.get('messages') is not None:
+                    reply = '\n'.join(f"{item['message_id']} {item['state']} @{item['project']}" for item in data['messages']) or '暂无对话记录。'
+                else:
+                    reply = data.get('reply') or data.get('message') or data.get('state') or str(data.get('error', {}).get('message', status))
+                await self._agent_local(event, reply)
+                return
+            raw = getattr(event.message_obj, 'raw_message', None)
+            if not isinstance(raw, dict) or not (raw.get('message_id') or raw.get('msg_id')):
+                await self._agent_local(event, '缺少稳定消息编号，本次未调用模型；请检查适配器消息标识。')
+                return
+            delivery, _ = self._agent_delivery(event, text, 'agent-chat')
+            with self._agent_db() as db:
+                db.execute("INSERT OR IGNORE INTO agent_outbox VALUES (?,?,?,NULL,'watch',?)", (sender, channel, delivery, time.time()))
+            status, data = await self._request(event, MESSAGES_URL, {'delivery_id': delivery, 'text': text})
+            if data.get('message_id'):
+                with self._agent_db() as db:
+                    db.execute('UPDATE agent_outbox SET message_id=? WHERE sender=? AND channel=? AND delivery=?', (data['message_id'], sender, channel, delivery))
+                await self._agent_tick()
+            else:
+                await self._agent_local(event, '消息受理未确认，不会改用另一个聊天模型。可用 /agent status 查询；重复投递会复用原编号。')
+        except Exception:
+            await self._agent_local(event, 'DSH 对话入口暂不可用，不会自动切换模型或新建任务。请查询原消息状态。')
     @staticmethod
     def _excerpt(text):
         text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----", "[密钥已隐藏]", str(text))

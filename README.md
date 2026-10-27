@@ -4,7 +4,9 @@
 
 > 当前是可审计的个人远程任务桥接器，不是已经完成“人格、长期记忆、日常聊天与电脑操作统一”的完整 Agent。公开仓库保存源码、测试和文档，不包含个人运行数据，也不是开箱即用的生产部署包。
 
-统一 Agent 的阶段 A 已验证原生会话、人格作用域、取消和工具守卫。原生接口存在守卫后工具名/参数可被替换的缺口，现已增加桥接自有执行保护层，保护组通过合成检查，未部署或接入现有 `/mac`。原生失败对照仍保留，不宣称官方接口已修复。见[原始停止记录](NATIVE-STAGE-A-20261027.md)和[执行边界修复](NATIVE-BOUNDARY-20261027.md)。聊天、记忆和真实审批链路尚未交付。
+统一 Agent 源码已接通认证消息入口、独立聊天名额、DSH 原生持久会话、微信回复对账，以及有限规则的共享人格偏好。**新路由与自动学习默认关闭，尚未生产灰度；新入口只有审核读取，没有文件写入或命令执行。** 持久审批宿主已通过真实原生工具守卫的合成对接，但还没有接入后台写入任务，不能把它当成已可用的微信审批链路。
+
+阶段 A 发现的原生工具名/参数替换失败对照仍保留；新驱动使用桥接自有保护层，不宣称官方接口已修复，也不把保护层自动套用到旧 `/mac`。见[原始停止记录](NATIVE-STAGE-A-20261027.md)、[执行边界修复](NATIVE-BOUNDARY-20261027.md)和最新 [CHANGELOG](CHANGELOG.md)。
 
 ## 目标与当前状态
 
@@ -19,12 +21,17 @@
 - 显式异步受理、同事务终态事件、持久化通知订阅。
 - 通知发送认领和未知结果处理，避免超时后盲目重复通知。
 - 合成后端、取消竞态、通知故障及独立回环 SSH 环境回归测试。
+- 默认关闭的普通文字消息入口：DSH create/resume、来源和项目独立会话、重复投递去重、串行聊天和持久发送认领。
+- 新入口只读文件列表、小文本读取及当前来源任务快照；读取使用目录描述符逐级定位，拒绝符号链接和敏感目录，单独允许 `/etc/hosts`。
+- 私有原生完成收据：正常完成后先 flush、dispose、fsync，再回传；worker 重启可核对收据，缺失/不匹配时不重跑未知消息。
+- 默认关闭的有限偏好学习、纠正、忘记、学习开关，以及不修改默认 preset 的专属桌面人格安装工具。
+- 独立持久审批宿主：绑定来源/原会话/项目/执行尝试/工具和实际参数摘要，单次消费，重启撤销未消耗授权；目前仅合成原生接点验证，未接任务执行器。
 
 **尚未实现：**
 
-- 普通聊天自动调用 DSH。目前只有 `/mac` 任务走桥接。
-- AstrBot 聊天记录与 DSH 的统一持续会话、长期记忆。
-- 人格培养插件的接入和兼容性验证。
+- 新聊天、人格和偏好的生产灰度，以及真实手机验收、三十分钟链路观察。
+- 新后台文件/命令任务、持久工具审批的微信确认入口和结果事件回填；不能用旧 `/mac` 代替新入口的硬审批。
+- 正式桌面专属 preset 安装；现有默认 preset 和旧会话未接管。
 - 对任意桌面应用的完整 GUI 自动操作。
 
 模型接口、会话记忆和电脑工具是不同层次。两边都使用 DeepSeek，并不会自动共享上下文或权限。背景见 [接入调查](ASTRBOT-INTEGRATION-20261026.md)。
@@ -32,19 +39,16 @@
 ## 架构
 
 ```text
-微信私聊
-  -> AstrBot + agentbridge_mac 插件
-  -> 本地认证 shim（OpenAI 兼容接口与控制接口）
-  -> 专用 SSH 反向隧道
-  -> Mac worker（任务状态、调度、执行监督）
-  -> DSH headless（一次性任务）
+微信私聊 -> AstrBot 适配 -> 认证 shim -> 既有 SSH 隧道 -> Mac worker
+  /mac：既有调度器 -> DSH headless 一次性任务（保留旧行为）
+  普通文字：独立聊天队列 -> 短生命周期原生驱动 -> create/resume 持久会话
 
 完成结果：worker SQLite 终态事件 -> 插件对账 -> AstrBot 消息 API -> 微信
 ```
 
 worker 和 shim 只绑定回环地址。SSH 隧道是既有传输方式，不要求新增公网应用端口。
 
-当前 worker 注入的是按项目组织的短任务摘要，不是 DSH 原生会话续接，也不等于跨来源共享聊天历史。
+旧 `/mac` 仍注入短任务摘要。新入口原生续接同一来源/项目的会话，并注入该来源的任务快照；快照不是新的后台任务事件回填，也不会导入 AstrBot 或桌面旧聊天。普通消息被灰度插件接管后先停止 AstrBot 模型路径；失败也不自动切换另一模型。由于停止事件后的普通 yield 会被框架丢弃，回复经持久认领直接调用消息 API。
 
 ## 使用方式
 
@@ -70,6 +74,20 @@ worker 和 shim 只绑定回环地址。SSH 隧道是既有传输方式，不要
 
 任务 ID 前缀匹配必须在来源范围内唯一。歧义不会自动选择最近任务。
 
+### 新文字入口与偏好控制（源码已实现，生产未启用）
+
+worker、shim 和插件必须同时显式开启 `AGENTBRIDGE_AGENT_MESSAGES=1`，并配置一致的 `AGENTBRIDGE_AGENT_CHANNELS` 及既有发送者允许列表。插件仍核对 AstrBot 来源允许列表和私聊类型；缺少稳定适配器消息 ID、非文字或混合媒体均不调用模型。其他来源和原 `/mac` 保持不变。
+
+- `/agent new`：新建独立对话上下文，保留人格、有效偏好和原记录。
+- `/agent status [消息ID]`、`/agent cancel <消息ID>`：直接查询/取消，不等待模型；运行中取消只有证实执行器停止才确认。
+- `/agent memory`、`/agent memory on|off`：查看偏好、关闭或恢复学习。恢复还要求宿主独立启用 `AGENTBRIDGE_AGENT_LEARNING=1`。
+- `/agent forget <偏好ID>`：停止后续注入和重新提取该值，不删除原始聊天记录。
+- `/agent persona`、`/agent persona name <名字>`：查看人格或显式修改名字；自动学习不能修改核心名字和权限。
+
+偏好学习不是训练模型权重。只从短的、直接偏好表述提取有限类别，不从模型、文件、工具结果或引用学习；推断要有两条独立消息，九十天过期。敏感内容和含糊表述保守跳过。偏好只按同一可信发送者共享，不共享全部会话历史。用户关闭学习后仍可使用已有有效偏好。
+
+`tools/install_shared_persona.py --profile <私有偏好快照绝对路径>` 可安装可选、纯聊天的 `dsh-shared` preset；先在临时 HOME 验证。它不修改默认 preset，不读旧会话，不覆盖内容不同的已有文件，也不为桌面增加电脑工具。当前仅临时安装验证通过，未对正式桌面执行。
+
 ### 如何理解状态
 
 - 受理表示任务已登记，不表示已经执行或执行成功。
@@ -87,6 +105,8 @@ worker 和 shim 只绑定回环地址。SSH 隧道是既有传输方式，不要
 - Bearer token 和 worker 共享密钥分别用于两段认证，必须保存在仓库外的私有文件或系统凭据设施中。
 - 文字分类只是粗筛，不是工具级硬审批。敏感任务确认与 DSH 权限配置仍有各自边界。
 - 当前规则会把部分只读系统路径查询归为需提权任务，并强制只产计划。这是已知体验问题，不能通过直接移除保护来“修复”。
+- 上一条只描述旧 `/mac` 分类。新入口直接审核读取 `/etc/hosts`，不走文字提权分类；仍没有通用 shell 或写入工具。
+- 原生保护层和持久审批宿主不构成任意恶意宿主 JavaScript 的沙箱。审批宿主只接受宿主审核的工具和扁平字符串参数，不允许嵌套请求或模型注册执行器；后台生产接线尚未完成。
 - 不自动提交 sudo 密码；不承诺隔离远端免密 sudo 等主机侧能力。
 - 取消不撤销已发生的副作用。主动脱离受控进程组的后代是已知边界。
 - 通知摘录脱敏不是任意敏感内容都不会泄漏的保证。不要通过聊天索取凭据或完整私密文件。
@@ -133,6 +153,12 @@ cd agentbridge
 | `AGENTBRIDGE_SHIM_URL` | 插件访问 shim 的地址 | `http://127.0.0.1:8787/v1/chat/completions` |
 | `AGENTBRIDGE_NOTIFICATIONS` | 插件异步通知开关 | `0`，独立启用 |
 | `AGENTBRIDGE_RUNNING_CANCEL` | worker 运行中取消开关 | `0`，独立启用 |
+| `AGENTBRIDGE_AGENT_MESSAGES` | worker/shim/插件新文字入口开关 | `0`，三处同时配置 |
+| `AGENTBRIDGE_AGENT_CHANNELS` | 新入口的灰度来源列表 | 必须显式配置，不能替代发送者允许列表 |
+| `AGENTBRIDGE_AGENT_LEARNING` | worker 偏好学习宿主开关 | `0`，和路由独立 |
+| `AGENTBRIDGE_AGENT_NODE` | 固定原生驱动运行时 | 已安装的 DSH Node，不自动升级 |
+| `AGENTBRIDGE_AGENT_PACKAGES` | 固定原生模块目录 | 已安装的 `dsh-0.1.1-rc.2` 包目录 |
+| `AGENTBRIDGE_AGENT_CREDENTIALS`、`AGENTBRIDGE_AGENT_CREDENTIAL_REF` | 原生凭据文件及引用 | 只读官方解析、仅内存兼容旧格式，不改写凭据 |
 
 AstrBot 的 `platform_settings.id_whitelist` 也必须登记自己的消息来源。切勿为解决空白名单而伪造身份、开放所有人，或覆盖原配置。
 
@@ -151,6 +177,7 @@ AstrBot 的 `platform_settings.id_whitelist` 也必须登记自己的消息来�
 - `GET /v1/models`：兼容模型列表。
 - `POST /v1/chat/completions`：默认等待，显式 `Prefer: respond-async` 才异步受理。
 - `POST /v1/agentbridge/control`：固定操作白名单，含状态、列表、确认、拒绝、取消和项目管理；`status.batch` 最多五十项。
+- `POST /v1/agentbridge/messages`：默认关闭的认证普通消息入口，正文仅 `delivery_id`、`text`，身份来自可信消息事件转送的认证头。会话和项目由 worker 决定，模型不能指定。返回 202 仅表示已受理，需按原投递 ID 对账。
 - `/v1/responses` 未实现，明确返回 404。
 
 客户端必须按协议提供认证、可信来源和稳定投递 ID。不要将此接口当成通用公开模型服务，也不要让模型自由提供来源身份、URL 或控制操作正文。
@@ -168,11 +195,18 @@ python3 -B -m unittest test_experience test_stability test_tunnel_isolation
 
 # 首轮核心回归，随后二十轮指定故障与并发组
 python3 -B tools/run_regressions.py
+
+# 新入口、私有读取和持久审批组，原生测试必须显式给出固定安装路径
+AGENTBRIDGE_TEST_NATIVE_NODE=<固定Node路径> \
+AGENTBRIDGE_TEST_NATIVE_PACKAGES=<固定模块目录> \
+python3 -B -m unittest test_agent_runtime test_agent_reads test_agent_approvals
 ```
 
 测试需要本地进程和回环端口权限；环境阻止绑定或启动独立 sshd 时，应报告失败及测试缺口，不关闭断言或把跳过写成通过。`run_regressions.py` 的首轮模块列表不等于自动发现全部文件，发布验证应同时运行完整自动发现。
 
 2026-10-26 的冻结组件记录为：154 项首轮加二十轮各 55 项，共 1254 次执行通过；随后发布工具补测后的自动发现为 157 项通过。这是历史证据，不自动代表后续提交通过。真实手机受理和最终通知已获得反馈；确认、拒绝、列表等仍需分别验收。
+
+2026-10-27 当前源码：完整隔离自动发现 229 项通过；新聊天/偏好/读取/持久审批组连续二十轮各 63 项通过，无跳过。真实中性原生会话两轮跨进程续接及持久收据匹配已验证，仍不是微信或完整后台写入工作流验收。失败与部署边界见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 源码与文档
 
@@ -180,7 +214,11 @@ python3 -B tools/run_regressions.py
 | --- | --- |
 | `worker.py` | Mac 调度、持久化、执行生命周期及取消监督 |
 | `shim.py` | 认证、OpenAI 兼容入口和控制路由 |
-| `native_boundary.mjs` | 后续专用原生 Agent 的工具执行保护层，尚未接入生产 worker |
+| `native_boundary.mjs` | 专用原生 Agent 的工具执行保护层，新只读驱动已使用，未生产灰度 |
+| `agent_runtime.py`、`agent_driver.mjs` | 独立聊天名额、持久消息和原生会话短驱动，默认关闭 |
+| `agent_reads.py` | 描述符相对的审核读取，不启动 shell、不写文件 |
+| `agent_approvals.py` | 重启失效、单次消费的持久工具审批宿主，尚未接入后台任务 |
+| `agent_persona.mjs`、`tools/install_shared_persona.py` | 共享偏好渲染与可选纯聊天桌面 preset |
 | `server/plugins/agentbridge_mac/` | AstrBot 命令和持久化通知插件 |
 | `server/docker_control/` | 原部署的凭据维护脚本，运行前需审查环境 |
 | `test_*.py` | 合成回归测试 |

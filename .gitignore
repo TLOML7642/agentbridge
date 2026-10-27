@@ -3,6 +3,11 @@
 !/worker.py
 !/shim.py
 !/native_boundary.mjs
+!/agent_runtime.py
+!/agent_driver.mjs
+!/agent_persona.mjs
+!/agent_approvals.py
+!/agent_reads.py
 !/test_*.py
 !/tools/
 /tools/*
