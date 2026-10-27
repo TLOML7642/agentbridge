@@ -2,6 +2,7 @@
 !/.gitignore
 !/worker.py
 !/shim.py
+!/native_boundary.mjs
 !/test_*.py
 !/tools/
 /tools/*
@@ -23,6 +24,7 @@
 !/IMPLEMENTATION-20261026.md
 !/ASTRBOT-INTEGRATION-20261026.md
 !/NATIVE-STAGE-A-20261027.md
+!/NATIVE-BOUNDARY-20261027.md
 !/README.md
 !/LICENSE
 !/CHANGELOG.md

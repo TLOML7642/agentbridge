@@ -20,6 +20,28 @@ REQUIRED_CHECKS = frozenset({
     "cancel_before_dispatch_and_resume_without_replay",
     "guard_binds_actual_dispatch_parameters",
     "guard_binds_actual_dispatch_tool",
+    "boundary_allows_approved_action_once",
+    "boundary_reads_need_no_approval",
+    "boundary_writes_default_off",
+    "boundary_denies_missing_or_foreign_identity",
+    "boundary_denies_unwrapped_registration",
+    "boundary_registry_replacement_revokes_inflight",
+    "boundary_scoped_shadow_revokes_inflight",
+    "boundary_rechecks_after_async_consumption",
+    "boundary_cancel_cannot_be_replaced",
+    "boundary_denies_stale_changed_or_missing_grants",
+    "boundary_pre_hook_cannot_discard_denial",
+    "boundary_nested_dispatch_cannot_inherit_grant",
+    "boundary_seals_all_execution_identity_fields",
+    "boundary_pre_hook_parameter_change_denied",
+    "boundary_pending_approval_cancel_discards_late_allow",
+    "boundary_consumption_failure_spends_execution",
+    "boundary_expiry_rechecked_before_action",
+    "boundary_one_approval_id_cannot_authorize_two_calls",
+    "boundary_action_can_only_enter_once",
+    "boundary_disabled_services_and_command_bypasses_denied",
+    "boundary_pins_and_rechecks_native_subject",
+    "boundary_directory_replacement_denied",
 })
 
 
@@ -36,6 +58,7 @@ def gate_passed(report, returncode):
     if any(not isinstance(name, str) for name in names) or set(names) != REQUIRED_CHECKS:
         return False
     return (report.get("stage") == "A"
+            and report.get("boundary") == "protected"
             and report.get("gatePassed") is True
             and report.get("productionChanged") is False
             and type(report.get("realModelCalls")) is int
@@ -45,7 +68,7 @@ def gate_passed(report, returncode):
             and all(check.get("passed") is True for check in checks))
 
 
-def run_probe(node, packages):
+def run_probe(node, packages, native_only=False):
     node = Path(node).expanduser().absolute()
     packages = Path(packages).expanduser().resolve(strict=True)
     if not node.is_file() or not os.access(node, os.X_OK):
@@ -59,7 +82,8 @@ def run_probe(node, packages):
             "TMPDIR": scratch, "ELECTRON_RUN_AS_NODE": "1",
             "AGENTBRIDGE_PROBE_PACKAGES": str(packages),
         }
-        result = subprocess.run([str(node), str(script)], cwd=scratch, env=env,
+        command = [str(node), str(script)] + (["--native-only"] if native_only else [])
+        result = subprocess.run(command, cwd=scratch, env=env,
                                 capture_output=True, text=True, timeout=45)
         if result.stderr or result.returncode not in (0, 2):
             raise RuntimeError("native probe failed to complete; stage A is not approved")
@@ -76,9 +100,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--node", required=True, help="installed pinned Node/Electron executable")
     parser.add_argument("--packages", required=True, help="installed @deepseek-ai package directory")
+    parser.add_argument("--native-only", action="store_true", help="unprotected diagnostic control; never release approval")
     args = parser.parse_args()
     try:
-        report, code = run_probe(args.node, args.packages)
+        report, code = run_probe(args.node, args.packages, args.native_only)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         print("Stage A probe incomplete; no approval or activation.", file=sys.stderr)
         return 1

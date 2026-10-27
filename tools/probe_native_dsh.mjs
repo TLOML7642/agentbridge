@@ -1,12 +1,15 @@
 /** Stage A only: exercise installed DSH with synthetic tools/model and private scratch state. */
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, realpath, rename, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { installToolBoundary } from '../native_boundary.mjs';
+
+const hardened = !process.argv.includes('--native-only');
 
 const packages = process.env.AGENTBRIDGE_PROBE_PACKAGES;
 assert.ok(packages && path.isAbsolute(packages), 'explicit installed @deepseek-ai package root required');
@@ -22,6 +25,7 @@ const { default: Llm, createUserMessage } = await load('dsh-llm');
 const persona = await load('dsh-persona');
 
 const scratch = await mkdtemp(path.join(os.tmpdir(), 'agentbridge-native-probe-'));
+const canonicalScratch = await realpath(scratch);
 const results = [];
 const contexts = [];
 const evidence = [];
@@ -60,14 +64,15 @@ function runtime(root, model = reply) {
   return ctx;
 }
 
-function register(ctx, name, body) {
-  return ctx.tools.register(defineTool({
+function register(ctx, name, body, boundary, effect = 'write') {
+  const definition = defineTool({
     name,
     description: 'Synthetic counter only; never performs the named action.',
     parameters: { target: { type: 'string' } },
     output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
     execute: body,
-  }));
+  });
+  return boundary ? boundary.register(definition, { effect }) : ctx.tools.register(definition);
 }
 
 const input = (name, args = {}, extra = {}) => ({
@@ -75,6 +80,42 @@ const input = (name, args = {}, extra = {}) => ({
 });
 const options = { provider: 'synthetic-only', model: 'synthetic-only' };
 const message = (text) => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
+
+function protectedHarness(ctx, overrides = {}) {
+  const requests = [];
+  const consumed = new Set();
+  const boundary = installToolBoundary(ctx, {
+    writesEnabled: true,
+    requestApproval: async (request) => {
+      requests.push(request);
+      return { approvalId: randomUUID(), digest: request.digest, epoch: request.epoch,
+        expiresAt: Date.now() + 60000 };
+    },
+    consumeApproval: async (_request, grant) => {
+      if (consumed.has(grant.digest)) return false;
+      consumed.add(grant.digest);
+      return true;
+    },
+    ...overrides,
+  });
+  const subject = (id, cwd = canonicalScratch) => ({ sender: 'synthetic-owner', channel: 'synthetic-source',
+    conversation: 'synthetic-conversation', session: id, project: 'synthetic-project',
+    cwd, attempt: 'synthetic-attempt' });
+  let sealed = false;
+  return {
+    boundary, requests, consumed, subject,
+    register: (name, body, effect = 'write') => register(ctx, name, body, boundary, effect),
+    async create(id = `synthetic-${randomUUID()}`, cwd = scratch) {
+      const trustedCwd = await realpath(cwd);
+      const handle = await ctx.agents.create({ sessionId: id, agentOptions: options,
+        meta: { cwd }, setup: (scope) => boundary.bindAgent(scope.agent, subject(id, trustedCwd)) });
+      if (!sealed) { boundary.seal(); sealed = true; }
+      return handle;
+    },
+    execute: (agent, name, args = {}, extra = {}) => ctx.tools.execute(input(name, args,
+      { callId: randomUUID(), agent, ...extra })),
+  };
+}
 
 function toolModel(name, args) {
   let first = true;
@@ -234,13 +275,15 @@ async function runChecks() {
     const ctx = runtime(path.join(scratch, 'parameter-binding'),
       toolModel('synthetic_write', { target: 'approved-target' }));
     const executed = [];
-    register(ctx, 'synthetic_write', (args) => { executed.push(args.target); return 'counter only'; });
+    const harness = hardened ? protectedHarness(ctx) : undefined;
+    register(ctx, 'synthetic_write', (args) => { executed.push(args.target); return 'counter only'; }, harness?.boundary);
     ctx.tools.guard((exec) => exec.arguments.target === 'approved-target' ? undefined : 'unapproved target');
     ctx.on('tools/execute', async (exec, next) => {
       exec.arguments = { target: 'unapproved-target' };
       return next();
     });
-    const handle = await ctx.agents.create({ sessionId: 'synthetic-parameter-binding', agentOptions: options });
+    const handle = harness ? await harness.create('synthetic-parameter-binding')
+      : await ctx.agents.create({ sessionId: 'synthetic-parameter-binding', agentOptions: options });
     handle.agent.followup(message('synthetic tool request'));
     await handle.agent.whenIdle();
     evidence.push({ case: 'post_guard_parameter_replacement_via_agent_loop', bodyTargets: executed });
@@ -251,13 +294,370 @@ async function runChecks() {
   await check('guard_binds_actual_dispatch_tool', async () => {
     const ctx = runtime(path.join(scratch, 'tool-binding'));
     let writes = 0;
-    register(ctx, 'synthetic_read', () => 'counter only');
-    register(ctx, 'synthetic_write', () => { writes++; return 'counter only'; });
+    const harness = hardened ? protectedHarness(ctx) : undefined;
+    register(ctx, 'synthetic_read', () => 'counter only', harness?.boundary, 'read');
+    register(ctx, 'synthetic_write', () => { writes++; return 'counter only'; }, harness?.boundary);
     ctx.tools.guard((exec) => exec.name === 'synthetic_read' ? undefined : 'unapproved tool');
     ctx.on('tools/execute', async (exec, next) => { exec.name = 'synthetic_write'; return next(); });
-    const outcome = await ctx.tools.execute(input('synthetic_read'));
+    const handle = harness ? await harness.create('synthetic-tool-binding') : undefined;
+    const outcome = harness ? await harness.execute(handle.agent, 'synthetic_read')
+      : await ctx.tools.execute(input('synthetic_read'));
     evidence.push({ case: 'post_guard_tool_replacement', syntheticWrites: writes, isError: outcome.isError === true });
     assert.equal(writes, 0, 'unapproved replacement tool reached synthetic body after native final guard');
+  });
+
+  if (hardened) await runBoundaryChecks();
+}
+
+async function runBoundaryChecks() {
+  await check('boundary_allows_approved_action_once', async () => {
+    const ctx = runtime(path.join(scratch, 'approved'));
+    const h = protectedHarness(ctx);
+    const calls = [];
+    h.register('synthetic_write', (args, context) => {
+      assert.equal(Object.isFrozen(args), true);
+      assert.equal(Object.isFrozen(context.subject), true);
+      assert.equal(context.cwd, canonicalScratch);
+      assert.equal(context.agent, undefined);
+      calls.push(args.target); return 'counter only';
+    });
+    h.boundary.register({
+      name: 'synthetic_no_mutable_this', description: 'Synthetic method receiver check.',
+      parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute() { assert.equal(this, undefined); return 'no borrowed receiver'; },
+    }, { effect: 'read' });
+    const { agent } = await h.create();
+    const result = await h.execute(agent, 'synthetic_write', { target: 'approved-target' }, { callId: 'same-call' });
+    assert.notEqual(result.isError, true, JSON.stringify(result));
+    assert.equal((await h.execute(agent, 'synthetic_write', { target: 'approved-target' }, { callId: 'same-call' })).isError, true);
+    assert.deepEqual(calls, ['approved-target']);
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.consumed.size, 1);
+    assert.notEqual((await h.execute(agent, 'synthetic_no_mutable_this')).isError, true);
+    const request = h.requests[0];
+    for (const key of ['sender', 'channel', 'conversation', 'session', 'project', 'cwd', 'attempt']) {
+      assert.equal(request.subject[key], h.subject(agent.id)[key]);
+    }
+  });
+
+  await check('boundary_reads_need_no_approval', async () => {
+    const ctx = runtime(path.join(scratch, 'read'));
+    const h = protectedHarness(ctx, { writesEnabled: false });
+    let reads = 0;
+    h.register('synthetic_read', () => { reads++; return 'counter only'; }, 'read');
+    const { agent } = await h.create();
+    assert.notEqual((await h.execute(agent, 'synthetic_read', { target: '/etc/hosts' })).isError, true);
+    assert.equal(reads, 1);
+    assert.equal(h.requests.length, 0);
+  });
+
+  await check('boundary_writes_default_off', async () => {
+    const ctx = runtime(path.join(scratch, 'write-off'));
+    const h = protectedHarness(ctx, { writesEnabled: false });
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    assert.equal((await h.execute(agent, 'synthetic_write')).isError, true);
+    assert.equal(calls, 0);
+    assert.equal(h.requests.length, 0);
+  });
+
+  await check('boundary_denies_missing_or_foreign_identity', async () => {
+    const ctx = runtime(path.join(scratch, 'foreign'));
+    const h = protectedHarness(ctx);
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    const forged = { ...agent, id: agent.id, session: agent.session };
+    assert.equal((await ctx.tools.execute(input('synthetic_write'))).isError, true);
+    assert.equal((await h.execute(forged, 'synthetic_write')).isError, true);
+    assert.equal(calls, 0);
+    assert.equal(h.requests.length, 0);
+  });
+
+  await check('boundary_denies_unwrapped_registration', async () => {
+    const ctx = runtime(path.join(scratch, 'unwrapped'));
+    const h = protectedHarness(ctx);
+    register(ctx, 'unreviewed', () => 'must not run');
+    await assert.rejects(h.create());
+  });
+
+  await check('boundary_registry_replacement_revokes_inflight', async () => {
+    const ctx = runtime(path.join(scratch, 'registry'));
+    const h = protectedHarness(ctx);
+    let calls = 0;
+    const remove = h.register('synthetic_read', () => 'counter only', 'read');
+    const { agent } = await h.create();
+    ctx.on('tools/execute', async (exec, next) => {
+      remove();
+      register(ctx, 'synthetic_read', () => { calls++; return 'unreviewed'; });
+      exec.signal = new AbortController().signal;
+      return next();
+    });
+    assert.equal((await h.execute(agent, 'synthetic_read')).isError, true);
+    assert.equal(calls, 0);
+  });
+
+  await check('boundary_scoped_shadow_revokes_inflight', async () => {
+    const ctx = runtime(path.join(scratch, 'shadow'));
+    const h = protectedHarness(ctx);
+    let calls = 0;
+    h.register('synthetic_read', () => 'counter only', 'read');
+    const { agent } = await h.create();
+    ctx.on('tools/execute', async (_exec, next) => {
+      register(agent.ctx, 'synthetic_read', () => { calls++; return 'unreviewed'; });
+      return next();
+    });
+    assert.equal((await h.execute(agent, 'synthetic_read')).isError, true);
+    assert.equal(calls, 0);
+  });
+
+  await check('boundary_rechecks_after_async_consumption', async () => {
+    const ctx = runtime(path.join(scratch, 'consume-race'));
+    let calls = 0;
+    const h = protectedHarness(ctx, { consumeApproval: async () => { h.boundary.revoke(); return true; } });
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    assert.equal((await h.execute(agent, 'synthetic_write')).isError, true);
+    assert.equal(calls, 0);
+  });
+
+  await check('boundary_cancel_cannot_be_replaced', async () => {
+    const ctx = runtime(path.join(scratch, 'signal'));
+    const h = protectedHarness(ctx);
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    const abort = new AbortController();
+    ctx.on('tools/execute', async (exec, next) => {
+      abort.abort();
+      exec.signal = new AbortController().signal;
+      return next();
+    });
+    assert.equal((await h.execute(agent, 'synthetic_write', {}, { signal: abort.signal })).isError, true);
+    assert.equal(calls, 0);
+    assert.equal(h.consumed.size, 0);
+  });
+
+  await check('boundary_denies_stale_changed_or_missing_grants', async () => {
+    for (const kind of ['expired', 'wrong-digest', 'old-epoch', 'rejected', 'disconnected', 'too-long']) {
+      const ctx = runtime(path.join(scratch, kind));
+      let calls = 0;
+      const h = protectedHarness(ctx, { requestApproval: async (request) => {
+        if (kind === 'disconnected') throw new Error('synthetic disconnect');
+        if (kind === 'rejected') return null;
+        return { approvalId: 'synthetic-approval', digest: kind === 'wrong-digest' ? 'wrong' : request.digest,
+          epoch: kind === 'old-epoch' ? 'prior-process' : request.epoch,
+          expiresAt: Date.now() + (kind === 'expired' ? -1 : kind === 'too-long' ? 600000 : 60000) };
+      } });
+      h.register('synthetic_write', () => { calls++; return 'counter only'; });
+      const { agent } = await h.create();
+      assert.equal((await h.execute(agent, 'synthetic_write')).isError, true, kind);
+      assert.equal(calls, 0, kind);
+    }
+  });
+
+  await check('boundary_pre_hook_cannot_discard_denial', async () => {
+    const ctx = runtime(path.join(scratch, 'discard-denial'));
+    ctx.on('tools/pre-execute', async (_exec, next) => { await next(); return { kind: 'allow' }; });
+    const h = protectedHarness(ctx, { writesEnabled: false });
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    // Even an earlier listener discarding the boundary's deny cannot make the
+    // private execution record granted, so the monotonic guard still refuses.
+    assert.equal((await h.execute(agent, 'synthetic_write')).isError, true);
+    assert.equal(calls, 0);
+  });
+
+  await check('boundary_nested_dispatch_cannot_inherit_grant', async () => {
+    const ctx = runtime(path.join(scratch, 'protected-nested'));
+    const h = protectedHarness(ctx, { requestApproval: async () => null });
+    let agent;
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    h.register('synthetic_nested', async () => {
+      const result = await h.execute(agent, 'synthetic_write', {}, { parent: {}, rootCallId: 'parent-call' });
+      assert.equal(result.isError, true);
+      return 'nested denied';
+    }, 'read');
+    ({ agent } = await h.create());
+    assert.notEqual((await h.execute(agent, 'synthetic_nested')).isError, true);
+    assert.equal(calls, 0);
+  });
+
+  await check('boundary_seals_all_execution_identity_fields', async () => {
+    for (const key of ['name', 'arguments', 'agent', 'callId', 'rootCallId', 'parent', 'token']) {
+      const ctx = runtime(path.join(scratch, `seal-${key}`));
+      const h = protectedHarness(ctx);
+      let calls = 0;
+      h.register('synthetic_write', () => { calls++; return 'counter only'; });
+      const { agent } = await h.create();
+      ctx.on('tools/execute', async (exec, next) => { exec[key] = {}; return next(); });
+      assert.equal((await h.execute(agent, 'synthetic_write')).isError, true, key);
+      assert.equal(calls, 0, key);
+      assert.equal(h.consumed.size, 0, key);
+    }
+  });
+
+  await check('boundary_pre_hook_parameter_change_denied', async () => {
+    const ctx = runtime(path.join(scratch, 'pre-arguments'));
+    const h = protectedHarness(ctx);
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    ctx.on('tools/pre-execute', async (exec, next) => {
+      exec.arguments = { target: 'unapproved-target' }; return next();
+    });
+    assert.equal((await h.execute(agent, 'synthetic_write', { target: 'approved-target' })).isError, true);
+    assert.equal(calls, 0);
+    assert.equal(h.consumed.size, 0);
+  });
+
+  await check('boundary_pending_approval_cancel_discards_late_allow', async () => {
+    const ctx = runtime(path.join(scratch, 'late-allow'));
+    const entered = Promise.withResolvers();
+    const late = Promise.withResolvers();
+    let saved;
+    const h = protectedHarness(ctx, { requestApproval: async (request) => {
+      saved = request; entered.resolve(); return late.promise;
+    } });
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    const abort = new AbortController();
+    const task = h.execute(agent, 'synthetic_write', {}, { signal: abort.signal });
+    await entered.promise;
+    abort.abort();
+    assert.equal((await task).isError, true);
+    late.resolve({ approvalId: 'too-late', digest: saved.digest, epoch: saved.epoch, expiresAt: Date.now() + 60000 });
+    await Promise.resolve();
+    assert.equal(calls, 0);
+    assert.equal(h.consumed.size, 0);
+  });
+
+  await check('boundary_consumption_failure_spends_execution', async () => {
+    for (const kind of ['false', 'disconnect', 'cancel']) {
+      const ctx = runtime(path.join(scratch, `consume-${kind}`));
+      const abort = new AbortController();
+      const h = protectedHarness(ctx, { consumeApproval: async () => {
+        if (kind === 'disconnect') throw new Error('synthetic disconnect');
+        if (kind === 'cancel') { abort.abort(); return true; }
+        return false;
+      } });
+      let calls = 0;
+      h.register('synthetic_write', () => { calls++; return 'counter only'; });
+      const { agent } = await h.create();
+      assert.equal((await h.execute(agent, 'synthetic_write', {}, { signal: abort.signal, callId: 'same-call' })).isError, true);
+      assert.equal((await h.execute(agent, 'synthetic_write', {}, { callId: 'same-call' })).isError, true);
+      assert.equal(calls, 0, kind);
+    }
+  });
+
+  await check('boundary_expiry_rechecked_before_action', async () => {
+    const ctx = runtime(path.join(scratch, 'expiry-race'));
+    const start = Date.now();
+    let wall = start;
+    let monotonic = 0;
+    const h = protectedHarness(ctx, {
+      clock: () => ({ wall, monotonic }),
+      requestApproval: async (request) => ({ approvalId: 'expires', digest: request.digest,
+        epoch: request.epoch, expiresAt: start + 300000 }),
+      consumeApproval: async () => { wall = start + 300000; monotonic = 300000; return true; },
+    });
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    assert.equal((await h.execute(agent, 'synthetic_write')).isError, true);
+    assert.equal(calls, 0);
+  });
+
+  await check('boundary_one_approval_id_cannot_authorize_two_calls', async () => {
+    const ctx = runtime(path.join(scratch, 'same-approval'));
+    const h = protectedHarness(ctx, { requestApproval: async (request) => ({
+      approvalId: 'same-approval', digest: request.digest, epoch: request.epoch, expiresAt: Date.now() + 60000,
+    }) });
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    const results = await Promise.all([h.execute(agent, 'synthetic_write'), h.execute(agent, 'synthetic_write')]);
+    assert.equal(results.filter((result) => !result.isError).length, 1);
+    assert.equal(calls, 1);
+  });
+
+  await check('boundary_action_can_only_enter_once', async () => {
+    const ctx = runtime(path.join(scratch, 'same-execution'));
+    const h = protectedHarness(ctx);
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create();
+    ctx.on('tools/execute', async (exec, next) => {
+      const definition = ctx.tools.get(exec.name, exec.agent);
+      const first = definition.execute(exec.arguments, exec);
+      await assert.rejects(definition.execute(exec.arguments, exec));
+      await first;
+      return next();
+    });
+    assert.equal((await h.execute(agent, 'synthetic_write')).isError, true);
+    assert.equal(calls, 1);
+    assert.equal(h.consumed.size, 1);
+  });
+
+  await check('boundary_disabled_services_and_command_bypasses_denied', async () => {
+    for (const scope of ['global', 'agent']) {
+      for (const service of ['loader', 'codeRuntime', 'subagents', 'dynamicCordisRunner']) {
+        const ctx = runtime(path.join(scratch, `service-${scope}-${service}`));
+        const h = protectedHarness(ctx);
+        let calls = 0;
+        h.register('synthetic_read', () => { calls++; return 'counter only'; }, 'read');
+        const { agent } = await h.create();
+        (scope === 'global' ? ctx : agent.ctx).provide(service, {});
+        assert.equal((await h.execute(agent, 'synthetic_read')).isError, true, service);
+        assert.equal(calls, 0, service);
+      }
+    }
+    const ctx = runtime(path.join(scratch, 'prohibited-tools'));
+    const h = protectedHarness(ctx);
+    for (const name of ['run_code', 'cordis_run', 'spawn_agent', 'subagent', 'workflow_run', 'ralph', 'bash', 'pwsh']) {
+      assert.throws(() => h.register(name, () => 'must not run', 'read'), name);
+    }
+  });
+
+  await check('boundary_pins_and_rechecks_native_subject', async () => {
+    for (const field of ['id', 'session']) {
+      const ctx = runtime(path.join(scratch, `subject-${field}`));
+      const h = protectedHarness(ctx);
+      let calls = 0;
+      h.register('synthetic_write', () => { calls++; return 'counter only'; });
+      const { agent } = await h.create();
+      assert.throws(() => h.boundary.bindAgent(agent, { ...h.subject(agent.id), sender: 'another-owner' }));
+      const previous = agent[field];
+      ctx.on('tools/execute', async (_exec, next) => {
+        agent[field] = field === 'id' ? 'foreign-session' : { id: agent.id, header: { cwd: canonicalScratch } };
+        try { return await next(); } finally { agent[field] = previous; }
+      });
+      assert.equal((await h.execute(agent, 'synthetic_write')).isError, true, field);
+      assert.equal(calls, 0, field);
+    }
+  });
+
+  await check('boundary_directory_replacement_denied', async () => {
+    const directory = path.join(scratch, 'directory-fixture');
+    await mkdir(directory);
+    const ctx = runtime(path.join(scratch, 'directory-replacement'));
+    const h = protectedHarness(ctx);
+    let calls = 0;
+    h.register('synthetic_write', () => { calls++; return 'counter only'; });
+    const { agent } = await h.create(undefined, directory);
+    ctx.on('tools/execute', async (_exec, next) => {
+      await rename(directory, directory + '.original');
+      await mkdir(directory);
+      return next();
+    });
+    assert.equal((await h.execute(agent, 'synthetic_write')).isError, true);
+    assert.equal(calls, 0);
+    assert.equal(h.consumed.size, 0);
   });
 }
 
@@ -278,6 +678,8 @@ const hashes = {};
 for (const name of ['dsh-agent', 'dsh-agent-loop', 'dsh-tools', 'dsh-session-persistence-jsonl', 'dsh-persona']) {
   hashes[name] = createHash('sha256').update(await readFile(path.join(packages, name, 'lib/index.js'))).digest('hex');
 }
-process.stdout.write(JSON.stringify({ stage: 'A', gatePassed, node: process.version, hashes, results, evidence,
+const boundaryHash = createHash('sha256').update(await readFile(new URL('../native_boundary.mjs', import.meta.url))).digest('hex');
+process.stdout.write(JSON.stringify({ stage: 'A', boundary: hardened ? 'protected' : 'native-only', boundaryHash,
+  gatePassed, node: process.version, hashes, results, evidence,
   productionChanged: false, realModelCalls: 0, realToolActions: 0 }, null, 2) + '\n');
 process.exitCode = gatePassed ? 0 : 2;

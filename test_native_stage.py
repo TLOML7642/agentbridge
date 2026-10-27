@@ -12,7 +12,7 @@ from tools.check_native_stage import REQUIRED_CHECKS, gate_passed, run_probe
 
 
 def report():
-    return {"stage": "A", "gatePassed": True, "productionChanged": False,
+    return {"stage": "A", "boundary": "protected", "gatePassed": True, "productionChanged": False,
             "realModelCalls": 0, "realToolActions": 0,
             "results": [{"name": name, "passed": True} for name in sorted(REQUIRED_CHECKS)]}
 
@@ -53,7 +53,7 @@ class NativeStageTests(unittest.TestCase):
             self.assertFalse(gate_passed(data, 0))
         for key, value in (("gatePassed", 1), ("productionChanged", 0),
                            ("realModelCalls", False), ("realToolActions", False),
-                           ("realToolActions", 1), ("stage", "B")):
+                           ("realToolActions", 1), ("stage", "B"), ("boundary", "native-only")):
             data = report()
             data[key] = value
             self.assertFalse(gate_passed(data, 0))
@@ -91,6 +91,17 @@ class NativeStageTests(unittest.TestCase):
                     run.return_value = subprocess.CompletedProcess([], code, json.dumps(report()), stderr)
                     with self.assertRaises(RuntimeError):
                         run_probe("/bin/sh", root)
+
+    def test_native_only_diagnostic_is_not_approval(self):
+        data = report()
+        data["boundary"] = "native-only"
+        data["gatePassed"] = False
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("tools.check_native_stage.subprocess.run") as run:
+                run.return_value = subprocess.CompletedProcess([], 2, json.dumps(data), "")
+                _data, code = run_probe("/bin/sh", root, native_only=True)
+                self.assertEqual(code, 2)
+                self.assertIn("--native-only", run.call_args.args[0])
 
 
 if __name__ == "__main__":
