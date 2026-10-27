@@ -94,6 +94,15 @@ worker 和 shim 只绑定回环地址。SSH 隧道是既有传输方式，不要
 
 ## 环境与配置
 
+### 获取源码
+
+```sh
+git clone https://github.com/TLOML7642/agentbridge.git
+cd agentbridge
+```
+
+克隆仅获取源码，不会安装微信适配器、创建 SSH 隧道或启动正式服务。先阅读以下环境要求和安全边界。
+
 ### 依赖与前置条件
 
 - Mac 上已有可用、经过权限审查的 DSH 安装。项目不分发或自动升级 DSH。
