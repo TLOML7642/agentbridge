@@ -72,7 +72,7 @@ async function main() {
   const boundary = installToolBoundary(ctx); // Writes remain OFF, including legacy execution.
   const root = await realpath(request.subject.cwd);
   const privateRoot = await realpath(path.dirname(request.root));
-  const privatePrefixes = [privateRoot, path.join(path.dirname(privateRoot), 'logs'), path.join(path.dirname(privateRoot), 'audit')];
+  const privatePrefixes = [privateRoot, ...['logs', 'audit', 'control'].map((name) => path.join(path.dirname(privateRoot), name))];
   const directoryIdentity = await stat(root);
   async function query(operation, value, signal) {
     const payload = { root, operation, value, device: directoryIdentity.dev, inode: directoryIdentity.ino,

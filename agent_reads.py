@@ -12,6 +12,15 @@ DENIED = re.compile(r'(?:^|/)(?:\.ssh|\.aws|\.codex|\.deepseek-harness|\.git|nod
                     r'\.(?:pem|key|db|sqlite|sqlite3)(?:$|/)', re.I)
 
 
+def private_path(value, prefixes):
+    # Default projects may be a home directory. Its hidden application state
+    # and macOS Library must not become readable just because they are in cwd.
+    hidden = any(part.startswith('.') for part in value.split(os.sep) if part)
+    library = os.path.expanduser('~/Library')
+    return (hidden or DENIED.search(value) or os.path.commonpath((value, library)) == library
+            or any(os.path.commonpath((value, prefix)) == prefix for prefix in prefixes))
+
+
 def query(request):
     root, value = request['root'], request['value']
     if (not isinstance(value, str) or not value or len(value) > 4096 or '\0' in value
@@ -29,7 +38,7 @@ def query(request):
         expected_identity = (request['device'], request['inode'])
         if os.path.commonpath((root, candidate)) != root:
             raise ValueError('outside scope')
-    if DENIED.search(candidate) or any(os.path.commonpath((candidate, prefix)) == prefix for prefix in request['private_prefixes']):
+    if private_path(candidate, request['private_prefixes']):
         raise ValueError('private path')
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -49,7 +58,7 @@ def query(request):
                 rows = []
                 for name in sorted(os.listdir(descriptor)):
                     full = os.path.join(candidate, name)
-                    if DENIED.search(full) or any(os.path.commonpath((full, prefix)) == prefix for prefix in request['private_prefixes']):
+                    if private_path(full, request['private_prefixes']):
                         continue
                     try:
                         info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)

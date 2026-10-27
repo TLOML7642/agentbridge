@@ -45,6 +45,22 @@ class ReadTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 self.query(name)
 
+    def test_hidden_auth_and_backup_directories_are_never_readable(self):
+        for directory in ('.config/gh', '.local/share/agentbridge-releases', '.docker', '.kube'):
+            path = self.workspace / directory
+            path.mkdir(parents=True)
+            (path / 'config.json').write_text('synthetic private marker')
+            with self.subTest(directory=directory), self.assertRaises(ValueError):
+                self.query(directory + '/config.json')
+        self.assertEqual([row['name'] for row in self.query('.', 'list_files')], ['hello.txt'])
+
+    def test_home_library_is_outside_the_reviewed_project_scope(self):
+        library = self.workspace / 'Library'
+        library.mkdir()
+        (library / 'config.json').write_text('synthetic private marker')
+        with mock.patch('agent_reads.os.path.expanduser', return_value=str(library)), self.assertRaises(ValueError):
+            self.query('Library/config.json')
+
     def test_leaf_and_parent_symlinks_are_not_followed(self):
         (self.workspace / 'link').symlink_to(self.workspace / 'hello.txt')
         (self.workspace / 'parent').symlink_to(self.private, target_is_directory=True)
