@@ -21,7 +21,8 @@ TERMINAL = frozenset(('verified', 'process-ended', 'denied', 'cancelled', 'uncer
 
 
 class TaskRuntime:
-    def __init__(self, root, runner, project, enabled=False, recover=lambda _row: None, check_external=lambda: None):
+    def __init__(self, root, runner, project, enabled=False, recover=lambda _row: None, check_external=lambda: None,
+                 allowed_projects=None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -30,6 +31,7 @@ class TaskRuntime:
         os.close(descriptor)
         self.path.chmod(0o600)
         self.enabled, self.runner, self.project = enabled, runner, project
+        self.allowed_projects = None if allowed_projects is None else frozenset(allowed_projects)
         self.check_external = check_external
         self.close_lock = threading.Lock()
         self.closed = False
@@ -123,8 +125,12 @@ class TaskRuntime:
             finally:
                 db.close()
 
+    def can_submit(self, project):
+        return (self.enabled and not self.stop.is_set()
+                and (self.allowed_projects is None or project in self.allowed_projects))
+
     def issue(self, kind, subject, ttl=120, cancel=None):
-        if not self.enabled or self.stop.is_set() or kind not in ('chat', 'task'):
+        if not self.can_submit(subject.get('project')) or kind not in ('chat', 'task'):
             raise AgentError('WRITES_DISABLED', '后台动作尚未启用')
         token = secrets.token_hex(32)
         with self.lock:
@@ -146,6 +152,8 @@ class TaskRuntime:
             if not cap or not self.enabled or self.stop.is_set() or cap['cancel'].is_set() or time.monotonic() >= cap['expires']:
                 raise AgentError('AUTH_FAIL', '任务执行授权不存在或已撤销')
             subject = cap['subject']
+            if not self.can_submit(subject.get('project')):
+                raise AgentError('WRITES_DISABLED', '当前项目未启用后台动作灰度')
             if cap['kind'] == 'chat' and payload.get('op') == 'submit':
                 if set(payload) != {'capability', 'op', 'call_id', 'tool', 'arguments'}:
                     raise AgentError('AUTH_FAIL', '任务登记字段错误')
@@ -171,7 +179,7 @@ class TaskRuntime:
             return value
 
     def submit(self, subject, delivery, tool, arguments):
-        if not self.enabled or self.stop.is_set():
+        if not self.can_submit(subject.get('project')):
             raise AgentError('WRITES_DISABLED', '后台动作尚未启用')
         required(delivery, 128)
         if tool not in TOOLS or not isinstance(arguments, dict) or set(arguments) != TOOLS[tool]:
@@ -309,6 +317,8 @@ class TaskRuntime:
             started = False
             try:
                 with self.execution_fence(cancel):
+                    if not self.can_submit(row['project']):
+                        raise AgentError('WRITES_DISABLED', '当前项目未启用后台动作灰度')
                     if cancel.is_set():
                         raise AgentError('CANCELLED', '后台执行尚未开始')
                     info = os.stat(row['cwd'])

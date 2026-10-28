@@ -472,7 +472,8 @@ class NativeExecutor:
         payload['python'] = sys.executable
         if self.tasks is not None:
             payload['task_events'] = turn.get('task_events', [])
-            payload['broker'] = self.tasks.issue('chat', turn['subject'], cancel=cancel)
+            if self.tasks.can_submit(turn['subject']['project']):
+                payload['broker'] = self.tasks.issue('chat', turn['subject'], cancel=cancel)
         source = Path(__file__).with_name('agent_driver.mjs')
         node = os.environ.get('AGENTBRIDGE_AGENT_NODE', str(Path.home() / '.deepseek-harness/bin/node'))
         request = self.root / (turn['id'] + '.request.json')

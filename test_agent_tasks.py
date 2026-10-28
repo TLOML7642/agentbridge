@@ -265,6 +265,33 @@ class TaskTests(unittest.TestCase):
         with self.assertRaises(AgentError):
             self.submit()
 
+    def test_project_canary_allowlist_denies_other_projects_and_empty_scope(self):
+        for projects in (frozenset(), frozenset({'canary-only'})):
+            self.runtime.allowed_projects = projects
+            self.assertFalse(self.runtime.can_submit('p'))
+            with self.assertRaises(AgentError):
+                self.submit()
+            with self.assertRaises(AgentError):
+                self.runtime.issue('chat', self.subject)
+        self.runtime.allowed_projects = frozenset({'p'})
+        self.wait(self.submit()['task_id'])
+
+    def test_revoked_project_scope_rejects_issued_capability(self):
+        cap = self.runtime.issue('chat', self.subject)
+        self.runtime.allowed_projects = frozenset({'other'})
+        with self.assertRaises(AgentError):
+            self.runtime.rpc(dict(capability=cap['capability'], op='submit', call_id='fixed-call', tool='create_text',
+                                  arguments={'path': 'synthetic.txt', 'text': 'synthetic'}))
+        self.assertEqual(self.calls, [])
+
+    def test_queued_project_revocation_prevents_action_body(self):
+        with self.runtime.execution_fence(threading.Event()):
+            row = self.submit()
+            self.wait(row['task_id'], 'running')
+            self.runtime.allowed_projects = frozenset()
+        self.wait(row['task_id'], 'failed')
+        self.assertEqual(self.calls, [])
+
     def test_invalid_result_fails_closed_without_killing_lane(self):
         self.runtime.runner = lambda *_: {'completion': 'verified', 'bad': object()}
         row = self.submit()

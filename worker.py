@@ -88,6 +88,7 @@ RUNNING_CANCEL_ENABLED = os.environ.get("AGENTBRIDGE_RUNNING_CANCEL", "0") == "1
 AGENT_ENABLED = os.environ.get("AGENTBRIDGE_AGENT_MESSAGES", "0") == "1"
 AGENT_LEARNING = os.environ.get('AGENTBRIDGE_AGENT_LEARNING', '0') == '1'
 AGENT_TASKS = os.environ.get('AGENTBRIDGE_AGENT_TASKS', '0') == '1'
+AGENT_TASK_PROJECTS = {s.strip() for s in os.environ.get('AGENTBRIDGE_AGENT_TASK_PROJECTS', '').split(',') if s.strip()}
 AGENT_CHANNELS = {s.strip() for s in os.environ.get("AGENTBRIDGE_AGENT_CHANNELS", "").split(",") if s.strip()}
 
 # 允许的来源通道。非空时请求必须携带白名单内的 channel，缺失同样拒绝，
@@ -1172,6 +1173,8 @@ class App:
                 raise AgentBridgeError('AUTH_FAIL', '持续对话必须显式配置发送者和灰度会话')
             root = os.path.join(BASE, 'agent')
             if AGENT_TASKS:
+                if not AGENT_TASK_PROJECTS:
+                    raise AgentBridgeError('AUTH_FAIL', '后台动作必须显式配置项目灰度允许列表')
                 task_root = os.path.join(root, 'tasks')
 
                 def settle_task(row):
@@ -1183,7 +1186,8 @@ class App:
                     if self.db.one("SELECT 1 FROM quarantine LIMIT 1"):
                         raise AgentError('TASK_UNCERTAIN', '旧执行器隔离尚未核查，后台动作未放行')
                 self.agent_tasks = TaskRuntime(task_root, task_executor, lambda name: self.get_project(name)['dir'],
-                                               enabled=True, recover=task_executor.recover, check_external=check_legacy_execution)
+                                               enabled=True, recover=task_executor.recover, check_external=check_legacy_execution,
+                                               allowed_projects=AGENT_TASK_PROJECTS)
             executor = NativeExecutor(root, run_task, redact, tasks=self.agent_tasks)
             self.agent = AgentRuntime(root, executor, lambda name: self.get_project(name)['dir'],
                                       self._agent_evidence, recover=executor.recover, allow_learning=AGENT_LEARNING, tasks=self.agent_tasks)

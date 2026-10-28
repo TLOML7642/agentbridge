@@ -93,7 +93,7 @@ worker、shim 和插件必须同时显式开启 `AGENTBRIDGE_AGENT_MESSAGES=1`�
 
 ### 有限后台动作（开发分支，默认关闭）
 
-worker 与微信插件另须显式开启 `AGENTBRIDGE_AGENT_TASKS=1`。正常聊天仍有独立名额，审批等待、状态查询和取消不占聊天 lane；保留原 SSH 链路，不增加公网端口或常驻执行器。
+worker 与微信插件另须显式开启 `AGENTBRIDGE_AGENT_TASKS=1`，worker 还必须显式配置非空的 `AGENTBRIDGE_AGENT_TASK_PROJECTS` 项目允许列表；缺失则拒绝启动后台能力。列表外的项目仍可只读聊天，不签发任务 capability，也不暴露任务提交工具。登记、RPC 审批/消费和排队后执行均复核项目灰度范围。正常聊天仍有独立名额，审批等待、状态查询和取消不占聊天 lane；保留原 SSH 链路，不增加公网端口或常驻执行器。
 
 - `create_text(path,text)`：只创建不存在的新文本，绑定项目/父目录 inode，排他创建、fsync、读回核对；不覆盖已有文件。
 - `make_directory(path)`：只新建一个目录，不隐式创建中间目录。
@@ -165,6 +165,7 @@ cd agentbridge
 | `AGENTBRIDGE_DSH_SETTINGS` | 桥接独立 DSH settings | 运行目录的 `dsh-settings.yaml` |
 | `AGENTBRIDGE_PORT` | worker 回环端口 | `9000` |
 | `AGENTBRIDGE_AGENT_TASKS` | worker/插件有限后台动作独立开关 | `0`，生产未启用 |
+| `AGENTBRIDGE_AGENT_TASK_PROJECTS` | worker 后台动作项目允许列表，逗号分隔 | 空；任务开关启用时必须显式配置 |
 | `AGENTBRIDGE_WORKER` | shim 访问 worker 的地址 | `http://127.0.0.1:9000/execute` |
 | `SHIM_PORT` | shim 回环端口 | `8787` |
 | `AGENTBRIDGE_SHIM_URL` | 插件访问 shim 的地址 | `http://127.0.0.1:8787/v1/chat/completions` |
@@ -237,10 +238,12 @@ python3 -B tools/check_background.py --node <固定Node绝对路径> \
 | --- | --- |
 | `worker.py` | Mac 调度、持久化、执行生命周期及取消监督 |
 | `shim.py` | 认证、OpenAI 兼容入口和控制路由 |
-| `native_boundary.mjs` | 专用原生 Agent 的工具执行保护层，新只读驱动已使用，未生产灰度 |
+| `native_boundary.mjs` | 专用原生 Agent 的工具执行保护层，只读灰度已使用，后台灰度另行开启 |
 | `agent_runtime.py`、`agent_driver.mjs` | 独立聊天名额、持久消息和原生会话短驱动，默认关闭 |
 | `agent_reads.py` | 描述符相对的审核读取，不启动 shell、不写文件 |
-| `agent_approvals.py` | 重启失效、单次消费的持久工具审批宿主，尚未接入后台任务 |
+| `agent_approvals.py` | 重启失效、单次消费的持久工具审批宿主，后台执行器已接入 |
+| `agent_tasks.py`、`agent_task_driver.mjs`、`agent_task_executor.py` | 私有后台 lane、单次原生动作及进程/收据监督 |
+| `agent_actions.py`、`agent_rpc.mjs` | 固定动作体和用途绑定的私有 Unix RPC |
 | `agent_persona.mjs`、`tools/install_shared_persona.py` | 共享偏好渲染与可选纯聊天桌面 preset |
 | `tools/config_invariants.py` | 静态授权配置校验，仅排除官方微信适配器两个消息同步状态字段 |
 | `server/plugins/agentbridge_mac/` | AstrBot 命令和持久化通知插件 |
