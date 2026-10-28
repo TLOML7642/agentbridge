@@ -20,6 +20,7 @@ SHIM_URL = os.environ.get("AGENTBRIDGE_SHIM_URL", "http://127.0.0.1:8787/v1/chat
 CONTROL_URL = SHIM_URL.rsplit("/v1/", 1)[0] + "/v1/agentbridge/control"
 MESSAGES_URL = SHIM_URL.rsplit('/v1/', 1)[0] + '/v1/agentbridge/messages'
 AGENT_ENABLED = os.environ.get('AGENTBRIDGE_AGENT_MESSAGES', '0') == '1'
+AGENT_TASKS = os.environ.get('AGENTBRIDGE_AGENT_TASKS', '0') == '1'
 AGENT_CHANNELS = {s.strip() for s in os.environ.get('AGENTBRIDGE_AGENT_CHANNELS', '').split(',') if s.strip()}
 TOKEN = os.environ.get("SHIM_TOKEN", "")
 TIMEOUT = int(os.environ.get("AGENTBRIDGE_MAC_TIMEOUT", "300"))
@@ -108,6 +109,7 @@ class Main(star.Star):
             self._agent_stop = asyncio.Event()
             with self._agent_db() as db:
                 db.execute("UPDATE agent_outbox SET state='unknown' WHERE state='sending'")
+                db.execute("UPDATE agent_task_outbox SET state='unknown' WHERE state='sending'")
             self._agent_task = asyncio.create_task(self._agent_loop())
         if not NOTIFICATIONS_ENABLED or self._sender_task is not None:
             return
@@ -161,6 +163,10 @@ class Main(star.Star):
             db.execute('CREATE TABLE IF NOT EXISTS agent_outbox('
                        'sender TEXT,channel TEXT,delivery TEXT,message_id TEXT,state TEXT,created REAL,'
                        'PRIMARY KEY(sender,channel,delivery))')
+            db.execute('CREATE TABLE IF NOT EXISTS agent_task_sources(sender TEXT,channel TEXT,cursor INTEGER,'
+                       'PRIMARY KEY(sender,channel))')
+            db.execute('CREATE TABLE IF NOT EXISTS agent_task_outbox(id TEXT PRIMARY KEY,sender TEXT,channel TEXT,'
+                       'payload TEXT,state TEXT)')
             yield db
 
     def _agent_allowed(self, sender, channel):
@@ -218,12 +224,89 @@ class Main(star.Star):
         while not self._agent_stop.is_set():
             try:
                 await self._agent_tick()
+                if AGENT_TASKS:
+                    await self._agent_task_tick()
             except Exception:
                 pass
             try:
                 await asyncio.wait_for(self._agent_stop.wait(), timeout=2)
             except TimeoutError:
                 pass
+
+    @staticmethod
+    def _task_event_text(event):
+        body = event['body']
+        origin = event['conversation'][:8]
+        prefix = f"后台任务 {event['task']} @{event['project']}，原会话 {origin}。\n"
+        if event['kind'] == 'approval':
+            arguments = body['arguments']
+            visible = {key: value for key, value in arguments.items() if key not in ('text', 'binding')}
+            if 'text' in arguments:
+                visible['text_bytes'] = len(arguments['text'].encode())
+                visible['text_sha256'] = hashlib.sha256(arguments['text'].encode()).hexdigest()
+                visible['text_preview'] = arguments['text'][:300]
+            return (prefix + '实际动作需要确认，四分钟内仅授权本次调用。\n工具：' + body['tool']
+                    + '\n参数：' + json.dumps(visible, ensure_ascii=False)
+                    + '\n动作摘要：' + body['digest'] + '\n审批ID：' + body['approval_id']
+                    + '\n同意：/agent approve ' + body['approval_id']
+                    + '\n拒绝：/agent deny ' + body['approval_id'])
+        state = body.get('state', 'uncertain')
+        descriptions = {'verified': '已完成并有检查证据', 'process-ended': '执行进程已结束，尚不等于目标已验证',
+                        'denied': '工具未获授权，未进入实际动作', 'cancelled': '执行器已停止，不撤销已发生的副作用',
+                        'uncertain': '结果未知，不会自动重跑，执行通道已隔离', 'failed': '执行前检查未通过'}
+        result = body.get('result') or {}
+        evidence = {key: result[key] for key in ('evidence', 'path', 'sha256', 'exit_code') if key in result}
+        return prefix + descriptions.get(state, state) + '\n' + json.dumps(evidence, ensure_ascii=False)
+
+    async def _agent_task_tick(self):
+        with self._agent_db() as db:
+            sources = [dict(row) for row in db.execute('SELECT * FROM agent_task_sources LIMIT 50')]
+        for source in sources:
+            sender, channel = source['sender'], source['channel']
+            if not self._agent_allowed(sender, channel):
+                continue
+            event_source = type('AgentSource', (), {'get_sender_id': lambda self, value=sender: value,
+                                                   'unified_msg_origin': channel})()
+            try:
+                status, data = await self._control(event_source, {'op': 'agent.events', 'after': str(source['cursor'])})
+            except Exception:
+                continue
+            if status != 200 or data.get('ok') is not True or not isinstance(data.get('events'), list):
+                continue
+            events = data['events']
+            if any(event.get('sender') != sender or event.get('channel') != channel
+                   or type(event.get('seq')) is not int or event['seq'] <= source['cursor'] for event in events):
+                continue
+            with self._agent_db() as db:
+                for event in events:
+                    state = 'pending' if event['kind'] in ('approval', 'terminal') else 'skipped'
+                    db.execute('INSERT OR IGNORE INTO agent_task_outbox VALUES (?,?,?,?,?)',
+                               (event['id'], sender, channel, json.dumps(event, ensure_ascii=False), state))
+                if events:
+                    db.execute('UPDATE agent_task_sources SET cursor=max(cursor,?) WHERE sender=? AND channel=?',
+                               (max(event['seq'] for event in events), sender, channel))
+        with self._agent_db() as db:
+            pending = [dict(row) for row in db.execute("SELECT * FROM agent_task_outbox WHERE state='pending' LIMIT 50")]
+        for row in pending:
+            if not self._agent_allowed(row['sender'], row['channel']):
+                continue
+            with self._agent_db() as db:
+                claim = db.execute("UPDATE agent_task_outbox SET state='sending' WHERE id=? AND state='pending'", (row['id'],))
+                if claim.rowcount != 1:
+                    continue
+            state = 'unknown'
+            try:
+                if self._agent_allowed(row['sender'], row['channel']):
+                    returned = await asyncio.wait_for(self._send_notification(row['channel'], self._task_event_text(json.loads(row['payload']))), timeout=15)
+                    state = 'api_returned' if returned else 'unknown'
+            except BaseException as error:
+                with self._agent_db() as db:
+                    db.execute("UPDATE agent_task_outbox SET state='unknown' WHERE id=?", (row['id'],))
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                continue
+            with self._agent_db() as db:
+                db.execute('UPDATE agent_task_outbox SET state=? WHERE id=?', (state, row['id']))
 
     async def _agent_local(self, event, text):
         sender, channel = str(event.get_sender_id()), event.unified_msg_origin
@@ -291,10 +374,32 @@ class Main(star.Star):
                 elif parts[:2] == ['/agent', 'cancel'] and len(parts) == 3:
                     delivery, _ = self._agent_delivery(event, text, 'agent-control')
                     status, data = await self._control(event, {'op': 'agent.cancel', 'message_id': parts[2], 'delivery_id': delivery})
+                elif parts[:2] in (['/agent', 'tasks'], ['/agent', 'approvals']) and len(parts) <= 3:
+                    field = 'task_id' if parts[1] == 'tasks' else 'approval_id'
+                    status, data = await self._control(event, {'op': 'agent.' + parts[1], **({field: parts[2]} if len(parts) == 3 else {})})
+                elif parts[:2] in (['/agent', 'approve'], ['/agent', 'deny'], ['/agent', 'task-cancel']) and len(parts) == 3:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    cancel_task = parts[1] == 'task-cancel'
+                    status, data = await self._control(event, {'op': 'agent.task.cancel' if cancel_task else 'agent.' + parts[1],
+                                                              'task_id' if cancel_task else 'approval_id': parts[2], 'delivery_id': delivery})
                 else:
-                    await self._agent_local(event, '用法：/agent new；/agent status [消息ID]；/agent cancel <消息ID>；/agent memory [on|off]；/agent forget <偏好ID>；/agent persona。当前写入未启用。')
+                    await self._agent_local(event, '用法：/agent new；/agent status [消息ID]；/agent cancel <消息ID>；/agent memory [on|off]；/agent forget <偏好ID>；/agent persona。'
+                                            + ('后台：/agent tasks [ID]；/agent task-cancel <ID>；/agent approvals [ID]；/agent approve <ID>；/agent deny <ID>。'
+                                               if AGENT_TASKS else '当前后台动作未启用。'))
                     return
-                if data.get('preferences') is not None:
+                if data.get('tasks') is not None:
+                    reply = '\n'.join(f"{item['task_id']} {item['state']} @{item['project']}" for item in data['tasks']) or '当前会话没有后台任务。'
+                elif data.get('approvals') is not None:
+                    reply = '\n'.join(f"{item['approval_id']} {item['state']} {item['tool']}" for item in data['approvals']) or '当前会话没有工具审批。'
+                elif data.get('approval_id'):
+                    reply = self._task_event_text({'task': data['subject']['attempt'], 'project': data['subject']['project'],
+                                                  'conversation': data['subject']['conversation'], 'kind': 'approval', 'body': data})
+                    if data['state'] != 'pending':
+                        reply = f"审批 {data['approval_id']}：{data['state']}，仅限该动作；执行结果请查 /agent tasks {data['subject']['attempt']}。"
+                elif data.get('task_id'):
+                    reply = self._task_event_text({'task': data['task_id'], 'project': data['project'],
+                                                  'conversation': data['conversation'], 'kind': 'terminal', 'body': data})
+                elif data.get('preferences') is not None:
                     reply = (data['core']['name'] + '；自动学习：' + ('开' if data['learning'] else '关')
                              + '\n' + ('\n'.join(f"{item['id']} {item['category']}={item['value']} 来源:{item['source']}" for item in data['preferences']) or '暂无有效长期偏好。'))
                 elif data.get('messages') is not None:
@@ -310,6 +415,8 @@ class Main(star.Star):
             delivery, _ = self._agent_delivery(event, text, 'agent-chat')
             with self._agent_db() as db:
                 db.execute("INSERT OR IGNORE INTO agent_outbox VALUES (?,?,?,NULL,'watch',?)", (sender, channel, delivery, time.time()))
+                if AGENT_TASKS:
+                    db.execute('INSERT OR IGNORE INTO agent_task_sources VALUES (?,?,0)', (sender, channel))
             status, data = await self._request(event, MESSAGES_URL, {'delivery_id': delivery, 'text': text})
             if data.get('message_id'):
                 with self._agent_db() as db:

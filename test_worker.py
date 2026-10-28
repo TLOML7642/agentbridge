@@ -1155,13 +1155,13 @@ class TestRound4Regressions(unittest.TestCase):
             "w.do_execute(app,{'task':'u1-old','job_id':'u1-old','channel':'owner'})"
         )
         proc = subprocess.Popen([sys.executable, "-B", "-c", wrapper],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         orphan_pid = None
         try:
             deadline = time.time() + 8
             while time.time() < deadline and not os.path.exists(pid_file):
                 time.sleep(0.05)
-            self.assertTrue(os.path.exists(pid_file), "合成后端未启动")
+            self.assertTrue(os.path.exists(pid_file), "合成后端未启动：" + (proc.stderr.read() if proc.poll() is not None else 'still running'))
             with open(pid_file) as fh:
                 orphan_pid = int(fh.read().strip())
             proc.kill()
@@ -1178,6 +1178,7 @@ class TestRound4Regressions(unittest.TestCase):
                 finally:
                     recovered.db.close()
         finally:
+            proc.stderr.close()
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
@@ -1481,13 +1482,13 @@ class TestRound5Fixes(unittest.TestCase):
             "w.do_execute(app,{'task':'synthetic','job_id':'gate-crash','channel':'owner'})"
         )
         parent = subprocess.Popen([sys.executable, "-B", "-c", wrapper],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         pgid = None
         try:
             deadline = time.monotonic() + 5
             while not paused.exists() and parent.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.02)
-            self.assertTrue(paused.exists())
+            self.assertTrue(paused.exists(), parent.stderr.read() if parent.poll() is not None else 'still running')
             pgid = int(paused.read_text())
             parent.kill()
             parent.wait(5)
@@ -1501,6 +1502,7 @@ class TestRound5Fixes(unittest.TestCase):
             self.assertEqual(self.app.get_job("gate-crash")["status"], "uncertain")
             self.assertEqual(self.app.db.query("SELECT * FROM quarantine"), [])
         finally:
+            parent.stderr.close()
             if parent.poll() is None:
                 parent.kill()
                 parent.wait(5)

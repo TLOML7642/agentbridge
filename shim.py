@@ -126,8 +126,11 @@ CONTROL_FIELDS = {
     "agent.memory.on": {"delivery_id"}, "agent.memory.off": {"delivery_id"},
     "agent.forget": {"memory_id", "delivery_id"},
     "agent.persona.set": {"name", "delivery_id"},
+    "agent.tasks": {"task_id"}, "agent.task.cancel": {"task_id", "delivery_id"},
+    "agent.approvals": {"approval_id"}, "agent.approve": {"approval_id", "delivery_id"},
+    "agent.deny": {"approval_id", "delivery_id"}, "agent.events": {"after"},
 }
-QUERY_OPS = frozenset(("status", "project.list", "diag", "jobs", "pending", "status.batch", "agent.status", "agent.lookup", "agent.memory", "agent.persona"))
+QUERY_OPS = frozenset(("status", "project.list", "diag", "jobs", "pending", "status.batch", "agent.status", "agent.lookup", "agent.memory", "agent.persona", "agent.tasks", "agent.approvals", "agent.events"))
 _HEALTH_LOCK = threading.Lock()
 _LAST_WORKER_HEALTH = None
 

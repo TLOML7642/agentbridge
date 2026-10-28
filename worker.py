@@ -43,6 +43,8 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from agent_runtime import AgentError, AgentRuntime, NativeExecutor
+from agent_tasks import TaskRuntime
+from agent_task_executor import NativeTaskExecutor
 
 # --------------------------------------------------------------------------
 # 配置
@@ -85,6 +87,7 @@ HTTP_TIMEOUT = int(os.environ.get("AGENTBRIDGE_HTTP_TIMEOUT", "30"))
 RUNNING_CANCEL_ENABLED = os.environ.get("AGENTBRIDGE_RUNNING_CANCEL", "0") == "1"
 AGENT_ENABLED = os.environ.get("AGENTBRIDGE_AGENT_MESSAGES", "0") == "1"
 AGENT_LEARNING = os.environ.get('AGENTBRIDGE_AGENT_LEARNING', '0') == '1'
+AGENT_TASKS = os.environ.get('AGENTBRIDGE_AGENT_TASKS', '0') == '1'
 AGENT_CHANNELS = {s.strip() for s in os.environ.get("AGENTBRIDGE_AGENT_CHANNELS", "").split(",") if s.strip()}
 
 # 允许的来源通道。非空时请求必须携带白名单内的 channel，缺失同样拒绝，
@@ -1163,13 +1166,27 @@ class App:
         self._recover_stale_jobs()
         self.prune_data()
         self.agent = None
+        self.agent_tasks = None
         if AGENT_ENABLED:
             if not ALLOWED_SENDERS or not AGENT_CHANNELS:
                 raise AgentBridgeError('AUTH_FAIL', '持续对话必须显式配置发送者和灰度会话')
             root = os.path.join(BASE, 'agent')
-            executor = NativeExecutor(root, run_task, redact)
+            if AGENT_TASKS:
+                task_root = os.path.join(root, 'tasks')
+
+                def settle_task(row):
+                    return self._settle_stale_executor({**row, 'lock_key': lock_key_for(normalize_dir(row['cwd'])),
+                                                        'job_id': row['id'], 'exec_state': row.get('exec_state') or 'starting'})
+
+                task_executor = NativeTaskExecutor(os.path.join(task_root, 'native'), run_task, _executor_identity, settle_task, redact)
+                def check_legacy_execution():
+                    if self.db.one("SELECT 1 FROM quarantine LIMIT 1"):
+                        raise AgentError('TASK_UNCERTAIN', '旧执行器隔离尚未核查，后台动作未放行')
+                self.agent_tasks = TaskRuntime(task_root, task_executor, lambda name: self.get_project(name)['dir'],
+                                               enabled=True, recover=task_executor.recover, check_external=check_legacy_execution)
+            executor = NativeExecutor(root, run_task, redact, tasks=self.agent_tasks)
             self.agent = AgentRuntime(root, executor, lambda name: self.get_project(name)['dir'],
-                                      self._agent_evidence, recover=executor.recover, allow_learning=AGENT_LEARNING)
+                                      self._agent_evidence, recover=executor.recover, allow_learning=AGENT_LEARNING, tasks=self.agent_tasks)
 
     def _agent_evidence(self, sender, channel, project):
         rows = self.db.query('SELECT job_id,status,result,exit_code,sandbox_mode FROM jobs '
@@ -1553,6 +1570,9 @@ CONTROL_FIELDS = {
     "agent.memory.on": {"delivery_id"}, "agent.memory.off": {"delivery_id"},
     "agent.forget": {"memory_id", "delivery_id"},
     "agent.persona.set": {"name", "delivery_id"},
+    "agent.tasks": {"task_id"}, "agent.task.cancel": {"task_id", "delivery_id"},
+    "agent.approvals": {"approval_id"}, "agent.approve": {"approval_id", "delivery_id"},
+    "agent.deny": {"approval_id", "delivery_id"}, "agent.events": {"after"},
 }
 CONTROL_OPS = frozenset(CONTROL_FIELDS)
 
@@ -1573,6 +1593,31 @@ def do_control(app: App, payload: dict) -> dict:
     if op.startswith('agent.'):
         _agent_source(app, sender, channel)
         try:
+            if op in ('agent.tasks', 'agent.task.cancel', 'agent.approvals', 'agent.approve', 'agent.deny', 'agent.events'):
+                if app.agent_tasks is None or not AGENT_TASKS:
+                    raise AgentError('WRITES_DISABLED', '后台动作尚未启用')
+                if op == 'agent.events':
+                    after = payload.get('after', '0')
+                    if not re.fullmatch(r'[0-9]{1,18}', after):
+                        raise AgentError('INVALID_MESSAGE', '事件游标格式错误')
+                    return app.agent_tasks.events(sender, channel, after=int(after))
+                project = app.current_project(channel)
+                conversation = app.agent.current_conversation(sender, channel, project)
+                if op == 'agent.tasks':
+                    return app.agent_tasks.inspect(sender, channel, conversation, project, payload.get('task_id', ''))
+                if op == 'agent.task.cancel':
+                    return app.agent_tasks.cancel(sender, channel, conversation, project, payload.get('task_id', ''), payload.get('delivery_id', ''))
+                if op == 'agent.approvals':
+                    result = app.agent_tasks.approvals.inspect(sender, channel, conversation, project, payload.get('approval_id', ''))
+                else:
+                    result = app.agent_tasks.approvals.decide(sender, channel, conversation, project, payload.get('approval_id', ''),
+                                                             payload.get('delivery_id', ''), op == 'agent.approve')
+                # Control clients need the status/actual parameters, not the
+                # host-only grant consumed by the native action process.
+                if 'approvals' in result:
+                    result['approvals'] = [{key: value for key, value in item.items() if key != 'grant'} for item in result['approvals']]
+                result.pop('grant', None)
+                return result
             return app.agent.control(sender, channel, op, app.current_project(channel),
                                      payload.get('message_id', ''), payload.get('delivery_id', ''),
                                      payload.get('memory_id', ''), payload.get('name', ''))
@@ -2129,10 +2174,19 @@ def _run_claimed(app: App, snap: dict) -> dict:
         ticket = gate.enqueue(snap.get("seq") or app.next_seq())
     entered = False
     began = False
+    execution = contextlib.ExitStack()
     cancelled = app._cancellations.get(snap.get("attempt_id"))
     try:
         gate.enter(ticket, cancelled)  # 同资源按接纳序号 FIFO
         entered = True
+        if app.agent_tasks is not None:
+            # Acquire FIFO first. Taking the global fence before a later FIFO
+            # ticket can deadlock the earlier ticket waiting for that fence.
+            try:
+                execution.enter_context(app.agent_tasks.execution_fence(cancelled or threading.Event()))
+            except AgentError as error:
+                _fail_job(app, snap, error.message)
+                raise AgentBridgeError('EXEC_FAIL', error.message) from None
         app.sched.begin_running(cancelled)
         began = True
         app.sched.mark_running(snap["job_id"], {
@@ -2210,6 +2264,7 @@ def _run_claimed(app: App, snap: dict) -> dict:
     except _CancelledStart:
         return _job_response(app, app.db.one("SELECT * FROM jobs WHERE job_id=?", (snap["job_id"],)))
     finally:
+        execution.close()
         with app._admit_lock:
             app._cancellations.pop(snap.get("attempt_id"), None)
         if entered:

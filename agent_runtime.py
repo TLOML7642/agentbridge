@@ -118,7 +118,7 @@ class AgentRuntime:
     A committed running intent precedes process launch. Unknown turns block
     their native session instead of automatically replaying a possibly used input.
     """
-    def __init__(self, root, runner, project, evidence=lambda *_: [], recover=lambda *_: None, allow_learning=False):
+    def __init__(self, root, runner, project, evidence=lambda *_: [], recover=lambda *_: None, allow_learning=False, tasks=None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -134,6 +134,7 @@ class AgentRuntime:
             self.lease.close()
             raise
         self.runner, self.project, self.evidence = runner, project, evidence
+        self.tasks = tasks
         self.preferences = Preferences(allow_learning)
         self.lock = threading.RLock()
         self.wake = threading.Event()
@@ -147,6 +148,7 @@ class AgentRuntime:
                 CREATE TABLE IF NOT EXISTS heads(
                   sender TEXT,channel TEXT,project TEXT,cwd TEXT,session TEXT,
                   PRIMARY KEY(sender,channel,project,cwd));
+                CREATE TABLE IF NOT EXISTS task_cursors(session TEXT PRIMARY KEY,seq INTEGER);
                 CREATE TABLE IF NOT EXISTS messages(
                   seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE,
                   sender TEXT,channel TEXT,delivery TEXT,digest TEXT,session TEXT,
@@ -291,6 +293,15 @@ class AgentRuntime:
                 result['message'] += ' 桌面偏好快照同步失败，尚不能确认桌面已停止使用。'
         return result
 
+    def current_conversation(self, sender, channel, project):
+        cwd = os.path.realpath(self.project(project))
+        with self.db() as db:
+            row = db.execute('SELECT session FROM heads WHERE sender=? AND channel=? AND project=? AND cwd=?',
+                             (sender, channel, project, cwd)).fetchone()
+            if row is None:
+                raise AgentError('NOT_FOUND', '当前项目尚无对话会话')
+            return row['session']
+
     def _control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name=''):
         required(sender); required(channel)
         if op == 'agent.cancel':
@@ -381,6 +392,8 @@ class AgentRuntime:
                             'resume': db.execute("SELECT 1 FROM messages WHERE session=? AND state='done' LIMIT 1", (row['session'],)).fetchone() is not None}
                     turn['subject'].update(conversation=session['id'], session=session['id'], attempt=row['id'])
                     turn['persona'] = self.preferences.view(db, session['sender'])
+                    cursor = db.execute('SELECT seq FROM task_cursors WHERE session=?', (session['id'],)).fetchone()
+                    turn['task_cursor'] = cursor['seq'] if cursor else 0
             if not row:
                 self.wake.wait(.25); self.wake.clear()
                 continue
@@ -391,6 +404,9 @@ class AgentRuntime:
                 if cwd != session['cwd'] or (stat.st_dev, stat.st_ino) != (session['device'], session['inode']):
                     raise AgentError('PROJECT_CHANGED', '项目目录已改变')
                 turn['recent_tasks'] = self.evidence(session['sender'], session['channel'], session['project'])
+                if self.tasks is not None:
+                    turn['task_events'] = self.tasks.events(session['sender'], session['channel'], session['id'], session['project'],
+                                                           after=turn['task_cursor'])['events']
                 reply = self.runner(turn, cancel)
                 if not isinstance(reply, str) or not reply.strip():
                     raise AgentError('EMPTY_REPLY', '对话没有完整返回')
@@ -404,6 +420,9 @@ class AgentRuntime:
                 pass
             with self.db() as db:
                 db.execute('UPDATE messages SET state=?,response=?,ended=? WHERE id=?', (state, reply, time.time(), row['id']))
+                if state == 'done' and turn.get('task_events'):
+                    db.execute('INSERT OR REPLACE INTO task_cursors VALUES (?,?)',
+                               (session['id'], max(event['seq'] for event in turn['task_events'])))
                 if state in ('uncertain', 'cancelled'):
                     db.execute('UPDATE sessions SET blocked=1 WHERE id=?', (session['id'],))
                     db.execute("UPDATE messages SET state='uncertain',ended=? WHERE session=? AND state='queued'", (time.time(), session['id']))
@@ -422,10 +441,11 @@ class AgentRuntime:
 
 
 class NativeExecutor:
-    def __init__(self, root, run_task, redact):
+    def __init__(self, root, run_task, redact, tasks=None):
         self.root, self.run_task, self.redact = Path(root), run_task, redact
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
+        self.tasks = tasks
 
     def recover(self, turn):
         if not re.fullmatch(r'[a-f0-9]{32}', turn['id']):
@@ -450,6 +470,9 @@ class NativeExecutor:
         payload = {k: turn[k] for k in ('id', 'session', 'text', 'subject', 'resume', 'recent_tasks', 'persona')}
         payload['root'] = str(self.root / 'native')
         payload['python'] = sys.executable
+        if self.tasks is not None:
+            payload['task_events'] = turn.get('task_events', [])
+            payload['broker'] = self.tasks.issue('chat', turn['subject'], cancel=cancel)
         source = Path(__file__).with_name('agent_driver.mjs')
         node = os.environ.get('AGENTBRIDGE_AGENT_NODE', str(Path.home() / '.deepseek-harness/bin/node'))
         request = self.root / (turn['id'] + '.request.json')
@@ -473,4 +496,6 @@ class NativeExecutor:
                 raise AgentError('DRIVER_UNKNOWN', '对话收据不匹配')
             raise AgentError('DRIVER_UNKNOWN', '缺少持久对话收据，不会自动重试')
         finally:
+            if payload.get('broker'):
+                self.tasks.revoke_capability(payload['broker']['capability'])
             request.unlink(missing_ok=True)

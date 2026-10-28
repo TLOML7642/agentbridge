@@ -8,6 +8,11 @@
 !/agent_persona.mjs
 !/agent_approvals.py
 !/agent_reads.py
+!/agent_tasks.py
+!/agent_actions.py
+!/agent_rpc.mjs
+!/agent_task_driver.mjs
+!/agent_task_executor.py
 !/test_*.py
 !/tools/
 /tools/*
