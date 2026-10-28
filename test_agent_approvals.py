@@ -54,6 +54,7 @@ class ApprovalTests(unittest.TestCase):
         first = self.pending()
         self.assertEqual(first['state'], 'pending')
         self.assertIsNone(first['grant'])
+        self.assertIsNone(first['reason'])
         self.assertEqual(first, self.pending())
         self.assertEqual(self.authority.path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.authority.root.stat().st_mode & 0o777, 0o700)
@@ -111,6 +112,7 @@ class ApprovalTests(unittest.TestCase):
         pending = self.pending()
         self.decide(pending, allow=False)
         self.assertEqual(self.pending()['state'], 'denied')
+        self.assertEqual(self.pending()['reason'], 'user_denied')
         with self.assertRaises(AgentError):
             self.decide(pending, delivery='new-decision')
         second = self.envelope()
@@ -119,6 +121,7 @@ class ApprovalTests(unittest.TestCase):
         self.now += 241
         self.assertFalse(self.authority.consume(self.subject['attempt'], second, grant))
         self.assertEqual(self.pending(second)['state'], 'expired')
+        self.assertEqual(self.pending(second)['reason'], 'approval_expired')
 
     def test_clock_rollback_expires_pending_approval(self):
         self.pending()
@@ -142,6 +145,7 @@ class ApprovalTests(unittest.TestCase):
         self.authority = self.make()
         row = self.authority.inspect('owner', 'private', 'original', 'p', pending['approval_id'])
         self.assertEqual(row['state'], 'revoked')
+        self.assertEqual(row['reason'], 'approval_revoked')
         with self.assertRaises(AgentError):
             self.authority.consume(self.subject['attempt'], self.request, grant)
         with self.assertRaises(AgentError):

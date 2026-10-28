@@ -1,4 +1,5 @@
 """Descriptor-relative reads against temporary synthetic files only."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,31 @@ class ReadTests(unittest.TestCase):
         self.assertEqual(len(self.query()['sha256']), 64)
         rows = self.query('.', 'list_files')
         self.assertEqual([row['name'] for row in rows], ['hello.txt'])
+
+    def test_metadata_matches_actual_utf8_bytes_without_newline_translation(self):
+        for text in ('部署测试青竹', '部署测试青竹\n', 'a\r\nb\r', '', 'ASCII', '汉😀e\u0301', '\ufeff字'):
+            with self.subTest(text=text):
+                data = text.encode('utf-8')
+                (self.workspace / 'hello.txt').write_bytes(data)
+                self.assertEqual(self.query(), dict(text=text, sha256=hashlib.sha256(data).hexdigest(),
+                                                   bytes=len(data), encoding='utf-8', unicode_codepoints=len(text),
+                                                   ends_with_newline=text.endswith(('\n', '\r'))))
+
+    def test_byte_count_is_not_stale_stat_size(self):
+        original_stat = os.fstat
+
+        def stale_size(descriptor):
+            fields = list(original_stat(descriptor))
+            fields[6] = 0
+            return os.stat_result(fields)
+
+        with mock.patch('agent_reads.os.fstat', side_effect=stale_size):
+            self.assertEqual(self.query()['bytes'], len(b'synthetic readable text'))
+
+    def test_invalid_utf8_is_not_reported_as_measured_text(self):
+        (self.workspace / 'hello.txt').write_bytes(b'\xff')
+        with self.assertRaises(UnicodeDecodeError):
+            self.query()
 
     def test_scope_traversal_and_private_directories_are_denied(self):
         for value in ('../outside.txt', '/private/etc/passwd', 'agent/message.txt'):

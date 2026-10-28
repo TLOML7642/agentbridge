@@ -80,7 +80,10 @@ def query(request):
             data = source.read(16385)
             if len(data) > 16384 or b'\0' in data:
                 raise ValueError('not small regular text')
-            return json.dumps(dict(text=data.decode('utf-8'), sha256=hashlib.sha256(data).hexdigest()), ensure_ascii=False)
+            text = data.decode('utf-8')
+            return json.dumps(dict(text=text, sha256=hashlib.sha256(data).hexdigest(),
+                                   bytes=len(data), encoding='utf-8', unicode_codepoints=len(text),
+                                   ends_with_newline=text.endswith(('\n', '\r'))), ensure_ascii=False)
     finally:
         os.close(directory)
 

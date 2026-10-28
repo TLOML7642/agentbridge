@@ -15,6 +15,8 @@ let ctx, handle, boundary, timer;
 let entered = false;
 let request;
 let receipt;
+let approvalEvidence = { reason: 'boundary_denied' };
+let approvalRequest;
 const stop = new AbortController();
 for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
   stop.abort(); boundary?.revoke(); handle?.agent.cancel({ kind: 'user' });
@@ -76,15 +78,30 @@ async function main() {
   new Loop(ctx, { agents: [], maxParallelToolCalls: 1 });
   boundary = installToolBoundary(ctx, { writesEnabled: true,
     requestApproval: async (envelope, signal) => {
+      approvalRequest = envelope;
       while (true) {
+        approvalEvidence = { reason: 'approval_unavailable' };
         const result = await rpc(request.broker, 'approval', { request: envelope }, signal);
+        approvalEvidence = { approval_id: result.approval_id, approval_state: result.state,
+          reason: result.reason ?? 'approval_not_consumed' };
         if (result.state === 'approved') return result.grant;
         if (result.state !== 'pending') return null;
         await sleep(300, undefined, { signal });
       }
     },
-    consumeApproval: async (envelope, grant, signal) =>
-      (await rpc(request.broker, 'consume', { request: envelope, grant }, signal)).consumed === true });
+    consumeApproval: async (envelope, grant, signal) => {
+      approvalEvidence = { reason: 'approval_unavailable' };
+      const result = await rpc(request.broker, 'consume', { request: envelope, grant }, signal);
+      if (result.consumed === true) {
+        approvalEvidence = { approval_id: grant.approvalId, approval_state: 'consumed', reason: 'boundary_denied' };
+        return true;
+      }
+      // Re-read the same call, never create or retry an action after a failed consume.
+      const current = await rpc(request.broker, 'approval', { request: envelope }, signal);
+      approvalEvidence = { approval_id: current.approval_id, approval_state: current.state,
+        reason: current.reason ?? 'approval_not_consumed' };
+      return false;
+    } });
   const parameters = Object.fromEntries(Object.keys(request.arguments).map((key) => [key, { type: 'string', required: true }]));
   boundary.register(defineTool({ name: request.tool, description: 'One host-frozen, individually approved background action.',
     parameters, output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
@@ -100,7 +117,16 @@ async function main() {
     callId: request.id, agent: handle.agent, signal: stop.signal });
   if (result.isError) {
     assert.equal(entered, false, 'an entered action without a receipt is uncertain');
-    receipt = { completion: 'denied', evidence: 'tool_body_not_entered' };
+    // A grant may expire in the native guard before consumeApproval is called.
+    // Refresh only an already registered request, without retrying the action.
+    if (approvalRequest && approvalEvidence.approval_state === 'approved') {
+      try {
+        const current = await rpc(request.broker, 'approval', { request: approvalRequest }, stop.signal);
+        approvalEvidence = { approval_id: current.approval_id, approval_state: current.state,
+          reason: current.reason ?? 'boundary_denied' };
+      } catch { approvalEvidence = { reason: 'approval_unavailable' }; }
+    }
+    receipt = { completion: 'denied', evidence: 'tool_body_not_entered', ...approvalEvidence };
   }
   assert.ok(receipt);
   return { id: request.id, session: request.session, subject: request.subject, digest: request.digest, result: receipt };

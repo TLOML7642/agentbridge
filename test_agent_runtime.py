@@ -626,8 +626,11 @@ class NativeDriverTests(unittest.TestCase):
             workspace = root / 'workspace'
             workspace.mkdir()
             (workspace / 'hello.txt').write_text('synthetic-file-content')
+            (workspace / 'unicode.txt').write_bytes('部署测试青竹'.encode('utf-8'))
+            (workspace / 'empty.txt').write_bytes(b'')
             (workspace / '.env').write_text('synthetic-private-marker')
-            for name, expected in [('hello.txt', 'synthetic-file-content'), ('.env', 'read target is outside')]:
+            for name, expected in [('hello.txt', 'synthetic-file-content'), ('unicode.txt', '部署测试青竹'),
+                                   ('empty.txt', ''), ('.env', 'read target is outside')]:
                 mid, sid = uuid.uuid4().hex, uuid.uuid4().hex
                 data = {'id': mid, 'session': sid, 'root': str(root / 'agent/native'), 'text': 'synthetic read',
                         'resume': False, 'synthetic': True, 'syntheticTool': {'name': 'read_text', 'arguments': {'file': name}},
@@ -641,6 +644,30 @@ class NativeDriverTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(expected, result.stdout)
                 self.assertNotIn('synthetic-private-marker', result.stdout)
+                if name != '.env':
+                    values = []
+
+                    def collect(value):
+                        if isinstance(value, str):
+                            try:
+                                collect(json.loads(value))
+                            except ValueError:
+                                pass
+                        elif isinstance(value, list):
+                            for item in value:
+                                collect(item)
+                        elif isinstance(value, dict):
+                            if 'sha256' in value and 'text' in value:
+                                values.append(value)
+                            for item in value.values():
+                                collect(item)
+
+                    collect(json.loads(json.loads(result.stdout)['reply'])['toolResult'])
+                    self.assertEqual(len(values), 1)
+                    self.assertEqual(values[0]['bytes'], len(expected.encode('utf-8')))
+                    self.assertEqual(values[0]['unicode_codepoints'], len(expected))
+                    self.assertEqual(values[0]['encoding'], 'utf-8')
+                    self.assertFalse(values[0]['ends_with_newline'])
 
     def test_shared_preset_does_not_change_defaults_or_read_history(self):
         with tempfile.TemporaryDirectory(prefix='shared-persona-test-') as scratch:

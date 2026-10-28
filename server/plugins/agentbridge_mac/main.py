@@ -255,8 +255,16 @@ class Main(star.Star):
                         'denied': '工具未获授权，未进入实际动作', 'cancelled': '执行器已停止，不撤销已发生的副作用',
                         'uncertain': '结果未知，不会自动重跑，执行通道已隔离', 'failed': '执行前检查未通过'}
         result = body.get('result') or {}
+        description = descriptions.get(state, state)
+        if state == 'denied':
+            description = {'user_denied': '用户主动拒绝，未进入实际动作',
+                           'approval_expired': '审批已过期，未进入实际动作',
+                           'approval_revoked': '审批已撤销，未进入实际动作',
+                           'approval_unavailable': '审批通道不可用，未进入实际动作',
+                           'approval_not_consumed': '授权未消费，未进入实际动作',
+                           'boundary_denied': '执行边界未放行，未进入实际动作'}.get(result.get('reason'), description)
         evidence = {key: result[key] for key in ('evidence', 'path', 'sha256', 'exit_code') if key in result}
-        return prefix + descriptions.get(state, state) + '\n' + json.dumps(evidence, ensure_ascii=False)
+        return prefix + description + '\n' + json.dumps(evidence, ensure_ascii=False)
 
     async def _agent_task_tick(self):
         with self._agent_db() as db:

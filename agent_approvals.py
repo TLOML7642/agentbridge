@@ -156,6 +156,8 @@ class ApprovalAuthority:
             row = db.execute('SELECT * FROM approvals WHERE id=?', (row['id'],)).fetchone()
         request = json.loads(row['request'])
         return {'ok': True, 'approval_id': row['id'], 'state': row['state'], 'tool': request['tool'],
+                'reason': {'denied': 'user_denied', 'expired': 'approval_expired',
+                           'revoked': 'approval_revoked'}.get(row['state']),
                 'arguments': request['arguments'], 'digest': row['digest'], 'subject': request['subject'],
                 'created': row['created'], 'expires': row['expires'],
                 'grant': {'approvalId': row['id'], 'digest': row['digest'], 'epoch': row['epoch'],

@@ -482,8 +482,81 @@ class NativeTaskTests(unittest.TestCase):
     def test_expired_approval_does_not_run_body(self):
         runtime, workspace, _executor, subject, task, approval = self.native()
         runtime.approvals.clock = lambda: approval['expires'] + 1
-        self.terminal(runtime, subject, task, 'denied')
+        value = self.terminal(runtime, subject, task, 'denied')
+        self.assertEqual(value['result']['reason'], 'approval_expired')
+        self.assertEqual(value['result']['approval_state'], 'expired')
+        self.assertEqual(value['result']['approval_id'], approval['approval_id'])
+        self.assertEqual(value['result']['evidence'], 'tool_body_not_entered')
+        events = runtime.events(subject['sender'], subject['channel'], 'original', 'p')['events']
+        self.assertEqual(events[-1]['body']['result'], value['result'])
         self.assertFalse((workspace / 'result.txt').exists())
+
+    def test_expiry_at_consume_preserves_reason_and_never_enters_body(self):
+        runtime, workspace, _executor, subject, task, approval = self.native()
+        consume = runtime.approvals.consume
+
+        def expire(attempt, request, grant):
+            runtime.approvals.clock = lambda: approval['expires'] + 1
+            return consume(attempt, request, grant)
+
+        with mock.patch.object(runtime.approvals, 'consume', side_effect=expire) as called:
+            runtime.approvals.decide(subject['sender'], subject['channel'], 'original', 'p',
+                                     approval['approval_id'], 'approve-before-expiry', True)
+            value = self.terminal(runtime, subject, task, 'denied')
+            called.assert_called_once()
+        self.assertEqual(value['result']['reason'], 'approval_expired')
+        self.assertEqual(value['result']['approval_state'], 'expired')
+        self.assertFalse((workspace / 'result.txt').exists())
+
+    def test_expiry_before_native_guard_preserves_reason_without_consuming(self):
+        runtime, workspace, _executor, subject, task, approval = self.native()
+        request = runtime.approvals.request
+
+        def expire_before_return(attempt, envelope):
+            value = request(attempt, envelope)
+            if value['state'] == 'approved':
+                # Synthetic expiry between the host response and native guard.
+                with runtime.approvals.db() as db:
+                    db.execute('UPDATE approvals SET expires=? WHERE id=?',
+                               (time.time() - 1, approval['approval_id']))
+                value['grant']['expiresAt'] = (time.time() - 1) * 1000
+            return value
+
+        with mock.patch.object(runtime.approvals, 'request', side_effect=expire_before_return), \
+                mock.patch.object(runtime.approvals, 'consume', wraps=runtime.approvals.consume) as consumed:
+            runtime.approvals.decide(subject['sender'], subject['channel'], 'original', 'p',
+                                     approval['approval_id'], 'approve-before-guard-expiry', True)
+            value = self.terminal(runtime, subject, task, 'denied')
+            consumed.assert_not_called()
+        self.assertEqual(value['result']['reason'], 'approval_expired')
+        self.assertEqual(value['result']['approval_state'], 'expired')
+        self.assertFalse((workspace / 'result.txt').exists())
+
+    def test_denial_reason_survives_receipt_recovery_without_rerun(self):
+        runtime, workspace, executor, subject, task, approval = self.native()
+        runtime.approvals.decide(subject['sender'], subject['channel'], 'original', 'p',
+                                 approval['approval_id'], 'explicit-denial', False)
+        before = self.terminal(runtime, subject, task, 'denied')
+        runtime.close()
+        with runtime.db() as db:
+            db.execute("UPDATE tasks SET state='running',result='' WHERE id=?", (task['task_id'],))
+            db.execute("DELETE FROM task_events WHERE kind='terminal'")
+        executor.run_task = mock.Mock(side_effect=AssertionError('denied actions must not rerun'))
+        restored = TaskRuntime(runtime.root, executor, lambda _: str(workspace), enabled=True, recover=executor.recover)
+        self.stack.callback(restored.close)
+        after = self.terminal(restored, subject, task, 'denied')
+        self.assertEqual(before['result'], after['result'])
+        self.assertEqual(after['result']['reason'], 'user_denied')
+        self.assertFalse((workspace / 'result.txt').exists())
+        executor.run_task.assert_not_called()
+        # Older private receipts remain valid, but no reason is invented for them.
+        receipt_path = executor.root / 'receipts' / (task['task_id'] + '.json')
+        old = json.loads(receipt_path.read_text())
+        old['result'] = {'completion': 'denied', 'evidence': 'tool_body_not_entered'}
+        receipt_path.write_text(json.dumps(old))
+        with restored.db() as db:
+            row = dict(db.execute('SELECT * FROM tasks WHERE id=?', (task['task_id'],)).fetchone())
+        self.assertEqual(executor.receipt(row), old['result'])
 
     def test_revoked_connection_denies_action_and_chat_remains_responsive(self):
         runtime, workspace, _executor, subject, task, _approval = self.native()
@@ -500,7 +573,8 @@ class NativeTaskTests(unittest.TestCase):
         self.assertFalse((workspace / 'result.txt').exists())
         with runtime.lock:
             runtime.capabilities.clear()
-        self.terminal(runtime, subject, task, 'denied')
+        value = self.terminal(runtime, subject, task, 'denied')
+        self.assertEqual(value['result']['reason'], 'approval_unavailable')
         self.assertFalse((workspace / 'result.txt').exists())
 
     def test_forged_request_and_changed_actual_parameters_cannot_consume_approval(self):
@@ -576,8 +650,13 @@ class NativeTaskTests(unittest.TestCase):
                     if allow:
                         self.assertEqual((workspace / 'result.txt').read_text(), 'synthetic-native-result')
                         self.assertEqual(result['result']['evidence'], 'created_new_file_fsynced')
+                    else:
+                        self.assertEqual(result['result']['reason'], 'user_denied')
+                        self.assertEqual(result['result']['approval_state'], 'denied')
+                        self.assertEqual(result['result']['approval_id'], pending['approval_id'])
                     events = runtime.events(subject['sender'], subject['channel'], 'original', 'p')['events']
                     self.assertEqual([event['kind'] for event in events], ['accepted', 'approval', 'terminal'])
+                    self.assertEqual(events[-1]['body']['result'], result['result'])
 
 
 class TaskHTTPTests(unittest.TestCase):
@@ -755,8 +834,63 @@ class TaskPluginTests(unittest.TestCase):
         self.assertIn(hashlib.sha256(b'synthetic content').hexdigest(), text)
         self.assertNotIn('private snapshot', text)
 
+    def test_denial_notifications_distinguish_expiry_user_denial_and_unknown(self):
+        for reason, expected in [('user_denied', '用户主动拒绝'), ('approval_expired', '审批已过期'),
+                                 ('approval_revoked', '审批已撤销'), ('approval_unavailable', '审批通道不可用'),
+                                 ('approval_not_consumed', '授权未消费'),
+                                 ('boundary_denied', '执行边界未放行'), (None, '工具未获授权')]:
+            with self.subTest(reason=reason):
+                result = {'completion': 'denied', 'evidence': 'tool_body_not_entered'}
+                if reason:
+                    result['reason'] = reason
+                event = {**self.event_data, 'body': {'state': 'denied', 'result': result}}
+                text = self.main._task_event_text(event)
+                self.assertIn(expected, text)
+                if reason != 'user_denied':
+                    self.assertNotIn('用户主动拒绝', text)
+                self.assertNotIn('自动拒绝', text)
+
 
 class TaskNativeChatTests(unittest.TestCase):
+    def test_denial_reasons_and_unknown_old_receipt_persist_once_in_original_session(self):
+        node, packages = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE'), os.environ.get('AGENTBRIDGE_TEST_NATIVE_PACKAGES')
+        if not node or not packages:
+            self.skipTest('explicit native runtime required')
+        with tempfile.TemporaryDirectory(prefix='abr-', dir='/private/tmp') as scratch:
+            root = Path(scratch).resolve()
+            workspace = root / 'work'
+            workspace.mkdir()
+            sid = uuid.uuid4().hex
+            events = []
+            for index, reason in enumerate(('user_denied', 'approval_expired', None), 1):
+                result = {'completion': 'denied', 'evidence': 'tool_body_not_entered'}
+                if reason:
+                    result['reason'] = reason
+                events.append(dict(id=f'synthetic-denial-{index}', seq=index, sender='owner', channel='private',
+                                   conversation=sid, project='p', task=f'synthetic-task-{index}', kind='terminal',
+                                   body={'state': 'denied', 'result': result}))
+            for turn in range(2):
+                mid = uuid.uuid4().hex
+                subject = dict(sender='owner', channel='private', conversation=sid, session=sid,
+                               project='p', cwd=str(workspace), attempt=mid)
+                request = dict(id=mid, session=sid, root=str(root / 'a/native'), subject=subject, resume=turn > 0,
+                               text='synthetic denial recall', synthetic=True, task_events=events)
+                file = root / 'request.json'
+                file.write_text(json.dumps(request))
+                result = subprocess.run([node, str(Path(__file__).with_name('agent_driver.mjs')), str(file)],
+                                        capture_output=True, text=True, timeout=15,
+                                        env={'HOME': str(root), 'PATH': '/usr/bin:/bin', 'ELECTRON_RUN_AS_NODE': '1',
+                                             'AGENTBRIDGE_AGENT_PACKAGES': packages})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                evidence = json.loads(json.loads(result.stdout)['reply'])['evidence']
+                self.assertEqual([json.loads(item[0]['text'].split('\n', 1)[1]) for item in evidence], events)
+            file = next((root / 'a/native/sessions').glob('*/' + sid + '/session.jsonl'))
+            records = [json.loads(line) for line in file.read_text().splitlines()]
+            for event in events:
+                self.assertEqual(sum(record.get('type') == 'user/message'
+                                     and record['data']['id'] == 'bridge-task-event:' + event['id']
+                                     for record in records), 1)
+
     def test_crash_after_native_event_flush_resumes_without_duplicate_evidence(self):
         node, packages = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE'), os.environ.get('AGENTBRIDGE_TEST_NATIVE_PACKAGES')
         if not node or not packages:
