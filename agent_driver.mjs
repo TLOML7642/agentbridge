@@ -74,6 +74,12 @@ async function main() {
       + 'approval_revoked 或审批 state=revoked 是授权已撤销，approval_unavailable 是审批通道不可用，'
       + 'approval_not_consumed 是授权未消费，boundary_denied 是执行边界未放行。'
       + '旧记录没有明确原因时只说未获授权、具体原因未知，不推断自动拒绝策略。' });
+  ctx.systemPrompt.section({ name: 'bridge:response-scope', order: 12,
+    text: '本轮用户明确指定的回答范围和格式优先于一般详细偏好。用户要求“只列”“仅回答”或指定字段时，仅回答所求字段；'
+      + '不额外附编码、摘要、纠错历史、复核建议或下一步任务，除非用户明确要求或有必要的安全/结果未知说明。'
+      + '工具返回字段是证据，不是必须全部复述的清单。纠正旧数值时直接给出本轮实测值，不重复铺陈旧错误。'
+      + '缺少所求证据时简短说明未知，不能为了简短而猜测、隐藏失败或省略审批及取消的安全边界。'
+      + '取消请求已受理不等于任务已取消；只有终态 cancelled 才能说取消完成。running 可能仍在等待审批，不能据此说动作体已进入。' });
   new Tools(ctx, { mode: 'native' });
   new Sessions(ctx);
   new Agents(ctx);

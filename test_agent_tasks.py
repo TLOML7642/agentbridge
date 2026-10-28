@@ -479,6 +479,65 @@ class NativeTaskTests(unittest.TestCase):
         self.assertFalse((workspace / 'result.txt').exists())
         self.assertEqual(runtime.approvals.inspect(subject['sender'], subject['channel'], 'original', 'p', approval['approval_id'])['state'], 'revoked')
 
+    def test_chat_and_cancel_after_native_body_entry_preserve_existing_side_effect(self):
+        fixture = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='ab-body-', dir='/private/tmp'))).resolve()
+        source = fixture / 'source'
+        source.mkdir()
+        for name in ('agent_task_driver.mjs', 'native_boundary.mjs', 'agent_rpc.mjs', 'agent_actions.py', 'agent_reads.py'):
+            shutil.copyfile(Path(__file__).with_name(name), source / name)
+        action = source / 'agent_actions.py'
+        original = action.read_text()
+        checkpoint = '                os.fsync(output.fileno())\n                output.seek(0)'
+        self.assertEqual(original.count(checkpoint), 1)
+        entered, release = fixture / 'body-entered', fixture / 'release'
+        # Delay only this copied synthetic helper after a real fsynced write.
+        # Production actions gain no wait option, shell or wider command access.
+        action.write_text(original.replace(checkpoint, f'''                os.fsync(output.fileno())
+                from pathlib import Path
+                import time
+                Path({str(entered)!r}).write_text(str(os.getpid()))
+                deadline = time.monotonic() + 20
+                while not Path({str(release)!r}).exists():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('synthetic body gate not released')
+                    time.sleep(.01)
+                output.seek(0)'''))
+        self.stack.enter_context(mock.patch('agent_task_executor.__file__', str(source / 'agent_task_executor.py')))
+        runtime, workspace, _executor, subject, task, approval = self.native()
+        self.stack.callback(release.touch)
+        self.assertFalse(entered.exists())
+        runtime.approvals.decide(subject['sender'], subject['channel'], 'original', 'p',
+                                 approval['approval_id'], 'approve-body-fixture', True)
+        deadline = time.monotonic() + 8
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(entered.exists(), 'native action body did not reach fsynced write')
+        pid = int(entered.read_text())
+        os.kill(pid, 0)
+        self.assertEqual((workspace / 'result.txt').read_text(), 'synthetic-native-result')
+        self.assertEqual(runtime.approvals.inspect(subject['sender'], subject['channel'], 'original', 'p',
+                                                  approval['approval_id'])['state'], 'consumed')
+        chat = AgentRuntime(fixture / 'chat', lambda *_: 'synthetic chat during action body', lambda _: str(workspace))
+        self.stack.callback(chat.close)
+        message = chat.submit(subject['sender'], subject['channel'], 'body-chat', 'synthetic query', 'p')
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            answer = chat.control(subject['sender'], subject['channel'], 'agent.status', 'p', message['message_id'])
+            if answer['state'] == 'done':
+                break
+            time.sleep(.01)
+        self.assertEqual(answer['reply'], 'synthetic chat during action body')
+        self.assertEqual(runtime.inspect(subject['sender'], subject['channel'], 'original', 'p', task['task_id'])['state'], 'running')
+        self.assertFalse(release.exists())
+        runtime.cancel(subject['sender'], subject['channel'], 'original', 'p', task['task_id'], 'cancel-entered-body')
+        self.terminal(runtime, subject, task, 'cancelled')
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertEqual((workspace / 'result.txt').read_text(), 'synthetic-native-result')
+        events = runtime.events(subject['sender'], subject['channel'], 'original', 'p')['events']
+        self.assertEqual([event['kind'] for event in events], ['accepted', 'approval', 'terminal'])
+        self.assertEqual(events[-1]['body']['state'], 'cancelled')
+
     def test_expired_approval_does_not_run_body(self):
         runtime, workspace, _executor, subject, task, approval = self.native()
         runtime.approvals.clock = lambda: approval['expires'] + 1
@@ -849,6 +908,22 @@ class TaskPluginTests(unittest.TestCase):
                 if reason != 'user_denied':
                     self.assertNotIn('用户主动拒绝', text)
                 self.assertNotIn('自动拒绝', text)
+
+    def test_task_snapshots_do_not_claim_body_entry_or_emit_empty_evidence(self):
+        for state, expected in [('queued', '尚未进入实际动作'), ('running', '不代表动作体已进入')]:
+            with self.subTest(state=state):
+                event = {**self.event_data, 'kind': 'snapshot', 'body': {'state': state, 'result': None}}
+                text = self.main._task_event_text(event)
+                self.assertIn(expected, text)
+                self.assertNotIn('{}', text)
+                self.assertNotIn('取消请求已受理', text)
+                self.assertNotIn('执行器已停止', text)
+
+    def test_nonempty_terminal_evidence_remains_visible(self):
+        result = {'evidence': 'created_new_file_fsynced', 'path': 'synthetic.txt', 'sha256': 'a' * 64}
+        event = {**self.event_data, 'body': {'state': 'verified', 'result': result}}
+        text = self.main._task_event_text(event)
+        self.assertEqual(json.loads(text.splitlines()[-1]), result)
 
 
 class TaskNativeChatTests(unittest.TestCase):

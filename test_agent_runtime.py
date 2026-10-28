@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -517,6 +518,47 @@ class PluginAgentTests(unittest.TestCase):
         self.assertTrue(payload['delivery_id'])
         self.main._request.assert_not_awaited()
 
+    def test_task_cancel_ack_distinguishes_pending_stop_and_terminal_states(self):
+        self.main._request = mock.AsyncMock()
+        cases = [('running', '取消请求已受理'), ('cancelled', '执行器已停止'),
+                 ('uncertain', '结果未知'), ('verified', '已完成并有检查证据'),
+                 ('denied', '工具未获授权')]
+        for index, (state, expected) in enumerate(cases):
+            with self.subTest(state=state):
+                self.event.message_obj.raw_message = {'message_id': 'cancel-' + str(index)}
+                self.event.get_message_str = lambda: 'agent task-cancel synthetic-task'
+                self.main._control = mock.AsyncMock(return_value=(200, {
+                    'ok': True, 'task_id': 'synthetic-task', 'project': 'p',
+                    'conversation': 'original', 'state': state, 'result': None}))
+                self.main._send_notification.reset_mock()
+                asyncio.run(self.main.agent_message(self.event))
+                payload = self.main._control.await_args.args[1]
+                self.assertEqual(payload['op'], 'agent.task.cancel')
+                self.assertEqual(payload['task_id'], 'synthetic-task')
+                self.assertTrue(payload['delivery_id'])
+                reply = self.main._send_notification.await_args.args[1]
+                self.assertIn(expected, reply)
+                self.assertNotIn('{}', reply)
+                if state == 'running':
+                    self.assertIn('尚未确认', reply)
+                    self.assertIn('/agent tasks synthetic-task', reply)
+                    self.assertNotIn('执行器已停止', reply)
+                else:
+                    self.assertNotIn('取消请求已受理', reply)
+                asyncio.run(self.main.agent_message(self.event))
+                self.assertEqual(self.main._send_notification.await_count, 1)
+        self.main._request.assert_not_awaited()
+
+    def test_failed_cancel_control_does_not_claim_acceptance_or_call_model(self):
+        self.event.get_message_str = lambda: '/agent task-cancel foreign-task'
+        self.main._request = mock.AsyncMock()
+        self.main._control = mock.AsyncMock(return_value=(404, {'ok': False, 'error': {'message': '任务不存在'}}))
+        asyncio.run(self.main.agent_message(self.event))
+        reply = self.main._send_notification.await_args.args[1]
+        self.assertIn('任务不存在', reply)
+        self.assertNotIn('取消请求已受理', reply)
+        self.main._request.assert_not_awaited()
+
     def test_copied_labelled_decisions_use_fixed_control_and_stable_delivery(self):
         approval = 'a' * 32
         for label, action in [('同意', 'approve'), ('拒绝', 'deny')]:
@@ -585,6 +627,48 @@ class PluginAgentTests(unittest.TestCase):
 
 
 class NativeDriverTests(unittest.TestCase):
+    def test_response_scope_is_assembled_for_fresh_and_resumed_native_turns(self):
+        packages = os.environ.get('AGENTBRIDGE_TEST_NATIVE_PACKAGES')
+        node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
+        if not packages or not node:
+            self.skipTest('explicit pinned native test runtime not supplied')
+        with tempfile.TemporaryDirectory(prefix='native-scope-test-') as scratch:
+            root = Path(scratch).resolve()
+            workspace, source = root / 'workspace', root / 'source'
+            workspace.mkdir()
+            source.mkdir()
+            for name in ('agent_driver.mjs', 'agent_persona.mjs', 'agent_rpc.mjs', 'native_boundary.mjs'):
+                shutil.copyfile(Path(__file__).with_name(name), source / name)
+            driver = source / 'agent_driver.mjs'
+            original = driver.read_text()
+            marker = 'const text = JSON.stringify({ turns: texts.length,'
+            self.assertEqual(original.count(marker), 1)
+            driver.write_text(original.replace(marker, """
+      const {renderPrompt} = await load('dsh-system-prompt');
+      const {assembleContextFor} = await load('dsh-agent');
+      const prompt = renderPrompt(await ctx.systemPrompt.assemble(
+        assembleContextFor(handle.agent, new AbortController().signal)));
+      const text = JSON.stringify({ prompt, turns: texts.length,"""))
+            session = uuid.uuid4().hex
+            for index in range(2):
+                mid = uuid.uuid4().hex
+                request = dict(id=mid, session=session, root=str(root / 'a/native'),
+                               text='只列字节数、码点数、是否尾换行', resume=index > 0, synthetic=True,
+                               persona={'preferences': [{'category': 'verbosity', 'value': 'detailed'}]},
+                               subject=dict(sender='synthetic-owner', channel='synthetic-private', conversation=session,
+                                            session=session, project='p', cwd=str(workspace), attempt=mid))
+                file = root / 'request.json'
+                file.write_text(json.dumps(request))
+                result = subprocess.run([node, str(driver), str(file)], capture_output=True, text=True, timeout=15,
+                                        env={'PATH': '/usr/bin:/bin', 'HOME': str(root), 'ELECTRON_RUN_AS_NODE': '1',
+                                             'AGENTBRIDGE_AGENT_PACKAGES': packages})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                prompt = json.loads(json.loads(result.stdout)['reply'])['prompt']
+                for rule in ('回答范围和格式优先于一般详细偏好', '仅回答所求字段', '不额外附编码、摘要',
+                             '工具返回字段是证据', '不能为了简短而猜测', '只有终态 cancelled',
+                             '不代表用户主动拒绝', '不能据此扩大工具权限'):
+                    self.assertIn(rule, prompt)
+
     def test_persistent_native_driver_across_two_processes(self):
         packages = os.environ.get('AGENTBRIDGE_TEST_NATIVE_PACKAGES')
         node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')

@@ -251,9 +251,15 @@ class Main(star.Star):
                     + '\n同意请单独发送下一行：\n/agent approve ' + body['approval_id']
                     + '\n拒绝请单独发送下一行：\n/agent deny ' + body['approval_id'])
         state = body.get('state', 'uncertain')
+        if event['kind'] == 'cancel-request' and state == 'running':
+            return (prefix + '取消请求已受理，尚未确认受控执行器停止，不代表取消完成。'
+                    + '\n请等待终态通知，或查询：/agent tasks ' + event['task']
+                    + '\n取消不会撤销已发生的副作用。')
         descriptions = {'verified': '已完成并有检查证据', 'process-ended': '执行进程已结束，尚不等于目标已验证',
                         'denied': '工具未获授权，未进入实际动作', 'cancelled': '执行器已停止，不撤销已发生的副作用',
-                        'uncertain': '结果未知，不会自动重跑，执行通道已隔离', 'failed': '执行前检查未通过'}
+                        'uncertain': '结果未知，不会自动重跑，执行通道已隔离', 'failed': '执行前检查未通过',
+                        'queued': '任务已排队，尚未进入实际动作',
+                        'running': '执行器运行中，可能仍在等待审批，不代表动作体已进入'}
         result = body.get('result') or {}
         description = descriptions.get(state, state)
         if state == 'denied':
@@ -264,7 +270,7 @@ class Main(star.Star):
                            'approval_not_consumed': '授权未消费，未进入实际动作',
                            'boundary_denied': '执行边界未放行，未进入实际动作'}.get(result.get('reason'), description)
         evidence = {key: result[key] for key in ('evidence', 'path', 'sha256', 'exit_code') if key in result}
-        return prefix + description + '\n' + json.dumps(evidence, ensure_ascii=False)
+        return prefix + description + ('\n' + json.dumps(evidence, ensure_ascii=False) if evidence else '')
 
     async def _agent_task_tick(self):
         with self._agent_db() as db:
@@ -414,8 +420,10 @@ class Main(star.Star):
                     if data['state'] != 'pending':
                         reply = f"审批 {data['approval_id']}：{data['state']}，仅限该动作；执行结果请查 /agent tasks {data['subject']['attempt']}。"
                 elif data.get('task_id'):
+                    kind = ('cancel-request' if parts[:2] == ['/agent', 'task-cancel']
+                            and status == 200 and data.get('ok') is True else 'snapshot')
                     reply = self._task_event_text({'task': data['task_id'], 'project': data['project'],
-                                                  'conversation': data['conversation'], 'kind': 'terminal', 'body': data})
+                                                  'conversation': data['conversation'], 'kind': kind, 'body': data})
                 elif data.get('preferences') is not None:
                     reply = (data['core']['name'] + '；自动学习：' + ('开' if data['learning'] else '关')
                              + '\n' + ('\n'.join(f"{item['id']} {item['category']}={item['value']} 来源:{item['source']}" for item in data['preferences']) or '暂无有效长期偏好。'))
