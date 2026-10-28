@@ -749,6 +749,9 @@ class TaskPluginTests(unittest.TestCase):
         text = self.main._task_event_text(event)
         self.assertIn('/agent approve synthetic-approval', text)
         self.assertIn('/agent deny synthetic-approval', text)
+        self.assertIn('/agent approve synthetic-approval', text.splitlines())
+        self.assertIn('/agent deny synthetic-approval', text.splitlines())
+        self.assertNotIn('同意：/agent', text)
         self.assertIn(hashlib.sha256(b'synthetic content').hexdigest(), text)
         self.assertNotIn('private snapshot', text)
 

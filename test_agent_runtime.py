@@ -517,6 +517,50 @@ class PluginAgentTests(unittest.TestCase):
         self.assertTrue(payload['delivery_id'])
         self.main._request.assert_not_awaited()
 
+    def test_copied_labelled_decisions_use_fixed_control_and_stable_delivery(self):
+        approval = 'a' * 32
+        for label, action in [('同意', 'approve'), ('拒绝', 'deny')]:
+            for colon in ('：', ': '):
+                with self.subTest(label=label, colon=colon):
+                    self.event.get_message_str = lambda: f'{label}{colon}/agent {action} {approval}'
+                    self.main._request = mock.AsyncMock()
+                    self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'reply': 'synthetic-decision'}))
+                    asyncio.run(self.main.agent_message(self.event))
+                    first = self.main._control.await_args.args[1]
+                    self.assertEqual(first['op'], 'agent.' + action)
+                    self.assertEqual(first['approval_id'], approval)
+                    asyncio.run(self.main.agent_message(self.event))
+                    self.assertEqual(self.main._control.await_args.args[1], first)
+                    self.main._request.assert_not_awaited()
+
+    def test_embedded_or_conflicting_label_does_not_make_approval(self):
+        approval = 'a' * 32
+        for text in [f'请转发 同意：/agent approve {approval}',
+                     f'"同意：/agent approve {approval}"',
+                     f'同意：/agent deny {approval}', f'拒绝：/agent approve {approval}',
+                     f'同意：/agent approve {approval}\n其他文字',
+                     '同意：/agent approve bad-id']:
+            with self.subTest(text=text):
+                self.event.get_message_str = lambda: text
+                self.main._request = mock.AsyncMock(return_value=(400, {}))
+                self.main._control = mock.AsyncMock()
+                asyncio.run(self.main.agent_message(self.event))
+                self.main._control.assert_not_awaited()
+
+    def test_labelled_decision_still_requires_authorized_private_plain_event(self):
+        self.event.get_message_str = lambda: '同意：/agent approve ' + 'a' * 32
+        self.main._request = mock.AsyncMock()
+        self.main._control = mock.AsyncMock()
+        with mock.patch.object(self.main, '_agent_allowed', return_value=False):
+            asyncio.run(self.main.agent_message(self.event))
+        self.event.is_private_chat = lambda: False
+        asyncio.run(self.main.agent_message(self.event))
+        self.event.is_private_chat = lambda: True
+        self.event.message_obj.message = [type('Record', (), {})()]
+        asyncio.run(self.main.agent_message(self.event))
+        self.main._control.assert_not_awaited()
+        self.main._request.assert_not_awaited()
+
     def test_uncertain_send_not_retried(self):
         self.main._request = mock.AsyncMock(return_value=(202, {'message_id': 'chat-1'}))
         self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'state': 'done', 'message_id': 'chat-1', 'reply': '你好'}))

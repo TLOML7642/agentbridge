@@ -248,8 +248,8 @@ class Main(star.Star):
             return (prefix + '实际动作需要确认，四分钟内仅授权本次调用。\n工具：' + body['tool']
                     + '\n参数：' + json.dumps(visible, ensure_ascii=False)
                     + '\n动作摘要：' + body['digest'] + '\n审批ID：' + body['approval_id']
-                    + '\n同意：/agent approve ' + body['approval_id']
-                    + '\n拒绝：/agent deny ' + body['approval_id'])
+                    + '\n同意请单独发送下一行：\n/agent approve ' + body['approval_id']
+                    + '\n拒绝请单独发送下一行：\n/agent deny ' + body['approval_id'])
         state = body.get('state', 'uncertain')
         descriptions = {'verified': '已完成并有检查证据', 'process-ended': '执行进程已结束，尚不等于目标已验证',
                         'denied': '工具未获授权，未进入实际动作', 'cancelled': '执行器已停止，不撤销已发生的副作用',
@@ -344,6 +344,11 @@ class Main(star.Star):
         if not callable(getattr(event, 'is_private_chat', None)) or not event.is_private_chat():
             return
         text = event.get_message_str().strip()
+        # Accept an exact copy of the old notification's labelled command,
+        # never a command embedded in prose, a quote or a conflicting label.
+        copied = re.fullmatch(r'(同意|拒绝)[：:]\s*(/agent\s+(approve|deny)\s+[0-9a-f]{32})', text)
+        if copied and {'同意': 'approve', '拒绝': 'deny'}[copied[1]] == copied[3]:
+            text = copied[2]
         # AstrBot's waking stage removes the configured '/' prefix before
         # filters run. Both forms must stay out of the ordinary model lane.
         if re.match(r'^/?mac(?:\s|$)', text) or re.fullmatch(r'确认\s+[0-9a-zA-Z]{6,}', text):
