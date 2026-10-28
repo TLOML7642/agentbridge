@@ -471,12 +471,50 @@ class PluginAgentTests(unittest.TestCase):
 
     def test_other_sources_and_mac_do_not_get_intercepted(self):
         self.main._request = mock.AsyncMock()
-        for text in ['/mac help', '确认 abcdef']:
+        for text in ['/mac help', 'mac help', 'mac use bridge-canary', '确认 abcdef']:
             self.event.get_message_str = lambda text=text: text
             self.assertIsNone(asyncio.run(self.main.agent_message(self.event)))
         self.event.is_private_chat = lambda: False
         asyncio.run(self.main.agent_message(self.event))
         self.event.stop_event.assert_not_called()
+        self.main._request.assert_not_awaited()
+
+    def test_wake_prefix_stripped_mac_switch_stays_in_fixed_control_lane(self):
+        self.event.get_message_str = lambda: 'mac use bridge-canary'
+        self.main._request = mock.AsyncMock()
+        self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'current': 'bridge-canary'}))
+        asyncio.run(self.main.agent_message(self.event))
+        self.event.stop_event.assert_not_called()
+        self.main._request.assert_not_awaited()
+        # The real command filter receives the remainder after matching mac.
+        replies = asyncio.run(collect(self.main.mac(self.event, 'use bridge-canary')))
+        self.assertEqual(len(replies), 1)
+        payload = self.main._control.await_args.args[1]
+        self.assertEqual(payload['op'], 'use')
+        self.assertEqual(payload['project'], 'bridge-canary')
+        self.assertTrue(payload['delivery_id'])
+        self.main._request.assert_not_awaited()
+
+    def test_wake_prefix_stripped_agent_memory_never_calls_model(self):
+        self.event.get_message_str = lambda: 'agent memory'
+        self.main._request = mock.AsyncMock()
+        self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'reply': 'synthetic-memory'}))
+        asyncio.run(self.main.agent_message(self.event))
+        self.event.stop_event.assert_called_once()
+        self.main._control.assert_awaited_once_with(self.event, {'op': 'agent.memory'})
+        self.main._request.assert_not_awaited()
+        self.main._send_notification.assert_awaited_once_with(Event.unified_msg_origin, 'synthetic-memory')
+
+    def test_wake_prefix_stripped_approval_uses_stable_control_not_chat(self):
+        self.event.get_message_str = lambda: 'agent approve synthetic-approval'
+        self.main._request = mock.AsyncMock()
+        self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'reply': 'synthetic-approved'}))
+        asyncio.run(self.main.agent_message(self.event))
+        self.event.stop_event.assert_called_once()
+        payload = self.main._control.await_args.args[1]
+        self.assertEqual(payload['op'], 'agent.approve')
+        self.assertEqual(payload['approval_id'], 'synthetic-approval')
+        self.assertTrue(payload['delivery_id'])
         self.main._request.assert_not_awaited()
 
     def test_uncertain_send_not_retried(self):

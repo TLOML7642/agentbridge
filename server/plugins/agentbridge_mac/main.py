@@ -344,8 +344,12 @@ class Main(star.Star):
         if not callable(getattr(event, 'is_private_chat', None)) or not event.is_private_chat():
             return
         text = event.get_message_str().strip()
-        if text.startswith('/mac') or re.fullmatch(r'确认\s+[0-9a-zA-Z]{6,}', text):
+        # AstrBot's waking stage removes the configured '/' prefix before
+        # filters run. Both forms must stay out of the ordinary model lane.
+        if re.match(r'^/?mac(?:\s|$)', text) or re.fullmatch(r'确认\s+[0-9a-zA-Z]{6,}', text):
             return
+        if re.match(r'^agent(?:\s|$)', text):
+            text = '/' + text
         # Stop AstrBot's ordinary model path BEFORE network calls, including failures.
         event.stop_event()
         try:
