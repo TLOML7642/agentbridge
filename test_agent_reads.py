@@ -31,6 +31,64 @@ class ReadTests(unittest.TestCase):
     def page(self, **kwargs):
         return self.query(operation='read_text_range', **kwargs)
 
+    def search(self, value='.', **kwargs):
+        with mock.patch('agent_reads.SOURCE_PROJECT', str(self.workspace)):
+            return self.query(value, 'search_text', literal='needle', **kwargs)
+
+    def test_literal_project_search_only_reviews_19_paths(self):
+        (self.workspace / 'README.md').write_text('no\nneedle.*literal\r\n尾needle\r')
+        (self.workspace / 'worker.py').write_text('needle in source\n')
+        (self.workspace / 'unreviewed.py').write_text('needle-private-content')
+        result = self.search()
+        self.assertEqual([(row['file'], row['line']) for row in result['matches']],
+                         [('README.md', 2), ('README.md', 3), ('worker.py', 1)])
+        self.assertFalse(result['truncated'])
+        self.assertEqual(len(result['files']), 19)
+        self.assertNotIn('needle-private-content', json.dumps(result))
+        with mock.patch('agent_reads.SOURCE_PROJECT', str(self.workspace)):
+            literal = self.query('README.md', 'search_text', literal='needle.*literal')
+            self.assertEqual(len(literal['matches']), 1)
+            self.assertEqual(literal['matches'][0]['line'], 2)
+            self.assertEqual(self.query('README.md', 'search_text', literal='needle.*missing')['matches'], [])
+
+    def test_search_versions_match_range_and_changes_refuse_old_evidence(self):
+        target = self.workspace / 'README.md'
+        target.write_text('needle\n')
+        with mock.patch('agent_reads.SOURCE_PROJECT', str(self.workspace)):
+            page = self.page(value='README.md')
+        found = self.search('README.md')['matches'][0]
+        self.assertEqual(found['file_version'], page['file_version'])
+        target.write_text('needle changed\n')
+        with self.assertRaises(ValueError):
+            self.search('README.md', expected_version=found['file_version'])
+
+    def test_search_boundaries_unicode_long_lines_and_response_budget(self):
+        (self.workspace / 'README.md').write_text(('前' * 1000 + 'needle' + '尾' * 1000 + '\n') * 100)
+        found = self.search('README.md', max_matches=50)
+        self.assertTrue(found['truncated'])
+        self.assertLessEqual(len(json.dumps(found, ensure_ascii=False).encode()), PAGE_BYTES)
+        first = found['matches'][0]
+        self.assertEqual(first['column'], 1001)
+        self.assertEqual(first['excerpt_start_column'], 921)
+        self.assertTrue(first['line_truncated'])
+        self.assertIn('needle', first['text'])
+        self.assertLess(found['files'][0]['scanned_lines'], found['files'][0]['total_lines'])
+        project = self.search(max_matches=50)
+        self.assertLessEqual(len(json.dumps(project, ensure_ascii=False).encode()), PAGE_BYTES)
+        self.assertTrue(project['truncated'])
+
+    def test_search_does_not_follow_links_or_escape_reviewed_scope(self):
+        (self.workspace / 'README.md').symlink_to(self.workspace / 'hello.txt')
+        with self.assertRaises(OSError):
+            self.search('README.md')
+        for path in ('hello.txt', '../README.md', '.env', '/etc/hosts'):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.search(path)
+        with self.assertRaises(ValueError):
+            self.query('hello.txt', 'search_text', literal='needle')
+        with self.assertRaises(ValueError):
+            self.search(max_matches=True)
+
     def test_range_chinese_crlf_cr_and_empty_snapshot(self):
         for data, lines in [(b'', []), ('中文\r\n尾行\r第三\n无尾换行'.encode(),
                                         ['中文\r\n', '尾行\r', '第三\n', '无尾换行'])]:

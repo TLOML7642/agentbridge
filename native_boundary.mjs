@@ -56,6 +56,7 @@ export function installToolBoundary(ctx, {
   writesEnabled = false,
   requestApproval,
   consumeApproval,
+  allowServiceIntent,
   clock = () => ({ wall: Date.now(), monotonic: performance.now() }),
 } = {}) {
   const epoch = randomUUID();
@@ -157,6 +158,8 @@ export function installToolBoundary(ctx, {
       executions.set(exec, record);
       const policy = await next();
       if (policy.kind !== 'allow') return policy;
+      if (entry.effect === 'service-intent'
+          && (typeof allowServiceIntent !== 'function' || allowServiceIntent(request) !== true)) fail();
       if (entry.effect === 'write') {
         if (writesEnabled !== true || typeof requestApproval !== 'function' || typeof consumeApproval !== 'function') fail();
         const answer = await waitForHost(() => requestApproval(request, record.originalSignal), record);
@@ -200,10 +203,10 @@ export function installToolBoundary(ctx, {
         directory: Object.freeze({ dev: directory.dev, ino: directory.ino }) }));
     },
     register(definition, { effect } = {}) {
-      if (sealed || closed || !['read', 'write'].includes(effect) || definitions.has(definition.name)
+      if (sealed || closed || !['read', 'write', 'service-intent'].includes(effect) || definitions.has(definition.name)
           || typeof definition.execute !== 'function') fail();
       const name = text(definition.name);
-      if (DENIED_TOOLS.test(name) || (effect === 'read' && COMMAND_TOOLS.has(name))) fail();
+      if (DENIED_TOOLS.test(name) || (effect !== 'write' && COMMAND_TOOLS.has(name))) fail();
       const action = definition.execute;
       // No finalizers/classifiers/presenters borrowed from arbitrary plugins:
       // callbacks before/after execution are not an approval-protected action.

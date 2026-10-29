@@ -356,6 +356,13 @@ class PreferenceTests(unittest.TestCase):
             row = self.submit(text='hello')
         self.assertEqual(self.wait(row['message_id'])['reply'], 'reply:hello')
 
+    def test_host_snapshot_failure_does_not_kill_chat_or_infer_document_state(self):
+        self.runtime.runtime_info = mock.Mock(side_effect=OSError('synthetic source unavailable'))
+        row = self.submit(text='hello')
+        self.assertEqual(self.wait(row['message_id'])['reply'], 'reply:hello')
+        self.assertIn('unavailable', self.calls[-1]['runtime_info']['evidence'])
+        self.assertTrue(self.runtime.thread.is_alive())
+
     def test_core_name_changes_only_through_explicit_scoped_control(self):
         self.submit(text='以后你叫小豆，简短回答')
         self.assertEqual(self.memory()['core']['name'], 'DSH 助手')

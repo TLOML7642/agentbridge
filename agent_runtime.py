@@ -41,6 +41,31 @@ class Preferences:
         ('workflow', 'test_first', r'先测试|先跑测试'),
         ('workflow', 'backup_first', r'先备份|修改前备份'),
     ]
+    VALUES = {'verbosity': {'brief', 'detailed'}, 'language': {'zh', 'en'},
+              'format': {'bullets', 'natural'}, 'workflow': {'test_first', 'backup_first'}}
+
+    @classmethod
+    def validate(cls, category, value):
+        if not isinstance(category, str) or not isinstance(value, str):
+            raise AgentError('INVALID_MESSAGE', '偏好类别和值必须为文字')
+        if category == 'name':
+            if isinstance(value, str) and value.strip() and re.fullmatch(r'[\w \-]{1,40}', value, re.UNICODE):
+                return
+        elif category in cls.VALUES and value in cls.VALUES[category]:
+            return
+        raise AgentError('INVALID_MESSAGE', '不支持的偏好类别或值；名字限 1 至 40 个文字/数字/空格/连字符')
+
+    def manual(self, db, owner, category, value, source):
+        self.validate(category, value)
+        if category == 'name':
+            db.execute('INSERT OR REPLACE INTO persona_core VALUES (?,?)', (owner, value))
+            return
+        prior = db.execute('SELECT id FROM preferences WHERE owner=? AND category=?', (owner, category)).fetchone()
+        db.execute('INSERT INTO preferences VALUES (?,?,?,?,?,?,?,NULL) '
+                   'ON CONFLICT(owner,category) DO UPDATE SET value=excluded.value,explicit=1,updated=excluded.updated,'
+                   'source=excluded.source,expires=NULL',
+                   (prior['id'] if prior else uuid.uuid4().hex, owner, category, value, 1, time.time(), 'manual:' + source))
+        db.execute('DELETE FROM preference_forgotten WHERE owner=? AND category=? AND value=?', (owner, category, value))
 
     def __init__(self, allow_learning=False):
         self.allow_learning = allow_learning
@@ -73,6 +98,8 @@ class Preferences:
             if not explicit and count < 2:
                 continue
             old = db.execute('SELECT * FROM preferences WHERE owner=? AND category=?', (owner, key)).fetchone()
+            if old and (old['source'] or '').startswith('manual:'):
+                continue
             if old and old['value'] != value and not explicit:
                 continue
             is_explicit = explicit or bool(old and old['explicit'] and old['value'] == value)
@@ -95,9 +122,9 @@ class Preferences:
 
     def control(self, db, owner, op, memory_id='', name=''):
         if op == 'agent.persona.set':
-            if not re.fullmatch(r'[\w \-]{1,40}', name, re.UNICODE):
-                raise AgentError('INVALID_MESSAGE', '名字仅支持 1 至 40 个文字、数字、空格或连字符')
-            db.execute('INSERT OR REPLACE INTO persona_core VALUES (?,?)', (owner, name))
+            self.manual(db, owner, 'name', name, 'persona-command')
+        if op == 'agent.persona.reset':
+            db.execute('DELETE FROM persona_core WHERE owner=?', (owner,))
         if op == 'agent.forget':
             row = db.execute('SELECT * FROM preferences WHERE id=? AND owner=?', (memory_id, owner)).fetchone()
             if row is None:
@@ -118,7 +145,8 @@ class AgentRuntime:
     A committed running intent precedes process launch. Unknown turns block
     their native session instead of automatically replaying a possibly used input.
     """
-    def __init__(self, root, runner, project, evidence=lambda *_: [], recover=lambda *_: None, allow_learning=False, tasks=None):
+    def __init__(self, root, runner, project, evidence=lambda *_: [], recover=lambda *_: None, allow_learning=False, tasks=None,
+                 services=None, runtime_info=None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -135,6 +163,7 @@ class AgentRuntime:
             raise
         self.runner, self.project, self.evidence = runner, project, evidence
         self.tasks = tasks
+        self.services, self.runtime_info = services, runtime_info
         self.preferences = Preferences(allow_learning)
         self.lock = threading.RLock()
         self.wake = threading.Event()
@@ -165,6 +194,9 @@ class AgentRuntime:
                   PRIMARY KEY(owner,category,value,source));
                 CREATE TABLE IF NOT EXISTS preference_forgotten(owner TEXT,category TEXT,value TEXT,
                   PRIMARY KEY(owner,category,value));
+                CREATE TABLE IF NOT EXISTS preference_drafts(
+                  id TEXT PRIMARY KEY,owner TEXT,channel TEXT,category TEXT,value TEXT,memory_id TEXT,
+                  basis TEXT,expires REAL,state TEXT);
             ''')
             for row in db.execute("SELECT * FROM messages WHERE state='running'").fetchall():
                 restored = recover(dict(row))
@@ -284,13 +316,88 @@ class AgentRuntime:
                     pass
             return False
 
-    def control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name=''):
-        result = self._control(sender, channel, op, project, message_id, delivery, memory_id, name)
-        if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set'):
+    def control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name='',
+                category='', value='', draft_id=''):
+        result = self._control(sender, channel, op, project, message_id, delivery, memory_id, name, category, value, draft_id)
+        if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set',
+                  'agent.persona.reset', 'agent.preference.set', 'agent.preference.confirm'):
             synced = self.export_profile(sender)
             result['desktop_profile_synced'] = synced
             if op == 'agent.forget' and not synced:
                 result['message'] += ' 桌面偏好快照同步失败，尚不能确认桌面已停止使用。'
+        return result
+
+    def profile_intent(self, subject, tool, arguments, call_id):
+        allowed = {'preference_view': set(), 'preference_draft': {'category', 'value'},
+                   'preference_forget_draft': {'memory_id'}}
+        if tool not in allowed or not isinstance(arguments, dict) or set(arguments) != allowed[tool]:
+            raise AgentError('INVALID_MESSAGE', '偏好只支持查看或创建确认草稿')
+        if any(not isinstance(v, str) or len(v) > 128 for v in arguments.values()):
+            raise AgentError('INVALID_MESSAGE', '偏好参数无效')
+        delivery = 'profile-' + hashlib.sha256(json.dumps([subject['attempt'], call_id]).encode()).hexdigest()
+        return self.control(subject['sender'], subject['channel'],
+                            'agent.memory' if tool == 'preference_view' else 'agent.preference.draft', subject['project'],
+                            delivery=delivery, **arguments)
+
+    def _preference_basis(self, db, sender, category):
+        if category == 'name':
+            row = db.execute('SELECT name FROM persona_core WHERE owner=?', (sender,)).fetchone()
+        else:
+            row = db.execute('SELECT id,value,updated,source FROM preferences WHERE owner=? AND category=?', (sender, category)).fetchone()
+        return json.dumps(dict(row) if row else None, sort_keys=True, ensure_ascii=False)
+
+    def _preference_control(self, db, sender, channel, op, delivery, memory_id, category, value, draft_id):
+        required(delivery, 128)
+        fingerprint = hashlib.sha256(json.dumps([op, memory_id, category, value, draft_id]).encode()).hexdigest()
+        old = db.execute('SELECT * FROM controls WHERE sender=? AND channel=? AND delivery=?', (sender, channel, delivery)).fetchone()
+        if old:
+            if old['digest'] != fingerprint:
+                raise AgentError('DELIVERY_CONFLICT', '偏好投递已绑定其他变更')
+            previous = json.loads(old['response'])
+            if 'preference_draft' not in previous:
+                return {'ok': True, 'reused': True, **self.preferences.view(db, sender),
+                        'message': '此前变更已处理，没有重新应用；此处为当前偏好。'}
+            row = db.execute('SELECT state,expires FROM preference_drafts WHERE id=?', (previous['preference_draft']['id'],)).fetchone()
+            previous['preference_draft']['state'] = ('expired' if row and row['state'] == 'pending' and row['expires'] <= time.time()
+                                                      else row['state'] if row else 'unknown')
+            previous['message'] = '原草稿收据，当前状态：' + previous['preference_draft']['state'] + '；没有重新应用变更。'
+            return {**previous, 'reused': True}
+        if op == 'agent.preference.confirm':
+            row = db.execute('SELECT * FROM preference_drafts WHERE id=? AND owner=? AND channel=?', (draft_id, sender, channel)).fetchone()
+            if row is None or row['state'] != 'pending' or row['expires'] <= time.time():
+                raise AgentError('INVALID_MESSAGE', '偏好草稿不存在、来源不匹配或已过期')
+            if self._preference_basis(db, sender, row['category']) != row['basis']:
+                raise AgentError('DELIVERY_CONFLICT', '原偏好已变化，请重新生成确认摘要')
+            if row['memory_id']:
+                self.preferences.control(db, sender, 'agent.forget', row['memory_id'])
+            else:
+                self.preferences.manual(db, sender, row['category'], row['value'], delivery)
+            db.execute("UPDATE preference_drafts SET state='applied' WHERE id=?", (draft_id,))
+            result = {'ok': True, **self.preferences.view(db, sender), 'message': '偏好已确认；只共享人格与偏好，不共享完整聊天历史。'}
+        elif op == 'agent.preference.set':
+            self.preferences.manual(db, sender, category, value, delivery)
+            result = {'ok': True, **self.preferences.view(db, sender)}
+        elif op == 'agent.preference.draft':
+            if memory_id:
+                row = db.execute('SELECT * FROM preferences WHERE id=? AND owner=?', (memory_id, sender)).fetchone()
+                if row is None:
+                    raise AgentError('NOT_FOUND', '偏好 ID 不存在或不属于当前发送者')
+                category, value = row['category'], row['value']
+            else:
+                self.preferences.validate(category, value)
+            count = db.execute("SELECT count(*) FROM preference_drafts WHERE owner=? AND channel=? AND state='pending' AND expires>?",
+                               (sender, channel, time.time())).fetchone()[0]
+            if count >= 5:
+                raise AgentError('BUSY', '最多五个待确认偏好草稿')
+            identifier, expires = uuid.uuid4().hex, time.time() + 600
+            db.execute("INSERT INTO preference_drafts VALUES (?,?,?,?,?,?,?,?,'pending')",
+                       (identifier, sender, channel, category, value, memory_id, self._preference_basis(db, sender, category), expires))
+            result = {'ok': True, 'preference_draft': {'id': identifier, 'category': category, 'value': value, 'state': 'pending',
+                                                     'action': 'forget' if memory_id else 'set', 'expires': expires},
+                      'message': '偏好尚未变更，核对摘要后单独发送：\n/agent preference confirm ' + identifier}
+        else:
+            raise AgentError('INVALID_MESSAGE', '不支持的偏好操作')
+        db.execute('INSERT INTO controls VALUES (?,?,?,?,?)', (sender, channel, delivery, fingerprint, json.dumps(result, ensure_ascii=False)))
         return result
 
     def current_conversation(self, sender, channel, project):
@@ -302,8 +409,12 @@ class AgentRuntime:
                 raise AgentError('NOT_FOUND', '当前项目尚无对话会话')
             return row['session']
 
-    def _control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name=''):
+    def _control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name='',
+                 category='', value='', draft_id=''):
         required(sender); required(channel)
+        if op in ('agent.preference.set', 'agent.preference.draft', 'agent.preference.confirm'):
+            with self.db() as db:
+                return self._preference_control(db, sender, channel, op, delivery, memory_id, category, value, draft_id)
         if op == 'agent.cancel':
             required(delivery, 128); required(message_id, 128)
             fingerprint = hashlib.sha256(json.dumps([op, message_id]).encode()).hexdigest()
@@ -329,8 +440,8 @@ class AgentRuntime:
                 event.set()
             return result
         with self.db() as db:
-            if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set'):
-                if op in ('agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona.set'):
+            if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set', 'agent.persona.reset'):
+                if op in ('agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona.set', 'agent.persona.reset'):
                     required(delivery, 128)
                     fingerprint = hashlib.sha256(json.dumps([op, memory_id, name]).encode()).hexdigest()
                     old = db.execute('SELECT * FROM controls WHERE sender=? AND channel=? AND delivery=?',
@@ -399,6 +510,10 @@ class AgentRuntime:
                 continue
             state, reply = 'uncertain', ''
             try:
+                try:
+                    turn['runtime_info'] = self.runtime_info() if self.runtime_info else {'evidence': 'runtime release not supplied'}
+                except Exception:
+                    turn['runtime_info'] = {'evidence': 'host snapshot unavailable; do not infer release from documents'}
                 cwd = os.path.realpath(self.project(session['project']))
                 stat = os.stat(cwd)
                 if cwd != session['cwd'] or (stat.st_dev, stat.st_ino) != (session['device'], session['inode']):
@@ -438,14 +553,17 @@ class AgentRuntime:
         if self.thread.is_alive():
             raise RuntimeError('chat executor did not quiesce; lease retained')
         self.lease.close()
+        if self.services is not None:
+            self.services.close()
 
 
 class NativeExecutor:
-    def __init__(self, root, run_task, redact, tasks=None):
+    def __init__(self, root, run_task, redact, tasks=None, services=None):
         self.root, self.run_task, self.redact = Path(root), run_task, redact
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         self.tasks = tasks
+        self.services = services
 
     def recover(self, turn):
         if not re.fullmatch(r'[a-f0-9]{32}', turn['id']):
@@ -470,6 +588,9 @@ class NativeExecutor:
         payload = {k: turn[k] for k in ('id', 'session', 'text', 'subject', 'resume', 'recent_tasks', 'persona')}
         payload['root'] = str(self.root / 'native')
         payload['python'] = sys.executable
+        payload['runtime_info'] = turn.get('runtime_info', {'evidence': 'runtime release not supplied'})
+        if self.services is not None:
+            payload['services'] = self.services.issue(turn['subject'], cancel, turn['text'])
         if self.tasks is not None:
             payload['task_events'] = turn.get('task_events', [])
             if self.tasks.can_submit(turn['subject']['project']):
@@ -499,4 +620,6 @@ class NativeExecutor:
         finally:
             if payload.get('broker'):
                 self.tasks.revoke_capability(payload['broker']['capability'])
+            if payload.get('services'):
+                self.services.revoke_capability(payload['services']['capability'])
             request.unlink(missing_ok=True)

@@ -33,6 +33,7 @@ import hmac
 import itertools
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import sqlite3
@@ -43,6 +44,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from agent_runtime import AgentError, AgentRuntime, NativeExecutor
+from agent_services import ServiceQueue
 from agent_tasks import TaskRuntime
 from agent_task_executor import NativeTaskExecutor
 
@@ -1171,6 +1173,7 @@ class App:
         if AGENT_ENABLED:
             if not ALLOWED_SENDERS or not AGENT_CHANNELS:
                 raise AgentBridgeError('AUTH_FAIL', '持续对话必须显式配置发送者和灰度会话')
+            self._agent_boot_source = self._agent_source_evidence()
             root = os.path.join(BASE, 'agent')
             if AGENT_TASKS:
                 if not AGENT_TASK_PROJECTS:
@@ -1188,9 +1191,56 @@ class App:
                 self.agent_tasks = TaskRuntime(task_root, task_executor, lambda name: self.get_project(name)['dir'],
                                                enabled=True, recover=task_executor.recover, check_external=check_legacy_execution,
                                                allowed_projects=AGENT_TASK_PROJECTS)
-            executor = NativeExecutor(root, run_task, redact, tasks=self.agent_tasks)
-            self.agent = AgentRuntime(root, executor, lambda name: self.get_project(name)['dir'],
-                                      self._agent_evidence, recover=executor.recover, allow_learning=AGENT_LEARNING, tasks=self.agent_tasks)
+            services = (ServiceQueue(os.path.join(root, 'services'), profile=lambda *args: self.agent.profile_intent(*args))
+                        if os.environ.get('AGENTBRIDGE_PERSONAL_SERVICES', '0') == '1' else None)
+            try:
+                executor = NativeExecutor(root, run_task, redact, tasks=self.agent_tasks, services=services)
+                self.agent = AgentRuntime(root, executor, lambda name: self.get_project(name)['dir'],
+                                          self._agent_evidence, recover=executor.recover, allow_learning=AGENT_LEARNING, tasks=self.agent_tasks,
+                                          services=services, runtime_info=self._agent_runtime_info)
+            except BaseException:
+                if services is not None:
+                    services.close()
+                if self.agent_tasks is not None:
+                    self.agent_tasks.close()
+                raise
+
+    def _agent_source_evidence(self):
+        # These are host facts, never inferred from the selected project's docs.
+        source = Path(__file__).resolve().parent
+        files = ('worker.py', 'agent_runtime.py', 'agent_driver.mjs', 'agent_services.py', 'agent_reads.py',
+                 'native_boundary.mjs', 'agent_persona.mjs', 'agent_rpc.mjs', 'agent_actions.py', 'agent_approvals.py',
+                 'agent_tasks.py', 'agent_task_driver.mjs', 'agent_task_executor.py')
+        digest = hashlib.sha256()
+        for name in files:
+            digest.update(name.encode() + b'\0' + (source / name).read_bytes())
+        revision = 'unknown'
+        clean = False
+        try:
+            git = ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', str(source)]
+            env = {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
+            revision = subprocess.check_output([*git, 'rev-parse', 'HEAD'], env=env, stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+            tracked = subprocess.run([*git, 'ls-files', '--error-unmatch', '--', *files], env=env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
+            clean = tracked and subprocess.run([*git, 'diff', '--quiet', '--no-ext-diff', '--no-textconv', 'HEAD', '--', *files],
+                                               env=env, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return {'code_sha256': digest.hexdigest(), 'checkout_commit': revision, 'audited_code_matches_commit': clean}
+
+    def _agent_runtime_info(self):
+        current = self._agent_source_evidence()
+        boot = getattr(self, '_agent_boot_source', None)
+        return {'evidence': 'host_startup_and_current_source_snapshots', 'startup_source': boot,
+                'current_source': current, 'source_matches_startup': boot is not None and current['code_sha256'] == boot['code_sha256'],
+                'worker_runtime': 'running', 'worker_boot_id': self.boot_id,
+                'deployment_status': 'worker running; server version and observation not independently supplied',
+                'project': 'selected by authenticated host routing',
+                'file_actions': 'per-action hard approval in configured canary only' if self.agent_tasks else 'disabled',
+                'personal_services': getattr(self.agent, 'services', None) is not None, 'automatic_learning_available': AGENT_LEARNING,
+                'deployment_observation': 'not asserted by this host snapshot',
+                'wechat_acceptance': 'not asserted', 'phone_receipt': 'unknown',
+                'project_documents': 'read-only snapshots, not deployment evidence'}
 
     def _agent_evidence(self, sender, channel, project):
         rows = self.db.query('SELECT job_id,status,result,exit_code,sandbox_mode FROM jobs '
@@ -1574,9 +1624,13 @@ CONTROL_FIELDS = {
     "agent.memory.on": {"delivery_id"}, "agent.memory.off": {"delivery_id"},
     "agent.forget": {"memory_id", "delivery_id"},
     "agent.persona.set": {"name", "delivery_id"},
+    "agent.persona.reset": {"delivery_id"},
+    "agent.preference.set": {"category", "value", "delivery_id"},
+    "agent.preference.confirm": {"draft_id", "delivery_id"},
     "agent.tasks": {"task_id"}, "agent.task.cancel": {"task_id", "delivery_id"},
     "agent.approvals": {"approval_id"}, "agent.approve": {"approval_id", "delivery_id"},
     "agent.deny": {"approval_id", "delivery_id"}, "agent.events": {"after"},
+    "agent.service.requests": set(), "agent.service.resolve": {"request_id", "result"},
 }
 CONTROL_OPS = frozenset(CONTROL_FIELDS)
 
@@ -1597,6 +1651,13 @@ def do_control(app: App, payload: dict) -> dict:
     if op.startswith('agent.'):
         _agent_source(app, sender, channel)
         try:
+            if op in ('agent.service.requests', 'agent.service.resolve'):
+                services = app.agent.services
+                if services is None:
+                    raise AgentError('SERVICE_DISABLED', '个人服务未启用')
+                if op == 'agent.service.requests':
+                    return services.pending(sender, channel)
+                return services.resolve(sender, channel, payload.get('request_id', ''), payload.get('result', ''))
             if op in ('agent.tasks', 'agent.task.cancel', 'agent.approvals', 'agent.approve', 'agent.deny', 'agent.events'):
                 if app.agent_tasks is None or not AGENT_TASKS:
                     raise AgentError('WRITES_DISABLED', '后台动作尚未启用')
@@ -1624,7 +1685,8 @@ def do_control(app: App, payload: dict) -> dict:
                 return result
             return app.agent.control(sender, channel, op, app.current_project(channel),
                                      payload.get('message_id', ''), payload.get('delivery_id', ''),
-                                     payload.get('memory_id', ''), payload.get('name', ''))
+                                     payload.get('memory_id', ''), payload.get('name', ''),
+                                     payload.get('category', ''), payload.get('value', ''), payload.get('draft_id', ''))
         except AgentError as exc:
             raise AgentBridgeError(exc.code, exc.message) from None
     if op == "diag":

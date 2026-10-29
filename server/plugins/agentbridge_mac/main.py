@@ -16,11 +16,18 @@ from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.star.filter.command import GreedyStr
 
+try:
+    from .reminders import Reminders, ReminderError
+except ImportError:
+    # Source-only synthetic tests import this file without an AstrBot package.
+    from server.plugins.agentbridge_mac.reminders import Reminders, ReminderError
+
 SHIM_URL = os.environ.get("AGENTBRIDGE_SHIM_URL", "http://127.0.0.1:8787/v1/chat/completions")
 CONTROL_URL = SHIM_URL.rsplit("/v1/", 1)[0] + "/v1/agentbridge/control"
 MESSAGES_URL = SHIM_URL.rsplit('/v1/', 1)[0] + '/v1/agentbridge/messages'
 AGENT_ENABLED = os.environ.get('AGENTBRIDGE_AGENT_MESSAGES', '0') == '1'
 AGENT_TASKS = os.environ.get('AGENTBRIDGE_AGENT_TASKS', '0') == '1'
+PERSONAL_SERVICES = os.environ.get('AGENTBRIDGE_PERSONAL_SERVICES', '0') == '1'
 AGENT_CHANNELS = {s.strip() for s in os.environ.get('AGENTBRIDGE_AGENT_CHANNELS', '').split(',') if s.strip()}
 TOKEN = os.environ.get("SHIM_TOKEN", "")
 TIMEOUT = int(os.environ.get("AGENTBRIDGE_MAC_TIMEOUT", "300"))
@@ -44,6 +51,17 @@ class Main(star.Star):
         self._sender_lease = None
         self._agent_task = None
         self._agent_stop = None
+        self._reminder_task = None
+        self._reminder_stop = None
+        self._reminder_store = None
+        self._reminder_sends = set()
+
+    def _reminders(self):
+        if not PERSONAL_SERVICES or not AGENT_ENABLED:
+            raise ReminderError('个人提醒服务尚未启用。')
+        if self._reminder_store is None:
+            self._reminder_store = Reminders(self._data_root())
+        return self._reminder_store
 
     def _data_root(self):
         root = Path(DATA_DIR) if DATA_DIR is not None else Path(star.StarTools.get_data_dir("agentbridge_mac"))
@@ -105,6 +123,10 @@ class Main(star.Star):
             db.execute("UPDATE notifications SET state='unknown',reason='sender_restarted' WHERE state='sending'")
 
     async def initialize(self):
+        if AGENT_ENABLED and PERSONAL_SERVICES and self._reminder_task is None:
+            self._reminders().start_sender()
+            self._reminder_stop = asyncio.Event()
+            self._reminder_task = asyncio.create_task(self._reminder_loop())
         if AGENT_ENABLED and self._agent_task is None:
             self._agent_stop = asyncio.Event()
             with self._agent_db() as db:
@@ -127,6 +149,11 @@ class Main(star.Star):
 
     async def terminate(self):
         try:
+            if self._reminder_task is not None:
+                self._reminder_stop.set()
+                await self._reminder_task
+                await asyncio.gather(*self._reminder_sends)
+                self._reminder_task = None
             if self._agent_task is not None:
                 self._agent_stop.set()
                 await self._agent_task
@@ -135,6 +162,8 @@ class Main(star.Star):
                 self._sender_stop.set()
                 await self._sender_task
         finally:
+            if self._reminder_store is not None:
+                self._reminder_store.close()
             self._sender_task = None
             if self._sender_lease is not None:
                 self._sender_lease.close()
@@ -167,7 +196,71 @@ class Main(star.Star):
                        'PRIMARY KEY(sender,channel))')
             db.execute('CREATE TABLE IF NOT EXISTS agent_task_outbox(id TEXT PRIMARY KEY,sender TEXT,channel TEXT,'
                        'payload TEXT,state TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS agent_service_sources(sender TEXT,channel TEXT,PRIMARY KEY(sender,channel))')
             yield db
+
+    async def _send_reminder(self, row):
+        state = 'blocked'
+        try:
+            if self._agent_allowed(row['sender'], row['channel']):
+                state = 'unknown'
+                returned = await asyncio.wait_for(self._send_notification(row['channel'], Reminders.notification(row)), timeout=15)
+                state = 'api_returned' if returned else 'unknown'
+        except Exception:
+            state = 'unknown'
+        finally:
+            self._reminders().finish(row['id'], state)
+
+    async def _reminder_tick(self):
+        store = self._reminders()
+        for _ in range(20 - len(self._reminder_sends)):
+            row = store.claim_due()
+            if row is None:
+                break
+            task = asyncio.create_task(self._send_reminder(row))
+            self._reminder_sends.add(task)
+            task.add_done_callback(self._reminder_sends.discard)
+            # Retrieve failures so an API exception cannot become an unhandled
+            # task exception. The durable send state was set in finally.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+    async def _reminder_loop(self):
+        while not self._reminder_stop.is_set():
+            try:
+                await self._reminder_tick()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(self._reminder_stop.wait(), timeout=2)
+            except TimeoutError:
+                pass
+
+    async def _service_tick(self):
+        with self._agent_db() as db:
+            sources = [dict(row) for row in db.execute('SELECT * FROM agent_service_sources')]
+        for source in sources:
+            sender, channel = source['sender'], source['channel']
+            if not self._agent_allowed(sender, channel):
+                continue
+            event = type('ServiceSource', (), {'get_sender_id': lambda self, value=sender: value,
+                                             'unified_msg_origin': channel})()
+            try:
+                status, data = await self._control(event, {'op': 'agent.service.requests'})
+                if status != 200 or data.get('ok') is not True:
+                    continue
+                for request in data.get('requests', []):
+                    if (not isinstance(request, dict) or set(request) != {'id', 'tool', 'arguments', 'expires'}
+                            or not isinstance(request['expires'], (int, float))
+                            or request['tool'] not in ('reminder_draft', 'reminder_list', 'reminder_get', 'reminder_cancel')):
+                        continue
+                    if request['expires'] <= time.time():
+                        result = {'ok': False, 'error': '服务请求过期，不自动执行或重建。'}
+                    else:
+                        result = self._reminders().request(sender, channel, request['id'], request['tool'], request['arguments'])
+                    await self._control(event, {'op': 'agent.service.resolve', 'request_id': request['id'],
+                                                'result': json.dumps(result, ensure_ascii=False)})
+            except Exception:
+                continue
 
     def _agent_allowed(self, sender, channel):
         return AGENT_ENABLED and channel in AGENT_CHANNELS and self._notification_allowed(sender, channel)
@@ -223,6 +316,8 @@ class Main(star.Star):
     async def _agent_loop(self):
         while not self._agent_stop.is_set():
             try:
+                if PERSONAL_SERVICES:
+                    await self._service_tick()
                 await self._agent_tick()
                 if AGENT_TASKS:
                     await self._agent_task_tick()
@@ -378,11 +473,35 @@ class Main(star.Star):
                 return
             if text.startswith('/agent'):
                 parts = text.split()
-                if parts == ['/agent', 'new']:
+                if parts[:2] == ['/agent', 'reminders'] and len(parts) <= 3:
+                    result = self._reminders().request(sender, channel, uuid.uuid4().hex,
+                        'reminder_get' if len(parts) == 3 else 'reminder_list',
+                        {'reminder_id': parts[2]} if len(parts) == 3 else {})
+                    await self._agent_local(event, self._reminder_reply(result))
+                    return
+                elif parts[:2] == ['/agent', 'remind'] and len(parts) == 4 and parts[2] in ('confirm', 'cancel'):
+                    delivery, _ = self._agent_delivery(event, text, 'reminder-control')
+                    result = self._reminders().request(sender, channel, 'control-' + delivery,
+                                                       'reminder_' + parts[2], {'reminder_id': parts[3]})
+                    await self._agent_local(event, self._reminder_reply(result))
+                    return
+                elif parts == ['/agent', 'new']:
                     delivery, _ = self._agent_delivery(event, text, 'agent-control')
                     status, data = await self._control(event, {'op': 'agent.new', 'delivery_id': delivery})
                 elif parts in (['/agent', 'memory'], ['/agent', 'persona']):
                     status, data = await self._control(event, {'op': 'agent.' + parts[1]})
+                elif parts == ['/agent', 'preference']:
+                    status, data = await self._control(event, {'op': 'agent.memory'})
+                elif parts[:3] == ['/agent', 'preference', 'set'] and len(parts) >= 5:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.preference.set', 'category': parts[3],
+                                                            'value': ' '.join(parts[4:]), 'delivery_id': delivery})
+                elif parts[:3] == ['/agent', 'preference', 'confirm'] and len(parts) == 4:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.preference.confirm', 'draft_id': parts[3], 'delivery_id': delivery})
+                elif parts == ['/agent', 'persona', 'reset']:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.persona.reset', 'delivery_id': delivery})
                 elif parts[:3] == ['/agent', 'persona', 'name'] and len(parts) >= 4:
                     delivery, _ = self._agent_delivery(event, text, 'agent-control')
                     status, data = await self._control(event, {'op': 'agent.persona.set', 'name': ' '.join(parts[3:]), 'delivery_id': delivery})
@@ -407,6 +526,8 @@ class Main(star.Star):
                                                               'task_id' if cancel_task else 'approval_id': parts[2], 'delivery_id': delivery})
                 else:
                     await self._agent_local(event, '用法：/agent new；/agent status [消息ID]；/agent cancel <消息ID>；/agent memory [on|off]；/agent forget <偏好ID>；/agent persona。'
+                                            + '\n显式偏好：/agent preference；/agent preference set <类别> <值>；/agent preference confirm <ID>；/agent persona reset。'
+                                            + ('\n提醒：/agent reminders [ID]；/agent remind confirm <ID>；/agent remind cancel <ID>。' if PERSONAL_SERVICES else '')
                                             + ('后台：/agent tasks [ID]；/agent task-cancel <ID>；/agent approvals [ID]；/agent approve <ID>；/agent deny <ID>。'
                                                if AGENT_TASKS else '当前后台动作未启用。'))
                     return
@@ -442,6 +563,8 @@ class Main(star.Star):
                 db.execute("INSERT OR IGNORE INTO agent_outbox VALUES (?,?,?,NULL,'watch',?)", (sender, channel, delivery, time.time()))
                 if AGENT_TASKS:
                     db.execute('INSERT OR IGNORE INTO agent_task_sources VALUES (?,?,0)', (sender, channel))
+                if PERSONAL_SERVICES:
+                    db.execute('INSERT OR IGNORE INTO agent_service_sources VALUES (?,?)', (sender, channel))
             status, data = await self._request(event, MESSAGES_URL, {'delivery_id': delivery, 'text': text})
             if data.get('message_id'):
                 with self._agent_db() as db:
@@ -449,8 +572,22 @@ class Main(star.Star):
                 await self._agent_tick()
             else:
                 await self._agent_local(event, '消息受理未确认，不会改用另一个聊天模型。可用 /agent status 查询；重复投递会复用原编号。')
+        except ReminderError as exc:
+            await self._agent_local(event, str(exc))
         except Exception:
             await self._agent_local(event, 'DSH 对话入口暂不可用，不会自动切换模型或新建任务。请查询原消息状态。')
+
+    @staticmethod
+    def _reminder_reply(result):
+        if not result.get('ok'):
+            return str(result.get('error', '提醒操作未确认。'))
+        rows = result.get('reminders', [result['reminder']] if 'reminder' in result else [])
+        text = '\n'.join(f"{row['id']} {row['state']}\n{row['absolute_time']} [{row['timezone']}]\n{row['content']}"
+                         + (' [内容预览截断，完整内容请查详情]' if row.get('content_truncated') else '') for row in rows)
+        return (result.get('message', '') + '\n' + (text or '当前来源没有提醒。')
+                + ('\n列表已截断，可用 /agent reminders <完整ID> 查详情。' if result.get('truncated') else '')
+                + ('\n以上是原操作时的状态收据，重复投递不重新执行；当前状态可重新查询。' if result.get('evidence') else '')
+                + '\n发送 API 返回不等于手机收到。').strip()
     @staticmethod
     def _excerpt(text):
         text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----", "[密钥已隐藏]", str(text))

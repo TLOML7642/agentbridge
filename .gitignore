@@ -4,6 +4,7 @@
 !/shim.py
 !/native_boundary.mjs
 !/agent_runtime.py
+!/agent_services.py
 !/agent_driver.mjs
 !/agent_persona.mjs
 !/agent_approvals.py
@@ -30,6 +31,7 @@
 !/server/plugins/agentbridge_mac/
 /server/plugins/agentbridge_mac/*
 !/server/plugins/agentbridge_mac/main.py
+!/server/plugins/agentbridge_mac/reminders.py
 !/server/plugins/agentbridge_mac/metadata.yaml
 !/IMPLEMENTATION-20261026.md
 !/ASTRBOT-INTEGRATION-20261026.md

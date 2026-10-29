@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--packages', required=True, type=Path)
     parser.add_argument('--report-dir', required=True, type=Path)
     parser.add_argument('--rounds', type=int, default=20)
+    parser.add_argument('--modules', nargs='+', help='focused isolated modules instead of discovery/repeated rounds')
     args = parser.parse_args()
     if not 1 <= args.rounds <= 20 or not args.node.is_absolute() or not args.packages.is_absolute():
         parser.error('explicit absolute native paths and 1..20 rounds required')
@@ -28,7 +29,8 @@ def main():
     os.umask(0o077)
     report.mkdir(parents=True, exist_ok=False)
     names = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd=root).decode().split('\0')
-    repeated = ['test_agent_tasks', 'test_agent_runtime', 'test_agent_reads', 'test_agent_approvals', 'test_config_invariants']
+    repeated = ['test_agent_tasks', 'test_agent_runtime', 'test_agent_reads', 'test_agent_approvals', 'test_config_invariants',
+                'test_reminders', 'test_agent_services', 'test_manual_preferences']
     results = []
     with tempfile.TemporaryDirectory(prefix='ab-background-', dir='/private/tmp') as scratch:
         scratch = Path(scratch)
@@ -52,8 +54,8 @@ def main():
                'AGENTBRIDGE_BASE': str(runtime), 'AGENTBRIDGE_AGENT_MESSAGES': '0', 'AGENTBRIDGE_AGENT_TASKS': '0',
                'AGENTBRIDGE_AGENT_LEARNING': '0', 'AGENTBRIDGE_TEST_NATIVE_NODE': str(args.node),
                'AGENTBRIDGE_TEST_NATIVE_PACKAGES': str(args.packages), 'ELECTRON_RUN_AS_NODE': '1'}
-        for index in range(args.rounds + 1):
-            modules = ['discover', '-p', 'test_*.py'] if index == 0 else repeated
+        for index in range(1 if args.modules else args.rounds + 1):
+            modules = args.modules or (['discover', '-p', 'test_*.py'] if index == 0 else repeated)
             command = [sys.executable, '-B', '-m', 'unittest', *modules]
             started = time.monotonic()
             result = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, timeout=300)

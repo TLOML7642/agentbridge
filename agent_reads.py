@@ -39,6 +39,21 @@ def identity(info):
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def snapshot(source, candidate, before):
+    if before.st_size > FILE_BYTES:
+        raise RangeError('file exceeds 1 MiB limit')
+    data = source.read(FILE_BYTES + 1)
+    if len(data) > FILE_BYTES or b'\0' in data:
+        raise RangeError('file exceeds 1 MiB limit or is not safe text')
+    after = os.fstat(source.fileno())
+    if identity(before) != identity(after):
+        raise RangeError('file changed during reading; restart at line 1')
+    data.decode('utf-8')
+    version = hashlib.sha256(json.dumps([candidate, identity(after)]).encode() + data).hexdigest()
+    lines = re.findall(rb'[^\r\n]*(?:\r\n|\r|\n|$)', data)[:-1]
+    return data, version, lines
+
+
 def read_range(source, request, candidate, before):
     start, count = request.get('start_line', 1), request.get('max_lines', 100)
     if type(start) is not int or start < 1 or type(count) is not int or not 1 <= count <= 200:
@@ -48,19 +63,9 @@ def read_range(source, request, candidate, before):
         raise RangeError('invalid file version; restart reading')
     if start > 1 and expected is None:
         raise RangeError('continuation requires expected_version from the first page; restart at line 1')
-    if before.st_size > FILE_BYTES:
-        raise RangeError('file exceeds 1 MiB limit')
-    data = source.read(FILE_BYTES + 1)
-    if len(data) > FILE_BYTES or b'\0' in data:
-        raise RangeError('file exceeds 1 MiB limit or is not safe text')
-    after = os.fstat(source.fileno())
-    if identity(before) != identity(after):
-        raise RangeError('file changed during reading; restart at line 1')
-    data.decode('utf-8')  # Validate the entire bounded snapshot, not just a fragment.
-    version = hashlib.sha256(json.dumps([candidate, identity(after)]).encode() + data).hexdigest()
+    data, version, lines = snapshot(source, candidate, before)
     if expected is not None and version != expected:
         raise RangeError('file changed between pages; discard previous fragments and restart at line 1')
-    lines = re.findall(rb'[^\r\n]*(?:\r\n|\r|\n|$)', data)[:-1]
     if start > len(lines) and not (not lines and start == 1):
         raise RangeError('start_line is beyond end of file')
 
@@ -83,6 +88,52 @@ def read_range(source, request, candidate, before):
     return result
 
 
+def search_file(source, request, candidate, before):
+    _data, version, lines = snapshot(source, candidate, before)
+    if request.get('expected_version') is not None and request['expected_version'] != version:
+        raise RangeError('file changed; discard previous evidence and restart reading')
+    result = {'matches': [], 'files': [{'file': request['value'], 'file_version': version,
+                                       'total_lines': len(lines), 'scanned_lines': 0}], 'truncated': False}
+    for number, raw in enumerate(lines, 1):
+        line = raw.decode('utf-8')
+        column = line.find(request['literal'])
+        if column >= 0:
+            start = max(0, column - 80)
+            match = dict(file=request['value'], line=number, column=column + 1,
+                         text=line[start:start + 300], excerpt_start_column=start + 1,
+                         line_truncated=start > 0 or len(line) > start + 300, file_version=version)
+            result['matches'].append(match)
+            if (len(result['matches']) > request.get('max_matches', 20)
+                    or len(json.dumps(result, ensure_ascii=False).encode()) > PAGE_BYTES - 1024):
+                result['matches'].pop()
+                result['truncated'] = True
+                break
+        result['files'][0]['scanned_lines'] = number
+    return json.dumps(result, ensure_ascii=False)
+
+
+def search_project(request):
+    result = {'matches': [], 'files': [], 'unread_files': [], 'truncated': False}
+    names = sorted(SOURCE_FILES)
+    for index, name in enumerate(names):
+        try:
+            page = json.loads(query(dict(request, value=name, expected_version=None)))
+        except (OSError, ValueError):
+            page = {'matches': [], 'files': [{'file': name, 'error': 'unavailable or unsafe text'}], 'truncated': False}
+        candidate = dict(result, matches=result['matches'] + page['matches'], files=result['files'] + page['files'])
+        if (len(candidate['matches']) > request.get('max_matches', 20)
+                or len(json.dumps(candidate, ensure_ascii=False).encode()) > PAGE_BYTES - 2048):
+            result['unread_files'] = names[index:]
+            result['truncated'] = True
+            break
+        result = candidate
+        if page['truncated']:
+            result['unread_files'] = names[index + 1:]
+            result['truncated'] = True
+            break
+    return json.dumps(result, ensure_ascii=False)
+
+
 def private_path(value, prefixes):
     # Default projects may be a home directory. Its hidden application state
     # and macOS Library must not become readable just because they are in cwd.
@@ -95,8 +146,18 @@ def private_path(value, prefixes):
 def query(request):
     root, value = request['root'], request['value']
     if (not isinstance(value, str) or not value or len(value) > 4096 or '\0' in value
-            or request['operation'] not in ('read_text', 'read_text_range', 'list_files')):
+            or request['operation'] not in ('read_text', 'read_text_range', 'list_files', 'search_text')):
         raise ValueError('invalid read')
+    if request['operation'] == 'search_text':
+        literal, count = request.get('literal'), request.get('max_matches', 20)
+        if (root != SOURCE_PROJECT or not isinstance(literal, str) or not 1 <= len(literal) <= 200 or '\0' in literal
+                or type(count) is not int or not 1 <= count <= 50
+                or value != '.' and value not in SOURCE_FILES):
+            raise RangeError('literal search requires the reviewed source project, 1..200 literal characters and 1..50 matches')
+        if value == '.':
+            if request.get('expected_version') is not None:
+                raise RangeError('project search versions are per file; select one file to check a version')
+            return search_project(request)
     # Symlinks are deliberately unsupported, including intermediate components.
     # realpath + O_NOFOLLOW on just the leaf would leave parent-swap races.
     candidate = os.path.normpath(os.path.join(root, value))
@@ -152,6 +213,10 @@ def query(request):
         descriptor = os.open(leaf, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
         with os.fdopen(descriptor, 'rb') as source:
             info = os.fstat(source.fileno())
+            if request['operation'] == 'search_text':
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError('not regular text')
+                return search_file(source, request, candidate, info)
             if request['operation'] == 'read_text_range':
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError('not regular text')
