@@ -444,7 +444,7 @@ class NativeTaskTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(mock.patch.dict(os.environ, {'AGENTBRIDGE_AGENT_NODE': node, 'AGENTBRIDGE_AGENT_PACKAGES': packages}))
 
-    def native(self):
+    def native(self, tool='create_text', arguments=None):
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='abx-', dir='/private/tmp'))).resolve()
         workspace = root / 'work'
         workspace.mkdir()
@@ -453,7 +453,8 @@ class NativeTaskTests(unittest.TestCase):
         self.stack.callback(runtime.close)
         subject = dict(sender='synthetic-owner', channel='synthetic-private', conversation='original',
                        session=uuid.uuid4().hex, project='p', cwd=str(workspace), attempt=uuid.uuid4().hex)
-        task = runtime.submit(subject, 'native-call', 'create_text', {'path': 'result.txt', 'text': 'synthetic-native-result'})
+        task = runtime.submit(subject, 'native-call', tool, arguments if arguments is not None else
+                              {'path': 'result.txt', 'text': 'synthetic-native-result'})
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             values = runtime.approvals.inspect(subject['sender'], subject['channel'], 'original', 'p')['approvals']
@@ -478,6 +479,28 @@ class NativeTaskTests(unittest.TestCase):
         self.terminal(runtime, subject, task, 'cancelled')
         self.assertFalse((workspace / 'result.txt').exists())
         self.assertEqual(runtime.approvals.inspect(subject['sender'], subject['channel'], 'original', 'p', approval['approval_id'])['state'], 'revoked')
+
+    def test_echo_expiry_and_pending_cancel_have_one_terminal_without_body_entry(self):
+        for expired in (True, False):
+            with self.subTest(expired=expired):
+                runtime, workspace, _executor, subject, task, approval = self.native(
+                    'run_command', {'program': '/bin/echo', 'argv': '["synthetic-M1-marker"]'})
+                if expired:
+                    runtime.approvals.clock = lambda: approval['expires'] + 1
+                    value = self.terminal(runtime, subject, task, 'denied')
+                    self.assertEqual(value['result']['reason'], 'approval_expired')
+                    self.assertEqual(value['result']['evidence'], 'tool_body_not_entered')
+                else:
+                    receipt = runtime.cancel(subject['sender'], subject['channel'], 'original', 'p',
+                                             task['task_id'], 'synthetic-M1-cancel')
+                    self.assertIn(receipt['state'], ('running', 'cancelled'))
+                    value = self.terminal(runtime, subject, task, 'cancelled')
+                terminal = [event for event in runtime.events(subject['sender'], subject['channel'],
+                            'original', 'p')['events'] if event['kind'] == 'terminal']
+                self.assertEqual(len(terminal), 1)
+                self.assertEqual(terminal[0]['body']['state'], value['state'])
+                self.assertNotIn('synthetic-M1-marker', json.dumps(value.get('result')))
+                self.assertEqual(list(workspace.iterdir()), [])
 
     def test_chat_and_cancel_after_native_body_entry_preserve_existing_side_effect(self):
         fixture = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='ab-body-', dir='/private/tmp'))).resolve()
