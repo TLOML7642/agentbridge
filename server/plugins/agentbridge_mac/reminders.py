@@ -260,6 +260,5 @@ class Reminders:
 
     @staticmethod
     def notification(row):
-        due = datetime.fromtimestamp(row['due'], ZoneInfo(row['timezone'])).isoformat()
-        late = f"（延误 {row['late_seconds']} 秒）" if row['late_seconds'] > 0 else ''
-        return f"提醒 {row['id']} {late}\n计划时间：{due} [{row['timezone']}]\n{row['content']}"
+        late = f"\n（这条消息晚到了 {row['late_seconds']} 秒。）" if row['late_seconds'] > 0 else ''
+        return row['content'] + late

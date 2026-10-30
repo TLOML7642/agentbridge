@@ -204,7 +204,7 @@ class ReminderTests(unittest.TestCase):
         self.store.start_sender()
         claim = self.store.claim_due()
         self.assertEqual(claim['id'], fresh['id'])
-        self.assertIn('延误 86400 秒', self.store.notification(claim))
+        self.assertEqual(self.store.notification(claim), 'synthetic reminder\n（这条消息晚到了 86400 秒。）')
         self.assertEqual(self.get(old)['reminder']['state'], 'expired')
 
     def test_short_restart_delay_is_still_disclosed(self):
@@ -215,7 +215,25 @@ class ReminderTests(unittest.TestCase):
         self.store = Reminders(self.root, lambda: self.now)
         self.addCleanup(self.store.close)
         self.store.start_sender()
-        self.assertIn('延误 1 秒', self.store.notification(self.store.claim_due()))
+        self.assertEqual(self.store.notification(self.store.claim_due()), 'synthetic reminder\n（这条消息晚到了 1 秒。）')
+
+    def test_on_time_notification_is_exact_content_without_management_template(self):
+        for content in ('做一次验收', '喝水\n顺便活动一下', '复核原文：提醒 af123 [UTC]'):
+            with self.subTest(content=content):
+                self.assertEqual(self.store.notification({'content': content, 'late_seconds': 0}), content)
+
+    def test_notification_does_not_mutate_record_or_hide_query_details(self):
+        row = self.setting(content='做一次验收')['reminder']
+        self.store.start_sender()
+        self.now += 60
+        claim = self.store.claim_due()
+        snapshot = dict(claim)
+        self.assertEqual(self.store.notification(claim), '做一次验收')
+        self.assertEqual(claim, snapshot)
+        details = self.get(row)['reminder']
+        self.assertEqual(details['id'], row['id'])
+        self.assertEqual(details['absolute_time'], row['absolute_time'])
+        self.assertEqual(details['timezone'], 'UTC')
 
     def test_sender_lease_is_exclusive_and_no_lease_cannot_claim(self):
         with self.assertRaises(RuntimeError):
@@ -323,6 +341,7 @@ class ReminderPluginTests(unittest.TestCase):
         self.main._control = mock.AsyncMock(side_effect=AssertionError('Mac must not be called'))
         self.tick(); self.tick()
         self.main._send_notification.assert_awaited_once()
+        self.main._send_notification.assert_awaited_once_with(self.event.unified_msg_origin, 'synthetic')
         self.assertEqual(self.store.request('owner', self.event.unified_msg_origin, 'get', 'reminder_get',
                                            {'reminder_id': row['id']})['reminder']['state'], 'api_returned')
         self.main._control.assert_not_awaited()
