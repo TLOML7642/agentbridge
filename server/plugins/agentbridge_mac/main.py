@@ -251,7 +251,7 @@ class Main(star.Star):
                 for request in data.get('requests', []):
                     if (not isinstance(request, dict) or set(request) != {'id', 'tool', 'arguments', 'expires'}
                             or not isinstance(request['expires'], (int, float))
-                            or request['tool'] not in ('reminder_draft', 'reminder_list', 'reminder_get', 'reminder_cancel')):
+                            or request['tool'] not in ('reminder_set', 'reminder_draft', 'reminder_list', 'reminder_get', 'reminder_cancel')):
                         continue
                     if request['expires'] <= time.time():
                         result = {'ok': False, 'error': '服务请求过期，不自动执行或重建。'}
@@ -586,8 +586,8 @@ class Main(star.Star):
                          + (' [内容预览截断，完整内容请查详情]' if row.get('content_truncated') else '') for row in rows)
         return (result.get('message', '') + '\n' + (text or '当前来源没有提醒。')
                 + ('\n列表已截断，可用 /agent reminders <完整ID> 查详情。' if result.get('truncated') else '')
-                + ('\n以上是原操作时的状态收据，重复投递不重新执行；当前状态可重新查询。' if result.get('evidence') else '')
-                + '\n发送 API 返回不等于手机收到。').strip()
+                + ('\n原操作收据，当前状态可重新查询。' if result.get('evidence') else '')
+                + ('\n发送 API 返回不等于手机收到。' if any(row['state'] in ('sending', 'unknown', 'api_returned') for row in rows) else '')).strip()
     @staticmethod
     def _excerpt(text):
         text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----", "[密钥已隐藏]", str(text))

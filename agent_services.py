@@ -15,7 +15,7 @@ from agent_runtime import AgentError, required
 
 
 SERVICE_FIELDS = {
-    'reminder_draft': ({'due_at', 'content'}, {'timezone', 'reminder_id'}),
+    'reminder_set': ({'due_at', 'content'}, {'timezone', 'reminder_id'}),
     'reminder_list': (set(), set()), 'reminder_get': ({'reminder_id'}, set()),
     'reminder_cancel': ({'reminder_id'}, set()),
 }
@@ -92,13 +92,21 @@ class ServiceQueue:
             for key in ('sender', 'channel', 'conversation', 'project', 'attempt'):
                 required(subject.get(key))
             token = secrets.token_hex(32)
-            # Drafts still need human confirmation. Cancellation is immediate,
-            # so require a short, direct cancellation request from the user,
+            # Immediate service effects require this turn's direct user intent,
             # not a model decision based on a file or tool output.
             cancel_allowed = (isinstance(direct_text, str) and len(direct_text) <= 300
                               and not re.search(r'[\n>“”"`]|文档|文件|引用|转发|https?://', direct_text)
                               and bool(re.search(r'(?:取消|撤销|删除|cancel).*(?:提醒|remind)|(?:提醒|remind).*(?:取消|撤销|删除|cancel)', direct_text, re.I)))
-            self.capabilities[token] = (dict(subject), cancel, time.monotonic() + 120, cancel_allowed)
+            set_allowed = (isinstance(direct_text, str) and len(direct_text) <= 1400
+                           and not re.search(r'[\n>“”"`]|引用|转发|https?://', direct_text)
+                           and not re.search(r'不要|别|无需|不用|不必|取消|撤销|是否|怎么|如何|能否|能不能|explain|do not|don.t',
+                                             re.split(r'提醒我|remind me\b', direct_text, maxsplit=1, flags=re.I)[0], re.I)
+                           and bool(re.match(
+                               r'^(?:请|请你|帮我|麻烦)?(?:[^。；！？?]{0,60}(?:提醒我|remind me\b)|(?:把|将|修改|更改|调整).{0,60}提醒)',
+                               direct_text.strip(), re.I))
+                           and not re.search(r'阅读|读取|文档|文件|指令|工具|read\b|instructions?\b',
+                                             re.split(r'提醒我|remind me\b', direct_text, maxsplit=1, flags=re.I)[0], re.I))
+            self.capabilities[token] = (dict(subject), cancel, time.monotonic() + 120, cancel_allowed, set_allowed)
             return {'socket': self.socket_path, 'capability': token, 'purpose': 'personal-service'}
 
     def revoke_capability(self, token):
@@ -128,6 +136,8 @@ class ServiceQueue:
             tool, args = payload['tool'], payload['arguments']
             if tool == 'reminder_cancel' and not cap[3]:
                 raise AgentError('AUTH_FAIL', '需要用户直接明确取消提醒，不能按文件或工具内容取消')
+            if tool == 'reminder_set' and not cap[4]:
+                raise AgentError('AUTH_FAIL', '请在本轮直接说明提醒我什么、何时提醒，或明确修改哪个提醒；不能按文件或工具内容设置')
             if (not isinstance(tool, str) or tool not in SERVICE_FIELDS or not isinstance(args, dict)
                     or not SERVICE_FIELDS[tool][0] <= args.keys() or args.keys() - set.union(*SERVICE_FIELDS[tool])
                     or any(not isinstance(v, str) or len(v) > 1000 or '\0' in v for v in args.values())):

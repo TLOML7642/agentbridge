@@ -35,6 +35,78 @@ class ReminderTests(unittest.TestCase):
     def get(self, row, **kwargs):
         return self.call('get', {'reminder_id': row['id']}, **kwargs)
 
+    def setting(self, delta=60, **args):
+        return self.call('set', dict(due_at=datetime.fromtimestamp(self.now + delta, timezone.utc).isoformat(),
+                                     timezone='UTC', content='synthetic reminder') | args)
+
+    def test_immediate_creation_and_restart_dispatch_without_confirmation(self):
+        row = self.setting()['reminder']
+        self.assertEqual(row['state'], 'active')
+        self.assertIsNone(row['expires'])
+        self.store.close()
+        self.store = Reminders(self.root, lambda: self.now)
+        self.addCleanup(self.store.close)
+        self.store.start_sender()
+        self.now += 60
+        self.assertEqual(self.store.claim_due()['id'], row['id'])
+        self.assertIsNone(self.store.claim_due())
+
+    def test_immediate_modify_preserves_id_and_invalidates_old_draft(self):
+        row = self.setting()['reminder']
+        old = self.draft(120, reminder_id=row['id'])
+        changed = self.setting(180, reminder_id=row['id'], content='changed')['reminder']
+        self.assertEqual(changed['id'], row['id'])
+        self.assertEqual(changed['due'], self.now + 180)
+        self.assertEqual(changed['content'], 'changed')
+        self.assertFalse(self.confirm(old)['ok'])
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM reminders').fetchone()[0], 2)
+
+    def test_immediate_quota_validation_and_modify_at_capacity(self):
+        rows = [self.setting()['reminder'] for _ in range(20)]
+        self.assertFalse(self.setting()['ok'])
+        self.assertTrue(self.setting(120, reminder_id=rows[0]['id'])['ok'])
+        for args in ({'content': ''}, {'content': 'x' * 1001}, {'due_at': 'tomorrow'},
+                     {'due_at': '2020-01-01T10:00'}, {'sender': 'other'}, {'channel': 'other'},
+                     {'reminder_id': ''}):
+            self.assertFalse(self.setting(**args)['ok'])
+
+    def test_immediate_replay_after_cancel_is_receipt_not_reactivation(self):
+        args = {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}
+        one = self.call('set', args, request='stable-set')
+        row = one['reminder']
+        self.call('cancel', {'reminder_id': row['id']})
+        self.assertEqual(self.call('set', args, request='stable-set'), one)
+        self.assertEqual(self.get(row)['reminder']['state'], 'cancelled')
+        self.store.start_sender()
+        self.now = row['due']
+        self.assertIsNone(self.store.claim_due())
+
+    def test_immediate_modify_is_source_scoped_and_cannot_change_sending(self):
+        row = self.setting()['reminder']
+        args = {'due_at': '2028-01-01T10:00', 'content': 'changed', 'reminder_id': row['id']}
+        self.assertFalse(self.call('set', args, sender='other')['ok'])
+        self.assertFalse(self.call('set', args, channel='other')['ok'])
+        self.store.start_sender()
+        self.now += 60
+        self.store.claim_due()
+        self.assertFalse(self.call('set', args)['ok'])
+        self.store.finish(row['id'], 'unknown')
+        self.assertFalse(self.call('set', args)['ok'])
+
+    def test_immediate_concurrent_replay_and_modify_cancel_race(self):
+        args = {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            results = list(pool.map(lambda _: self.call('set', args, request='one'), range(16)))
+        self.assertTrue(all(result == results[0] for result in results))
+        row = results[0]['reminder']
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(self.setting, 120, reminder_id=row['id']),
+                       pool.submit(self.call, 'cancel', {'reminder_id': row['id']})]
+            for future in futures:
+                future.result()
+        self.assertEqual(self.get(row)['reminder']['state'], 'cancelled')
+
     def test_draft_is_not_active_and_explicit_confirmation_is_required(self):
         row = self.draft()
         self.store.start_sender()
@@ -234,10 +306,9 @@ class ReminderPluginTests(unittest.TestCase):
         self.stack.callback(self.store.close)
 
     def active(self):
-        row = self.store.request('owner', self.event.unified_msg_origin, uuid.uuid4().hex, 'reminder_draft',
+        row = self.store.request('owner', self.event.unified_msg_origin, uuid.uuid4().hex, 'reminder_set',
                                  {'due_at': datetime.fromtimestamp(self.now + 60, timezone.utc).isoformat(),
                                   'timezone': 'UTC', 'content': 'synthetic'})['reminder']
-        self.store.request('owner', self.event.unified_msg_origin, uuid.uuid4().hex, 'reminder_confirm', {'reminder_id': row['id']})
         self.now = row['due']
         return row
 
@@ -255,6 +326,16 @@ class ReminderPluginTests(unittest.TestCase):
         self.assertEqual(self.store.request('owner', self.event.unified_msg_origin, 'get', 'reminder_get',
                                            {'reminder_id': row['id']})['reminder']['state'], 'api_returned')
         self.main._control.assert_not_awaited()
+
+    def test_receipt_is_short_without_unrelated_delivery_warning(self):
+        row = self.active()
+        result = {'ok': True, 'reminder': row, 'message': '提醒已设置。'}
+        text = self.main._reminder_reply(result)
+        self.assertNotIn('API', text)
+        self.assertNotIn('confirm', text)
+        self.assertIn(row['absolute_time'], text)
+        row['state'] = 'unknown'
+        self.assertIn('不等于手机收到', self.main._reminder_reply(result))
 
     def test_api_timeout_or_false_is_unknown_not_retried(self):
         for failure in (TimeoutError('synthetic'), False):

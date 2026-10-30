@@ -146,6 +146,7 @@ class Reminders:
 
     def _execute(self, db, sender, channel, tool, args, now):
         fields = {'reminder_draft': ({'due_at', 'content'}, {'timezone', 'reminder_id'}),
+                  'reminder_set': ({'due_at', 'content'}, {'timezone', 'reminder_id'}),
                   'reminder_list': (set(), set()), 'reminder_get': ({'reminder_id'}, set()),
                   'reminder_cancel': ({'reminder_id'}, set()),
                   'reminder_confirm': ({'reminder_id'}, set())}
@@ -165,7 +166,7 @@ class Reminders:
                     break
                 items = candidate
             return {'reminders': items, 'truncated': len(rows) > len(items)}
-        if tool == 'reminder_draft':
+        if tool in ('reminder_set', 'reminder_draft'):
             content, zone = args['content'], args.get('timezone', 'Asia/Shanghai')
             if (not isinstance(content, str) or not content.strip() or len(content) > 1000 or '\0' in content
                     or not isinstance(zone, str) or len(zone) > 100):
@@ -180,6 +181,22 @@ class Reminders:
                 version = original['version']
             elif 'reminder_id' in args:
                 raise ReminderError('修改须提供完整提醒 ID。')
+            if tool == 'reminder_set':
+                if target:
+                    db.execute('UPDATE reminders SET content=?,due=?,timezone=?,version=version+1 WHERE id=?',
+                               (content, due, zone, target))
+                    identifier = target
+                else:
+                    count = db.execute("SELECT count(*) FROM reminders WHERE sender=? AND channel=? AND state IN ('active','sending','unknown')",
+                                       (sender, channel)).fetchone()[0]
+                    if count >= 20:
+                        raise ReminderError('当前来源最多二十个有效或发送结果未知的提醒。')
+                    identifier = uuid.uuid4().hex
+                    db.execute('INSERT INTO reminders(id,sender,channel,state,content,due,timezone,created,version) '
+                               "VALUES (?,?,?,'active',?,?,?,?,1)",
+                               (identifier, sender, channel, content, due, zone, now))
+                return {'reminder': self.view(self._row(db, sender, channel, identifier)),
+                        'message': '提醒已修改。' if target else '提醒已设置。'}
             count = db.execute("SELECT count(*) FROM reminders WHERE sender=? AND channel=? AND state='draft'",
                                (sender, channel)).fetchone()[0]
             if count >= 5:

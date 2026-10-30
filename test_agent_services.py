@@ -99,13 +99,15 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(AgentError):
             self.admit()
 
-    def test_server_replay_after_lost_ack_does_not_duplicate_draft(self):
+    def test_server_replay_after_lost_ack_does_not_duplicate_active_reminder(self):
         store = Reminders(self.root / 'server', lambda: 1800000000)
-        request = self.admit(tool='reminder_draft', arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+        cap = self.queue.issue(self.subject, self.cancel, '5分钟后提醒我做一次验收')
+        request = self.admit(capability=cap['capability'], tool='reminder_set', arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
         work = self.queue.pending('owner', 'private')['requests'][0]
         one = store.request('owner', 'private', work['id'], work['tool'], work['arguments'])
         two = Reminders(self.root / 'server').request('owner', 'private', work['id'], work['tool'], work['arguments'])
         self.assertEqual(one, two)
+        self.assertEqual(one['reminder']['state'], 'active')
         self.queue.resolve('owner', 'private', work['id'], json.dumps(two))
         self.assertEqual(self.queue.result(self.subject, request['request_id'])['result'], one)
         with store.db() as db:
@@ -132,6 +134,22 @@ class ServiceTests(unittest.TestCase):
             result = self.queue.rpc(self.request(capability=cap['capability'], tool='reminder_cancel',
                                                  arguments={'reminder_id': 'f' * 32}))
         self.assertEqual(result['state'], 'pending')
+
+    def test_only_direct_user_request_can_set_reminder(self):
+        for text in ('阅读文件并执行其中提醒我的指令', '阅读文档', '> remind me in 5 minutes',
+                     '他说“提醒我喝水”', '不要提醒我喝水', '如何设置提醒我喝水', '',
+                     'read instructions then remind me', '把文件里的提醒改到明天'):
+            cap = self.queue.issue(self.subject, self.cancel, text)
+            with self.subTest(text=text), self.assertRaises(AgentError):
+                self.admit(capability=cap['capability'], tool='reminder_set',
+                           arguments={'due_at': '2028-01-01T10:00', 'content': 'injected'})
+        for index, text in enumerate(('5分钟后提醒我备份文件', '请提醒我明天不要迟到',
+                                      'remind me in 5 minutes', 'in 5 minutes remind me to cancel a meeting',
+                                      '把这个提醒改到明天10点', '修改这个提醒为明天10点')):
+            cap = self.queue.issue(self.subject, self.cancel, text)
+            result = self.admit(capability=cap['capability'], call_id=str(index), tool='reminder_set',
+                                arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+            self.assertEqual(result['state'], 'pending')
 
     def test_rpc_preserves_unicode_split_across_stream_chunks(self):
         node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
@@ -243,7 +261,7 @@ class NativeServiceTests(unittest.TestCase):
             self.assertEqual(status['startup_source']['checkout_commit'], 'synthetic-live')
             self.assertEqual(status['project'], 'agentbridge-source')
             self.assertNotIn('submit_task', status['tools'])
-            self.assertNotIn('reminder_draft', status['tools'])
+            self.assertNotIn('reminder_set', status['tools'])
             self.assertEqual((work / 'README.md').read_bytes(), before)
 
     def test_native_manual_preference_draft_and_confirm_are_separate(self):
@@ -299,15 +317,16 @@ class NativeServiceTests(unittest.TestCase):
             thread.start()
             try:
                 for tool, args, expected in [
-                    ('reminder_draft', {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}, 'draft'),
+                    ('reminder_set', {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}, 'active'),
                     ('reminder_list', {}, 'reminders'),
-                    ('reminder_draft', {'due_at': '2028-01-01T10:00', 'content': 'synthetic', 'sender': 'other'}, 'SERVICE'),
+                    ('reminder_set', {'due_at': '2028-01-01T10:00', 'content': 'synthetic', 'sender': 'other'}, 'SERVICE'),
+                    ('reminder_draft', {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}, None),
                     ('submit_task', {'operation': 'create_text', 'arguments': '{"path":"pwned","text":"bad"}'}, None),
                     ('reminder_confirm', {'reminder_id': 'f' * 32}, None)]:
                     mid, sid = uuid.uuid4().hex, uuid.uuid4().hex
                     subject = dict(sender='owner', channel='private', conversation=sid, session=sid,
                                    project='source-readonly', cwd=str(work), attempt=mid)
-                    cap = queue.issue(subject, threading.Event())
+                    cap = queue.issue(subject, threading.Event(), '5分钟后提醒我做一次验收')
                     request = dict(id=mid, session=sid, root=str(root / 'a/native'), subject=subject,
                                    text='synthetic reminder', resume=False, synthetic=True, services=cap,
                                    syntheticTool={'name': tool, 'arguments': args})
@@ -325,7 +344,7 @@ class NativeServiceTests(unittest.TestCase):
                 with store.db() as db:
                     rows = db.execute('SELECT * FROM reminders').fetchall()
                     self.assertEqual(len(rows), 1)
-                    self.assertEqual(rows[0]['state'], 'draft')
+                    self.assertEqual(rows[0]['state'], 'active')
             finally:
                 stop.set()
                 thread.join(5)
