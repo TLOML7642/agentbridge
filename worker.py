@@ -802,6 +802,17 @@ def _process_identity(pid: int, pgid: int) -> str | None:
 
 def _group_members(pgid: int) -> dict:
     try:
+        if sys.platform.startswith("linux"):
+            # Minimal Linux images need no ps binary. Each /proc birth identity
+            # still validates the kernel process group; races fail closed.
+            members = {}
+            for name in os.listdir("/proc"):
+                if name.isascii() and name.isdecimal():
+                    pid = int(name)
+                    identity = _process_identity(pid, pgid)
+                    if identity:
+                        members[pid] = identity
+            return members
         output = subprocess.check_output(["ps", "-axo", "pid=,pgid="], text=True, timeout=2)
         members = {}
         for line in output.splitlines():

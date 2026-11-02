@@ -21,6 +21,12 @@
 !/tools/probe_native_dsh.mjs
 !/server/
 /server/*
+!/server/assistant/
+/server/assistant/*
+!/server/assistant/package.json
+!/server/assistant/package-lock.json
+!/server/assistant/README.md
+!/server/assistant/runtime-artifacts.json
 !/server/plugins/
 !/server/docker_control/
 /server/docker_control/*
