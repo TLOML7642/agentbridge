@@ -558,12 +558,15 @@ class AgentRuntime:
 
 
 class NativeExecutor:
-    def __init__(self, root, run_task, redact, tasks=None, services=None):
+    def __init__(self, root, run_task, redact, tasks=None, services=None, file_reads=True):
+        if type(file_reads) is not bool:
+            raise ValueError('file_reads must be an explicit boolean')
         self.root, self.run_task, self.redact = Path(root), run_task, redact
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         self.tasks = tasks
         self.services = services
+        self.file_reads = file_reads
 
     def recover(self, turn):
         if not re.fullmatch(r'[a-f0-9]{32}', turn['id']):
@@ -589,6 +592,8 @@ class NativeExecutor:
         payload['root'] = str(self.root / 'native')
         payload['python'] = sys.executable
         payload['runtime_info'] = turn.get('runtime_info', {'evidence': 'runtime release not supplied'})
+        if not self.file_reads:
+            payload['read_mode'] = 'none'
         if self.services is not None:
             payload['services'] = self.services.issue(turn['subject'], cancel, turn['text'])
         if self.tasks is not None:

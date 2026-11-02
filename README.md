@@ -50,6 +50,7 @@
 服务器主脑迁移的 P0 Linux 真实 API 续接和资源门槛已通过，见
 [服务器运行时验证](server/assistant/README.md)。这不是已部署架构：独立 assistant、
 工具解耦、数据迁移和实际切换仍须各自过门槛，当前生产链路不变。
+P1第一版独立对话宿主和固定shim路由已形成默认关闭的隔离候选；尚无Mac工具、项目镜像或历史迁移，不能据此启用生产新路由。
 
 ```text
 微信私聊 -> AstrBot 适配 -> 认证 shim -> 既有 SSH 隧道 -> Mac worker

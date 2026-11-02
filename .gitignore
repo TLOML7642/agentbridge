@@ -1,6 +1,7 @@
 /*
 !/.gitignore
 !/worker.py
+!/assistant.py
 !/shim.py
 !/native_boundary.mjs
 !/agent_runtime.py

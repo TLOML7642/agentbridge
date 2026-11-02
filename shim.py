@@ -59,6 +59,8 @@ BODY_MAX = int(os.environ.get("SHIM_BODY_MAX", str(64 * 1024)))
 HTTP_TIMEOUT = int(os.environ.get("SHIM_HTTP_TIMEOUT", "60"))
 AGENT_ENABLED = os.environ.get('AGENTBRIDGE_AGENT_MESSAGES', '0') == '1'
 AGENT_CHANNELS = {s.strip() for s in os.environ.get('AGENTBRIDGE_AGENT_CHANNELS', '').split(',') if s.strip()}
+ASSISTANT = os.environ.get('AGENTBRIDGE_ASSISTANT', '')
+ASSISTANT_SECRET_FILE = os.environ.get('AGENTBRIDGE_ASSISTANT_SECRET_FILE', '')
 
 MODEL_ID = "agentbridge"
 
@@ -112,6 +114,43 @@ def _worker_base() -> str:
     return WORKER.rstrip("/")
 
 
+def _agent_target():
+    """Host-configured loopback target only. Invalid config never falls back."""
+    if not ASSISTANT:
+        return _worker_base(), WORKER_SECRET
+    try:
+        target = urllib.parse.urlparse(ASSISTANT)
+        if (target.scheme != 'http' or target.hostname != '127.0.0.1' or target.port is None
+                or target.username or target.password or target.path not in ('', '/')
+                or target.query or target.fragment):
+            raise ValueError
+        from tools.check_server_runtime import private_credential
+        secret = private_credential(ASSISTANT_SECRET_FILE).decode().strip()
+        if not secret or len(secret) > 512:
+            raise ValueError
+        return ASSISTANT.rstrip('/'), secret
+    except (OSError, ValueError, TypeError):
+        raise ApiError(503, '服务器助手配置无效；不会退回Mac聊天', 'ASSISTANT_CONFIG') from None
+
+
+def _accept_agent(payload, sender, channel):
+    base, secret = _agent_target()
+    request = urllib.request.Request(base + '/agent/messages',
+        data=json.dumps({**payload, 'sender': sender, 'channel': channel}, ensure_ascii=False).encode(),
+        headers={'X-AgentBridge-Secret': secret, 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=ACCEPT_TIMEOUT) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            result = json.load(error)
+            if isinstance(result, dict) and result.get('ok') is False:
+                return result
+            raise ValueError('unrecognized admission error')
+        finally:
+            error.close()
+
+
 CONTROL_FIELDS = {
     "status": {"job_id"}, "confirm": {"token", "delivery_id"},
     "status.batch": {"job_ids"}, "diag": set(), "jobs": set(), "pending": set(),
@@ -158,9 +197,11 @@ def control_worker(payload: dict, meta: dict) -> dict:
         if not isinstance(ids, list) or not 1 <= len(ids) <= 50 or any(not isinstance(i, str) or not i for i in ids):
             raise ApiError(400, "批量查询须提供 1 至 50 个任务 ID", "invalid_control")
     body = {**payload, "sender": meta["sender"], "channel": meta["channel"]}
+    independent = op.startswith('agent.') and bool(ASSISTANT)
+    base, secret = _agent_target() if op.startswith('agent.') else (_worker_base(), WORKER_SECRET)
     req = urllib.request.Request(
-        _worker_base() + "/control", data=json.dumps(body, ensure_ascii=False).encode(),
-        headers={"Content-Type": "application/json", "X-AgentBridge-Secret": WORKER_SECRET})
+        base + "/control", data=json.dumps(body, ensure_ascii=False).encode(),
+        headers={"Content-Type": "application/json", "X-AgentBridge-Secret": secret})
     query = op in QUERY_OPS
     deadline = time.monotonic() + 10
     for attempt in range(3 if query else 1):
@@ -170,8 +211,9 @@ def control_worker(payload: dict, meta: dict) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=min(ACCEPT_TIMEOUT, remaining, 3) if query else ACCEPT_TIMEOUT) as resp:
                 result = json.loads(resp.read())
-            with _HEALTH_LOCK:
-                _LAST_WORKER_HEALTH = time.time()
+            if not independent:
+                with _HEALTH_LOCK:
+                    _LAST_WORKER_HEALTH = time.time()
             if op == "diag":
                 result["last_worker_healthy_at"] = _LAST_WORKER_HEALTH
             return result
@@ -187,7 +229,8 @@ def control_worker(payload: dict, meta: dict) -> dict:
     if query:
         return {"ok": False, "code": "QUERY_UNAVAILABLE",
                 "last_worker_healthy_at": _LAST_WORKER_HEALTH,
-                "message": "隧道或 worker 不可达，查询未创建任务。请稍后查询原 ID。"}
+                "message": ("服务器助手不可达，不会改用Mac或其他模型；请稍后查询原ID。" if independent else
+                            "隧道或 worker 不可达，查询未创建任务。请稍后查询原 ID。")}
     return {"ok": False, "code": "ACCEPT_UNKNOWN", "job_id": payload.get("job_id") or payload.get("delivery_id"),
             "message": "修改结果未知；不会自动重试，请先查询原任务，不要新建授权。"}
 
@@ -472,17 +515,17 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._read_body()
                 if set(payload) != {'delivery_id', 'text'}:
                     raise ApiError(400, '消息字段必须是 delivery_id 与 text', 'INVALID_MESSAGE')
-                req = urllib.request.Request(_worker_base() + '/agent/messages',
-                    data=json.dumps({**payload, 'sender': sender, 'channel': channel}, ensure_ascii=False).encode(),
-                    headers={'X-AgentBridge-Secret': WORKER_SECRET, 'Content-Type': 'application/json'})
-                with urllib.request.urlopen(req, timeout=ACCEPT_TIMEOUT) as response:
-                    result = json.load(response)
+                result = _accept_agent(payload, sender, channel)
                 code = result.get('code')
                 status = 403 if code == 'AUTH_FAIL' else 409 if code in ('DELIVERY_CONFLICT', 'SESSION_UNCERTAIN') else 404 if code == 'AGENT_DISABLED' else 400 if code == 'INVALID_MESSAGE' else 429 if code == 'BUSY' else 503 if result.get('ok') is not True else 202
                 return self._json(status, result)
             except ApiError as exc:
                 self.close_connection = True
                 return self._oai_error(exc.status, exc.message, exc.code)
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, ConnectionRefusedError):
+                    return self._oai_error(503, '连接未建立，消息未受理；不会改用其他模型', 'NOT_ACCEPTED')
+                return self._oai_error(503, '消息受理结果未知，请按原投递ID查询，勿新建', 'ACCEPT_UNKNOWN')
             except Exception:
                 return self._oai_error(503, '消息受理结果未知，请以原投递 ID 查询或重试，勿新建', 'ACCEPT_UNKNOWN')
         if route == "/v1/responses":
