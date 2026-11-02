@@ -485,6 +485,11 @@ class Main(star.Star):
                                                        'reminder_' + parts[2], {'reminder_id': parts[3]})
                     await self._agent_local(event, self._reminder_reply(result))
                     return
+                elif parts == ['/agent', 'projects']:
+                    status, data = await self._control(event, {'op': 'agent.projects'})
+                elif parts[:2] == ['/agent', 'use'] and len(parts) == 3:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.use', 'project': parts[2], 'delivery_id': delivery})
                 elif parts == ['/agent', 'new']:
                     delivery, _ = self._agent_delivery(event, text, 'agent-control')
                     status, data = await self._control(event, {'op': 'agent.new', 'delivery_id': delivery})
@@ -531,7 +536,12 @@ class Main(star.Star):
                                             + ('后台：/agent tasks [ID]；/agent task-cancel <ID>；/agent approvals [ID]；/agent approve <ID>；/agent deny <ID>。'
                                                if AGENT_TASKS else '当前后台动作未启用。'))
                     return
-                if data.get('tasks') is not None:
+                if data.get('projects') is not None:
+                    reply = '当前项目：' + data['current'] + '\n' + '\n'.join(
+                        item['name'] + ' 工具目标：' + item['tool_target'] for item in data['projects'])
+                elif data.get('current'):
+                    reply = '当前项目：' + data['current']
+                elif data.get('tasks') is not None:
                     reply = '\n'.join(f"{item['task_id']} {item['state']} @{item['project']}" for item in data['tasks']) or '当前会话没有后台任务。'
                 elif data.get('approvals') is not None:
                     reply = '\n'.join(f"{item['approval_id']} {item['state']} {item['tool']}" for item in data['approvals']) or '当前会话没有工具审批。'

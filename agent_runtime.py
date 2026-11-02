@@ -146,7 +146,7 @@ class AgentRuntime:
     their native session instead of automatically replaying a possibly used input.
     """
     def __init__(self, root, runner, project, evidence=lambda *_: [], recover=lambda *_: None, allow_learning=False, tasks=None,
-                 services=None, runtime_info=None):
+                 services=None, runtime_info=None, logical_projects=False):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -164,6 +164,7 @@ class AgentRuntime:
         self.runner, self.project, self.evidence = runner, project, evidence
         self.tasks = tasks
         self.services, self.runtime_info = services, runtime_info
+        self.logical_projects = logical_projects
         self.preferences = Preferences(allow_learning)
         self.lock = threading.RLock()
         self.wake = threading.Event()
@@ -197,7 +198,16 @@ class AgentRuntime:
                 CREATE TABLE IF NOT EXISTS preference_drafts(
                   id TEXT PRIMARY KEY,owner TEXT,channel TEXT,category TEXT,value TEXT,memory_id TEXT,
                   basis TEXT,expires REAL,state TEXT);
+                CREATE TABLE IF NOT EXISTS logical_heads(
+                  sender TEXT,channel TEXT,project TEXT,session TEXT,
+                  PRIMARY KEY(sender,channel,project));
+                CREATE TABLE IF NOT EXISTS message_evidence(
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,message TEXT,state TEXT,code TEXT,created REAL);
             ''')
+            if self.logical_projects:
+                if db.execute('SELECT 1 FROM heads GROUP BY sender,channel,project HAVING count(DISTINCT session)>1 LIMIT 1').fetchone():
+                    raise AgentError('MIGRATION_AMBIGUOUS', '旧项目会话头不唯一，停止迁移')
+                db.execute('INSERT OR IGNORE INTO logical_heads SELECT sender,channel,project,session FROM heads')
             for row in db.execute("SELECT * FROM messages WHERE state='running'").fetchall():
                 restored = recover(dict(row))
                 if restored is not None:
@@ -206,6 +216,9 @@ class AgentRuntime:
                 else:
                     db.execute("UPDATE messages SET state='uncertain',ended=? WHERE id=?", (time.time(), row['id']))
                     db.execute('UPDATE sessions SET blocked=1 WHERE id=?', (row['session'],))
+                db.execute('INSERT INTO message_evidence(message,state,code,created) VALUES (?,?,?,?)',
+                           (row['id'], 'done' if restored is not None else 'uncertain',
+                            'RECEIPT_RECOVERED' if restored is not None else 'RESTART_UNKNOWN', time.time()))
             db.execute("UPDATE messages SET state='uncertain',ended=? WHERE state='queued' "
                        "AND session IN (SELECT id FROM sessions WHERE blocked=1)", (time.time(),))
         self.thread = threading.Thread(target=self._loop, name='agent-chat-lane', daemon=True)
@@ -227,8 +240,22 @@ class AgentRuntime:
                 db.close()
 
     def _session(self, db, sender, channel, project, cwd, new=False):
-        row = db.execute('SELECT session FROM heads WHERE sender=? AND channel=? AND project=? AND cwd=?',
-                         (sender, channel, project, cwd)).fetchone()
+        if self.logical_projects:
+            row = db.execute('SELECT session FROM logical_heads WHERE sender=? AND channel=? AND project=?',
+                             (sender, channel, project)).fetchone()
+            if row is None:
+                # Preserve legacy heads/history. Ambiguous mappings require an
+                # explicit migration decision, never silently pick the newest.
+                candidates = db.execute('SELECT DISTINCT session FROM heads WHERE sender=? AND channel=? AND project=?',
+                                        (sender, channel, project)).fetchall()
+                if len(candidates) > 1:
+                    raise AgentError('MIGRATION_AMBIGUOUS', '同一逻辑项目有多个旧会话头，须先核对迁移绑定')
+                if candidates:
+                    row = candidates[0]
+                    db.execute('INSERT INTO logical_heads VALUES (?,?,?,?)', (sender, channel, project, row['session']))
+        else:
+            row = db.execute('SELECT session FROM heads WHERE sender=? AND channel=? AND project=? AND cwd=?',
+                             (sender, channel, project, cwd)).fetchone()
         if row and not new:
             return db.execute('SELECT * FROM sessions WHERE id=?', (row['session'],)).fetchone()
         sid = uuid.uuid4().hex
@@ -236,6 +263,8 @@ class AgentRuntime:
         db.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,0)',
                    (sid, sender, channel, project, cwd, stat.st_dev, stat.st_ino))
         db.execute('INSERT OR REPLACE INTO heads VALUES (?,?,?,?,?)', (sender, channel, project, cwd, sid))
+        if self.logical_projects:
+            db.execute('INSERT OR REPLACE INTO logical_heads VALUES (?,?,?,?)', (sender, channel, project, sid))
         return db.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
 
     def submit(self, sender, channel, delivery, text, project):
@@ -259,6 +288,8 @@ class AgentRuntime:
             mid = uuid.uuid4().hex
             db.execute('INSERT INTO messages(id,sender,channel,delivery,digest,session,text,state,created) '
                        "VALUES (?,?,?,?,?,?,?,'queued',?)", (mid, sender, channel, delivery, fingerprint, session['id'], text, time.time()))
+            db.execute('INSERT INTO message_evidence(message,state,code,created) VALUES (?,?,?,?)',
+                       (mid, 'queued', 'ACCEPTED', time.time()))
             # Learning failure must not roll back the chat admission itself.
             db.execute('SAVEPOINT preference_learning')
             try:
@@ -275,10 +306,13 @@ class AgentRuntime:
     @staticmethod
     def _result(db, row, reused=False):
         session = db.execute('SELECT * FROM sessions WHERE id=?', (row['session'],)).fetchone()
+        evidence = db.execute('SELECT state,code,created FROM message_evidence WHERE message=? ORDER BY seq DESC LIMIT 1',
+                              (row['id'],)).fetchone()
         return {'ok': True, 'message_id': row['id'], 'session_id': row['session'],
                 'project': session['project'], 'state': row['state'],
                 'reply': row['response'] or '', 'reused': reused,
-                'completion': 'model_turn_completed' if row['state'] == 'done' else row['state']}
+                'completion': 'model_turn_completed' if row['state'] == 'done' else row['state'],
+                'evidence': dict(evidence) if evidence else None}
 
     def export_profile(self, owner):
         # Serialize the DB snapshot and publication with forgetting/learning.
@@ -403,8 +437,10 @@ class AgentRuntime:
     def current_conversation(self, sender, channel, project):
         cwd = os.path.realpath(self.project(project))
         with self.db() as db:
-            row = db.execute('SELECT session FROM heads WHERE sender=? AND channel=? AND project=? AND cwd=?',
-                             (sender, channel, project, cwd)).fetchone()
+            row = (db.execute('SELECT session FROM logical_heads WHERE sender=? AND channel=? AND project=?',
+                              (sender, channel, project)).fetchone() if self.logical_projects else
+                   db.execute('SELECT session FROM heads WHERE sender=? AND channel=? AND project=? AND cwd=?',
+                              (sender, channel, project, cwd)).fetchone())
             if row is None:
                 raise AgentError('NOT_FOUND', '当前项目尚无对话会话')
             return row['session']
@@ -499,6 +535,8 @@ class AgentRuntime:
                     session = dict(db.execute('SELECT * FROM sessions WHERE id=?', (row['session'],)).fetchone())
                     cancel = self.cancels.setdefault(row['id'], threading.Event())
                     db.execute("UPDATE messages SET state='running' WHERE id=? AND state='queued'", (row['id'],))
+                    db.execute('INSERT INTO message_evidence(message,state,code,created) VALUES (?,?,?,?)',
+                               (row['id'], 'running', 'CALL_INTENT', time.time()))
                     turn = {**dict(row), 'subject': {k: session[k] for k in ('sender', 'channel', 'project', 'cwd')},
                             'resume': db.execute("SELECT 1 FROM messages WHERE session=? AND state='done' LIMIT 1", (row['session'],)).fetchone() is not None}
                     turn['subject'].update(conversation=session['id'], session=session['id'], attempt=row['id'])
@@ -508,7 +546,7 @@ class AgentRuntime:
             if not row:
                 self.wake.wait(.25); self.wake.clear()
                 continue
-            state, reply = 'uncertain', ''
+            state, reply, code = 'uncertain', '', 'CALL_UNKNOWN'
             try:
                 try:
                     turn['runtime_info'] = self.runtime_info() if self.runtime_info else {'evidence': 'runtime release not supplied'}
@@ -516,8 +554,10 @@ class AgentRuntime:
                     turn['runtime_info'] = {'evidence': 'host snapshot unavailable; do not infer release from documents'}
                 cwd = os.path.realpath(self.project(session['project']))
                 stat = os.stat(cwd)
-                if cwd != session['cwd'] or (stat.st_dev, stat.st_ino) != (session['device'], session['inode']):
+                if not self.logical_projects and (cwd != session['cwd'] or (stat.st_dev, stat.st_ino) != (session['device'], session['inode'])):
                     raise AgentError('PROJECT_CHANGED', '项目目录已改变')
+                if self.logical_projects:
+                    turn['subject'].update(cwd=cwd, origin_cwd=session['cwd'])
                 turn['recent_tasks'] = self.evidence(session['sender'], session['channel'], session['project'])
                 if self.tasks is not None:
                     turn['task_events'] = self.tasks.events(session['sender'], session['channel'], session['id'], session['project'],
@@ -526,15 +566,19 @@ class AgentRuntime:
                 if not isinstance(reply, str) or not reply.strip():
                     raise AgentError('EMPTY_REPLY', '对话没有完整返回')
                 state = 'done'
+                code = 'RECEIPT_COMPLETED'
             except AgentError as exc:
+                code = exc.code if re.fullmatch('[A-Z_]{1,64}', exc.code) else 'CALL_UNKNOWN'
                 if exc.code == 'CANCELLED':
                     state = 'cancelled'
-                elif exc.code == 'PROJECT_CHANGED':
+                elif exc.code in ('PROJECT_CHANGED', 'NOT_STARTED'):
                     state = 'failed'
             except Exception:
                 pass
             with self.db() as db:
                 db.execute('UPDATE messages SET state=?,response=?,ended=? WHERE id=?', (state, reply, time.time(), row['id']))
+                db.execute('INSERT INTO message_evidence(message,state,code,created) VALUES (?,?,?,?)',
+                           (row['id'], state, code, time.time()))
                 if state == 'done' and turn.get('task_events'):
                     db.execute('INSERT OR REPLACE INTO task_cursors VALUES (?,?)',
                                (session['id'], max(event['seq'] for event in turn['task_events'])))
@@ -558,7 +602,7 @@ class AgentRuntime:
 
 
 class NativeExecutor:
-    def __init__(self, root, run_task, redact, tasks=None, services=None, file_reads=True):
+    def __init__(self, root, run_task, redact, tasks=None, services=None, file_reads=True, remote=None, snapshots=None):
         if type(file_reads) is not bool:
             raise ValueError('file_reads must be an explicit boolean')
         self.root, self.run_task, self.redact = Path(root), run_task, redact
@@ -567,6 +611,8 @@ class NativeExecutor:
         self.tasks = tasks
         self.services = services
         self.file_reads = file_reads
+        self.remote = remote
+        self.snapshots = snapshots
 
     def recover(self, turn):
         if not re.fullmatch(r'[a-f0-9]{32}', turn['id']):
@@ -594,6 +640,12 @@ class NativeExecutor:
         payload['runtime_info'] = turn.get('runtime_info', {'evidence': 'runtime release not supplied'})
         if not self.file_reads:
             payload['read_mode'] = 'none'
+        if self.remote is not None and self.remote.projects.target(turn['subject']['project']) == 'mac':
+            payload['read_mode'] = 'remote'
+            payload['remote_reads'] = self.remote.issue('chat', turn['subject'], cancel=cancel)
+        snapshot = self.snapshots(turn['subject']['project']) if self.snapshots else None
+        if snapshot:
+            payload.update(read_mode='snapshot', read_root=snapshot[0], source_snapshot=snapshot[1])
         if self.services is not None:
             payload['services'] = self.services.issue(turn['subject'], cancel, turn['text'])
         if self.tasks is not None:
@@ -609,8 +661,12 @@ class NativeExecutor:
         # Electron's audited Node entry point needs the same flag as the DSH launcher.
         command = ['/usr/bin/env', 'ELECTRON_RUN_AS_NODE=1', node, str(source), str(request)]
         try:
-            result = self.run_task(command, cwd=turn['subject']['cwd'], timeout=120,
-                                   cancel_check=cancel.is_set)
+            from process_supervisor import ProcessStartError
+            try:
+                result = self.run_task(command, cwd=turn['subject']['cwd'], timeout=120,
+                                       cancel_check=cancel.is_set)
+            except ProcessStartError:
+                raise AgentError('NOT_STARTED', '后端进程未启动，无自动重试') from None
             if result.get('cancelled') and result.get('group_stopped'):
                 raise AgentError('CANCELLED', '执行器已停止')
             recovered = self.recover(turn)
@@ -627,4 +683,6 @@ class NativeExecutor:
                 self.tasks.revoke_capability(payload['broker']['capability'])
             if payload.get('services'):
                 self.services.revoke_capability(payload['services']['capability'])
+            if payload.get('remote_reads'):
+                self.remote.revoke_capability(payload['remote_reads']['capability'])
             request.unlink(missing_ok=True)

@@ -1,5 +1,17 @@
 # 服务器主脑迁移：P0 隔离验证材料
 
+## 安全试切候选（默认关闭，未部署）
+
+`assistant.py`使用独立共享监督模块，不导入旧worker。逻辑项目、服务器工作空间和工具目标独立保存；原会话ID、Mac路径来源和聊天头保持。`/agent projects`、`/agent use <名称>`仅操作宿主预先登记的逻辑项目，不能登记任意路径。Mac的`AGENTBRIDGE_WORKER_ROLE=executor_only`会生成私有角色标记，后续普通重启仍禁止聊天写者；恢复combined必须显式迁移回退，不可仅清空环境变量绕过。
+
+`tools/migrate_assistant.py`只接受已退出的旧写者PID，并取得既有写者锁、核对无在途执行，制作新私有目录的SQLite backup/原生会话/收据/偏好副本。导入只写全新演练目录，旧审批归档但不带有效授权，未知服务请求不重放；不切路由、不覆盖生产源、不操作服务器提醒调度器。`tools/source_snapshot.py`只导出经独立GitHub核对提交的原十九路径，清单包含版本、时间及哈希，源码不是运行状态证据。
+
+Dockerfile的`baseline`与`candidate`理解同一追加式状态格式；回退只换代码镜像，绝不恢复旧SQLite。构建context必须另在私有隔离目录准备，`runtime/node`来自已校验Linux归档，`runtime/deps`为锁文件的全新Linux npm ci结果，不复制Mac依赖、配置、聊天或密钥。官方Python基镜像固定为`python@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337`，通过`--build-arg PYTHON_IMAGE=...`传入。两目标构建不等于已验收或已上线。
+
+运行必须非root、只读根/源码/依赖、私有状态卷、私有凭据只读挂载或tmpfs、`--memory 1g --cpus 1 --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges`。只监听容器回环，不发布任何0.0.0.0端口；实际同宿主回环接入须另行授权选择既有网络，不能用容器桥接端口映射绕过。并发仅一个聊天lane。`AGENTBRIDGE_EXECUTOR_URL`只接受既有固定127.0.0.1端口，密钥从`AGENTBRIDGE_EXECUTOR_SECRET_FILE`私有文件读取；只影响新助手，旧/mac路由不变。离线/调用未知只记录证据，无离线动作队列，无自动重放。
+
+当前冻结完整发现433项通过，20轮和真实副本Linux演练尚在进行。未通过这些门槛前结论仍为不可试切。原微信账号、模型/人格、现有密钥、提醒数据库和发送器不替换。实际手机收取、真实Mac关机30分钟及新30分钟/24小时观察不由合成测试批准。
+
 当前包含 P0 验证入口及 P1 第一版独立对话宿主候选，**不是已上线的服务器 assistant**。
 P0 探针不启动监听器；P1 候选须显式开启，仅监听127.0.0.1:9010。
 当前不切生产 shim 路由，不启动旧调度器，不导入生产会话。

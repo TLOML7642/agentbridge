@@ -105,7 +105,7 @@ def exercise(node, packages, real):
     # App, the old scheduler, project registry or HTTP listener.
     sys.path.insert(0, str(ROOT))
     from agent_runtime import AgentRuntime, NativeExecutor
-    from worker import run_task
+    from process_supervisor import run_task
 
     checks = dict.fromkeys(CHECKS, False)
     checks['linux_x64'] = sys.platform.startswith('linux') and platform.machine() == 'x86_64'

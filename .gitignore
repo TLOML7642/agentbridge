@@ -1,7 +1,12 @@
 /*
 !/.gitignore
 !/worker.py
+!/worker_role.py
+!/executor_api.py
 !/assistant.py
+!/assistant_projects.py
+!/assistant_executor.py
+!/process_supervisor.py
 !/shim.py
 !/native_boundary.mjs
 !/agent_runtime.py
@@ -28,6 +33,7 @@
 !/server/assistant/package-lock.json
 !/server/assistant/README.md
 !/server/assistant/runtime-artifacts.json
+!/server/assistant/Dockerfile
 !/server/plugins/
 !/server/docker_control/
 /server/docker_control/*

@@ -85,7 +85,9 @@ export function installToolBoundary(ctx, {
     const bound = agents.get(agent);
     if (!bound || agent.session !== bound.session || agent.id !== bound.subject.session
         || agent.session.id !== bound.subject.session || ctx.agents.get(agent.id) !== agent
-        || canonicalDirectory(agent.session.header.cwd) !== bound.subject.cwd) fail();
+        || (bound.originCwd === undefined
+          ? canonicalDirectory(agent.session.header.cwd) !== bound.subject.cwd
+          : agent.session.header.cwd !== bound.originCwd)) fail();
     const directory = statSync(bound.subject.cwd);
     if (directory.dev !== bound.directory.dev || directory.ino !== bound.directory.ino) fail();
     return bound;
@@ -192,14 +194,19 @@ export function installToolBoundary(ctx, {
   });
 
   return Object.freeze({
-    bindAgent(agent, subject) {
+    bindAgent(agent, subject, { originCwd } = {}) {
       if (closed || agents.has(agent)) fail();
       const values = Object.fromEntries(SUBJECT_KEYS.map((key) => [key, text(subject[key])]));
       values.cwd = canonicalDirectory(values.cwd);
+      // A migrated native header is immutable provenance, not the live tool
+      // directory. Only trusted host setup supplies this explicit binding.
+      if (originCwd !== undefined && (!path.isAbsolute(text(originCwd)) || originCwd.includes('\0'))) fail();
       if (agent.id !== values.session || agent.session.id !== values.session
-          || canonicalDirectory(agent.session.header.cwd) !== values.cwd) fail();
+          || (originCwd === undefined ? canonicalDirectory(agent.session.header.cwd) !== values.cwd
+            : agent.session.header.cwd !== originCwd)) fail();
       const directory = statSync(values.cwd);
       agents.set(agent, Object.freeze({ session: agent.session, subject: snapshot(values),
+        originCwd,
         directory: Object.freeze({ dev: directory.dev, ino: directory.ino }) }));
     },
     register(definition, { effect } = {}) {

@@ -152,6 +152,7 @@ def _accept_agent(payload, sender, channel):
 
 
 CONTROL_FIELDS = {
+    'agent.projects': set(), 'agent.use': {'project', 'delivery_id'},
     "status": {"job_id"}, "confirm": {"token", "delivery_id"},
     "status.batch": {"job_ids"}, "diag": set(), "jobs": set(), "pending": set(),
     "deny": {"job_id", "delivery_id"}, "cancel": {"job_id", "delivery_id"},

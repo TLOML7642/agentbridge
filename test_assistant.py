@@ -19,6 +19,7 @@ import assistant
 from agent_runtime import AgentError
 import shim
 import worker
+import process_supervisor
 from http.server import ThreadingHTTPServer
 from test_s1_s5 import load_plugin
 
@@ -356,7 +357,7 @@ class NativeAssistantTests(unittest.TestCase):
                 return original(command, **kwargs)
 
             with mock.patch.dict(os.environ, {'AGENTBRIDGE_AGENT_NODE': node, 'AGENTBRIDGE_AGENT_PACKAGES': packages}), \
-                    mock.patch.object(worker, 'run_task', side_effect=run), \
+                    mock.patch.object(process_supervisor, 'run_task', side_effect=run), \
                     mock.patch.object(worker, 'App') as legacy, mock.patch.object(worker, 'Scheduler') as scheduler:
                 app = assistant.App(root / 'a', 'synthetic', {'owner'}, {'private'})
                 try:

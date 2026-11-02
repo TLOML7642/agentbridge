@@ -245,7 +245,7 @@ class TestAsyncBridge(unittest.TestCase):
         row = None
         try:
             with mock.patch.object(worker, 'RUNNING_CANCEL_ENABLED', True), \
-                    mock.patch.object(worker, '_stop_owned_group', return_value=False):
+                    mock.patch('process_supervisor._stop_owned_group', return_value=False):
                 self.post('inspect', 'uncertain-cancel', Prefer='respond-async')
                 row = self.wait_state('uncertain-cancel', lambda r: r['exec_state'] == 'released')
                 self.control({'op': 'cancel', 'job_id': 'uncertain-cancel', 'delivery_id': 'uncertain-intent'})
@@ -259,13 +259,13 @@ class TestAsyncBridge(unittest.TestCase):
             self.wait_idle()
 
     def test_identity_change_or_permission_error_never_authorizes_kill(self):
-        with mock.patch.object(worker, '_group_alive', return_value=True), \
-                mock.patch.object(worker, '_group_members', return_value={42: 'new-birth'}), \
+        with mock.patch('process_supervisor._group_alive', return_value=True), \
+                mock.patch('process_supervisor._group_members', return_value={42: 'new-birth'}), \
                 mock.patch.object(worker.os, 'killpg') as signal_group:
             self.assertFalse(worker._stop_owned_group(42, {42: 'old-birth'}))
             signal_group.assert_not_called()
-        with mock.patch.object(worker, '_group_alive', return_value=True), \
-                mock.patch.object(worker, '_group_members', return_value={42: 'same-birth'}), \
+        with mock.patch('process_supervisor._group_alive', return_value=True), \
+                mock.patch('process_supervisor._group_members', return_value={42: 'same-birth'}), \
                 mock.patch.object(worker.os, 'killpg', side_effect=PermissionError):
             self.assertFalse(worker._stop_owned_group(42, {42: 'same-birth'}))
 

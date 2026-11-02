@@ -145,12 +145,21 @@ def private_path(value, prefixes):
 
 def query(request):
     root, value = request['root'], request['value']
+    if request.get('reviewed_snapshot') is True:
+        # A snapshot never grants /etc/hosts or arbitrary workspace reads.
+        candidate = os.path.normpath(os.path.join(root, value))
+        relative = os.path.relpath(candidate, root)
+        if (os.path.commonpath((candidate, root)) != root or not (
+                relative in SOURCE_FILES or request['operation'] in ('list_files', 'search_text') and
+                (relative == '.' or request['operation'] == 'list_files' and
+                 any(name.startswith(relative + '/') for name in SOURCE_FILES)))):
+            raise ValueError('outside reviewed snapshot')
     if (not isinstance(value, str) or not value or len(value) > 4096 or '\0' in value
             or request['operation'] not in ('read_text', 'read_text_range', 'list_files', 'search_text')):
         raise ValueError('invalid read')
     if request['operation'] == 'search_text':
         literal, count = request.get('literal'), request.get('max_matches', 20)
-        if (root != SOURCE_PROJECT or not isinstance(literal, str) or not 1 <= len(literal) <= 200 or '\0' in literal
+        if (root != SOURCE_PROJECT and request.get('reviewed_snapshot') is not True or not isinstance(literal, str) or not 1 <= len(literal) <= 200 or '\0' in literal
                 or type(count) is not int or not 1 <= count <= 50
                 or value != '.' and value not in SOURCE_FILES):
             raise RangeError('literal search requires the reviewed source project, 1..200 literal characters and 1..50 matches')
@@ -195,6 +204,10 @@ def query(request):
                 rows = []
                 for name in sorted(os.listdir(descriptor)):
                     full = os.path.join(candidate, name)
+                    relative = os.path.relpath(full, root)
+                    if request.get('reviewed_snapshot') is True and not (relative in SOURCE_FILES or
+                            any(file.startswith(relative + '/') for file in SOURCE_FILES)):
+                        continue
                     if (private_path(full, request['private_prefixes'])
                             or not source_allowed(full, directory=True)):
                         continue

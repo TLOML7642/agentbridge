@@ -163,7 +163,7 @@ class LinuxSupervisorTests(unittest.TestCase):
     def test_proc_members_require_matching_kernel_birth_identity_without_ps(self):
         with mock.patch.object(worker.sys, 'platform', 'linux'), \
                 mock.patch.object(worker.os, 'listdir', return_value=['self', '17', '23', '31', '١']), \
-                mock.patch.object(worker, '_process_identity', side_effect=lambda pid, group:
+                mock.patch('process_supervisor._process_identity', side_effect=lambda pid, group:
                                   'linux:boot:17:99' if pid == 17 and group == 17 else None), \
                 mock.patch.object(worker.subprocess, 'check_output') as ps:
             self.assertEqual(worker._group_members(17), {17: 'linux:boot:17:99'})

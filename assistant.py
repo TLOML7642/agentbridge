@@ -17,9 +17,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from agent_runtime import AgentError, AgentRuntime, NativeExecutor, required
 from agent_services import ServiceQueue
+from assistant_projects import Projects
 
 
 CONTROL_FIELDS = {
+    'agent.projects': set(), 'agent.use': {'project', 'delivery_id'},
     'agent.status': {'message_id'}, 'agent.lookup': {'delivery_id'},
     'agent.new': {'delivery_id'}, 'agent.cancel': {'message_id', 'delivery_id'},
     'agent.memory': set(), 'agent.persona': set(),
@@ -35,7 +37,8 @@ MAC_CONTROLS = frozenset(('agent.tasks', 'agent.task.cancel', 'agent.approvals',
 
 
 class App:
-    def __init__(self, root, secret, senders, channels, services=False, runner=None):
+    def __init__(self, root, secret, senders, channels, services=False, runner=None,
+                 executor_url=None, executor_secret=None, task_projects=()):
         required(secret, 512)
         if not senders or not channels or any(not isinstance(v, str) or not v.strip() for v in (*senders, *channels)):
             raise AgentError('AUTH_FAIL', '服务器助手须显式配置发送者和会话允许列表')
@@ -54,14 +57,25 @@ class App:
         self.workspace.mkdir(mode=0o700, exist_ok=True)
         self.workspace.chmod(0o700)
         self.project = 'assistant'
+        self.projects = Projects(self.root)
+        with self.projects.connect() as db:
+            if not db.execute('SELECT 1 FROM bindings WHERE name=?', (self.project,)).fetchone():
+                self.projects.bind(self.project)
+        self.workspace = Path(self.projects.workspace(self.project))
+        self.executor = None
+        if executor_url:
+            from assistant_executor import Executor
+            required(executor_secret, 512)
+            self.executor = Executor(self.root / 'tools', executor_url, executor_secret, self.projects, task_projects)
         self.agent = None
         queue = ServiceQueue(self.root / 'agent/services', profile=self.profile_intent) if services else None
         try:
             if runner is None:
                 # Definitions only. Never construct worker.App, Scheduler or its
                 # config/preset setup; use the already-verified owned supervisor.
-                from worker import run_task, redact
-                runner = NativeExecutor(self.root / 'agent', run_task, redact, services=queue, file_reads=False)
+                from process_supervisor import run_task, redact
+                runner = NativeExecutor(self.root / 'agent', run_task, redact, services=queue, file_reads=False,
+                                        tasks=self.executor, remote=self.executor, snapshots=self.projects.snapshot)
             ready = threading.Event()
 
             def run(turn, cancel):
@@ -70,20 +84,24 @@ class App:
                 ready.wait()
                 return runner(turn, cancel)
 
-            self.agent = AgentRuntime(self.root / 'agent', run, lambda _: str(self.workspace),
+            self.agent = AgentRuntime(self.root / 'agent', run, self.projects.workspace,
                                       recover=getattr(runner, 'recover', lambda _: None),
-                                      allow_learning=False, services=queue, runtime_info=self.runtime_info)
+                                      allow_learning=False, services=queue, runtime_info=self.runtime_info,
+                                      logical_projects=True, tasks=self.executor)
             ready.set()
         except BaseException:
             if queue:
                 queue.close()
+            if self.executor:
+                self.executor.close()
             raise
 
     def runtime_info(self):
         return {'host_role': 'server_assistant', 'assistant_boot_id': self.boot_id,
                 'assistant_runtime': 'running', 'mac_status': 'not_probed',
-                'file_reads': 'disabled pending trusted tool-target binding',
-                'mac_actions': 'unavailable; requests are not queued',
+                'file_reads': 'host-bound snapshot or fixed executor only; current project determines tools',
+                'mac_actions': ('fixed executor; availability not asserted; no offline queue' if self.executor
+                                else 'unavailable; requests are not queued'),
                 'profile_projection': 'server only; no desktop preset installed or synchronized',
                 'deployment_status': 'candidate process only; no production or phone acceptance evidence'}
 
@@ -109,17 +127,36 @@ class App:
         sender, channel = self.source(payload)
         if set(payload) != {'sender', 'channel', 'delivery_id', 'text'}:
             raise AgentError('INVALID_MESSAGE', '消息字段无效；项目和执行端由宿主绑定')
-        return self.agent.submit(sender, channel, payload['delivery_id'], payload['text'], self.project)
+        return self.agent.submit(sender, channel, payload['delivery_id'], payload['text'], self.projects.current(sender, channel))
 
     def control(self, payload):
         sender, channel = self.source(payload)
         op = payload.get('op')
         if isinstance(op, str) and op in MAC_CONTROLS:
-            raise AgentError('MAC_TOOLS_UNAVAILABLE', 'Mac工具尚未连接，未登记或排队执行；旧/mac仍走原链路')
+            if self.executor is None:
+                raise AgentError('MAC_TOOLS_UNAVAILABLE', 'Mac工具尚未连接，未登记或排队执行；旧/mac仍走原链路')
+            fields = {'agent.tasks': {'task_id'}, 'agent.task.cancel': {'task_id', 'delivery_id'},
+                      'agent.approvals': {'approval_id'}, 'agent.approve': {'approval_id', 'delivery_id'},
+                      'agent.deny': {'approval_id', 'delivery_id'}, 'agent.events': {'after'}}
+            if set(payload) - fields[op] - {'op', 'sender', 'channel'} or any(not isinstance(v, str) for v in payload.values()):
+                raise AgentError('INVALID_MESSAGE', '工具控制字段无效')
+            project = self.projects.current(sender, channel)
+            conversation = self.agent.current_conversation(sender, channel, project)
+            if op == 'agent.events':
+                return self.executor.events(sender, channel, conversation, project, int(payload.get('after', '0')))
+            subject = dict(sender=sender, channel=channel, conversation=conversation, project=project,
+                           attempt='control')
+            return self.executor.call(subject, {'agent.tasks': 'tasks', 'agent.task.cancel': 'cancel',
+                                      'agent.approvals': 'approvals', 'agent.approve': 'approve', 'agent.deny': 'deny'}[op],
+                                      {field: payload.get(field, '') for field in fields[op]})
         if not isinstance(op, str) or op not in CONTROL_FIELDS:
             raise AgentError('INVALID_MESSAGE', '服务器助手不支持该控制操作')
         if set(payload) - CONTROL_FIELDS[op] - {'op', 'sender', 'channel'} or any(not isinstance(v, str) for v in payload.values()):
             raise AgentError('INVALID_MESSAGE', '控制字段格式错误或包含非白名单字段')
+        if op == 'agent.projects':
+            return self.projects.listing(sender, channel)
+        if op == 'agent.use':
+            return self.projects.use(sender, channel, payload.get('project', ''), payload.get('delivery_id', ''))
         if op.startswith('agent.service.'):
             if self.agent.services is None:
                 raise AgentError('SERVICE_DISABLED', '个人服务未启用')
@@ -129,7 +166,7 @@ class App:
                 return self.agent.services.resolve(sender, channel, payload.get('request_id', ''), payload.get('result', ''))
             except (ValueError, TypeError):
                 raise AgentError('INVALID_MESSAGE', '服务结果须为明确状态的JSON对象') from None
-        return self.profile_result(self.agent.control(sender, channel, op, self.project, payload.get('message_id', ''),
+        return self.profile_result(self.agent.control(sender, channel, op, self.projects.current(sender, channel), payload.get('message_id', ''),
                                    payload.get('delivery_id', ''), payload.get('memory_id', ''),
                                    payload.get('name', ''), payload.get('category', ''),
                                    payload.get('value', ''), payload.get('draft_id', '')))
@@ -137,6 +174,8 @@ class App:
     def close(self):
         if not self.closed:
             self.agent.close()
+            if self.executor:
+                self.executor.close()
             self.closed = True
 
 
@@ -243,7 +282,11 @@ def main():
     senders = {v.strip() for v in os.environ.get('AGENTBRIDGE_ALLOWED_SENDERS', '').split(',') if v.strip()}
     channels = {v.strip() for v in os.environ.get('AGENTBRIDGE_AGENT_CHANNELS', '').split(',') if v.strip()}
     app = App(os.environ['AGENTBRIDGE_ASSISTANT_ROOT'], secret, senders, channels,
-              services=os.environ.get('AGENTBRIDGE_PERSONAL_SERVICES', '0') == '1')
+              services=os.environ.get('AGENTBRIDGE_PERSONAL_SERVICES', '0') == '1',
+              executor_url=os.environ.get('AGENTBRIDGE_EXECUTOR_URL'),
+              executor_secret=(private_credential(os.environ['AGENTBRIDGE_EXECUTOR_SECRET_FILE']).decode().strip()
+                               if os.environ.get('AGENTBRIDGE_EXECUTOR_URL') else None),
+              task_projects={v for v in os.environ.get('AGENTBRIDGE_AGENT_TASK_PROJECTS', '').split(',') if v})
     server = None
 
     def stop(*_):
