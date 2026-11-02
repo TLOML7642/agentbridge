@@ -4,6 +4,10 @@
 不启动监听器，不切 shim 路由，不启动旧调度器，不导入生产会话。
 模型仍固定为 `deepseek-official / deepseek-v4-flash`。
 
+2026-11-02 已复用用户确认的既有服务器密钥通过 P0 的14项检查，包括Linux两轮真实
+API及跨进程续接。原生子进程峰值104.336 MiB、探针容器峰值89.402 MiB，无OOM；
+生产配置/容器及路由不变。详见根目录CHANGELOG，不能据此宣称P1–P4已经完成。
+
 ## 固定运行时
 
 - Linux x86_64，Node `24.22.2`，原生 DSH 模块 `0.1.1-rc.2`。
@@ -38,6 +42,8 @@ python3 -B /probe/tools/check_server_runtime.py \
 父进程清空环境，使用空 HOME 和新 SQLite；报告及合成状态留在私有结果目录。
 
 真实模式必须另给 `--credential /private/server-credentials.yaml --credential-ref SERVER_KEY`。
+“专用”不要求新建：可以复用用户确认的既有服务器密钥，原配置只读解析，经stdin进入
+容器tmpfs，不放到命令参数或持久暂存。控制台名称不在本地配置中时不声称独立核验该标签。
 文件采用原生 DSH 凭据格式，必须当前用户所有、0600 常规文件，不接受链接、环境隐式密钥
 或聊天粘贴。探针只制作短暂私有副本，结束后删除该副本，保留原件。
 仅 Linux x86_64、非 root、cgroup v2 的 1 GiB/1 CPU 限额核对通过后才允许真实模型请求。

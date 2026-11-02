@@ -47,9 +47,9 @@
 
 ## 架构
 
-服务器主脑迁移已开始准备 P0 隔离验证材料，见
-[服务器运行时验证](server/assistant/README.md)。这不是已部署架构：专用服务器密钥真实续接、
-独立 assistant、工具解耦、数据迁移和实际切换均须各自过门槛，当前生产链路不变。
+服务器主脑迁移的 P0 Linux 真实 API 续接和资源门槛已通过，见
+[服务器运行时验证](server/assistant/README.md)。这不是已部署架构：独立 assistant、
+工具解耦、数据迁移和实际切换仍须各自过门槛，当前生产链路不变。
 
 ```text
 微信私聊 -> AstrBot 适配 -> 认证 shim -> 既有 SSH 隧道 -> Mac worker
