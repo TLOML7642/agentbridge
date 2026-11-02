@@ -19,7 +19,12 @@ export function rpc(broker, op, fields, signal) {
       if (!data.includes('\n')) return;
       try {
         const value = JSON.parse(data.slice(0, data.indexOf('\n')));
-        if (value?.ok !== true) throw new Error(purpose + '_DENIED');
+        if (value?.ok !== true) {
+          // Preserve only fixed host outcome codes, never remote prose or
+          // model-supplied fields. Offline is not an approval rejection.
+          const code = ['MAC_OFFLINE', 'EXECUTOR_UNKNOWN'].includes(value?.code) ? value.code : purpose + '_DENIED';
+          throw new Error(code);
+        }
         clean(); socket.destroy(); resolve(value);
       } catch (error) { socket.destroy(error); }
     });

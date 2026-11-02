@@ -327,6 +327,33 @@ class MigrationTests(unittest.TestCase):
                 self.assertTrue((target / name).read_bytes().startswith(data))
             self.assertIsNotNone(native.recover(dict(id=row['message_id'], session=row['session_id'], text='new-question')))
 
+    def test_native_mac_offline_is_explicit_without_blocking_chat_or_spooling(self):
+        node, packages = (os.environ.get(name) for name in ('AGENTBRIDGE_TEST_NATIVE_NODE', 'AGENTBRIDGE_TEST_NATIVE_PACKAGES'))
+        if not node or not packages:
+            self.skipTest('explicit pinned native runtime required')
+        def supervised(command, **kwargs):
+            request = Path(command[-1])
+            data = json.loads(request.read_text())
+            data.update(synthetic=True, syntheticTool={'name': 'submit_task', 'arguments': {
+                'operation': 'create_text', 'arguments': json.dumps({'path': 'offline.txt', 'text': 'must-not-run'})}})
+            request.write_text(json.dumps(data))
+            return run_task(command, **kwargs)
+        with mock.patch.dict(os.environ, {'AGENTBRIDGE_AGENT_NODE': node, 'AGENTBRIDGE_AGENT_PACKAGES': packages}), \
+                mock.patch('process_supervisor.run_task', side_effect=supervised):
+            app = assistant.App(self.root / 'server', 'synthetic', {'owner'}, {'private'},
+                                executor_url='http://127.0.0.1:1', executor_secret='synthetic-mac', task_projects={'p'})
+            self.stack.callback(app.close)
+            app.projects.bind('p', '', 'mac')
+            app.projects.use('owner', 'private', 'p', 'switch')
+            row = app.message(dict(sender='owner', channel='private', delivery_id='offline', text='synthetic offline action'))
+            result = self.wait(app.agent, row['message_id'])
+            tool = json.loads(json.loads(result['reply'])['toolResult'])['content'][0]
+            self.assertIs(tool['isError'], True)
+            self.assertIn('MAC_OFFLINE', json.dumps(tool))
+            self.assertFalse(list((self.root / 'server').rglob('offline.txt')))
+            with app.executor.db() as db:
+                self.assertEqual(db.execute('SELECT state FROM calls').fetchall(), [('not_accepted',)])
+
 
 if __name__ == '__main__':
     unittest.main()
