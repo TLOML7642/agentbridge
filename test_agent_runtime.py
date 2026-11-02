@@ -478,6 +478,45 @@ class PluginAgentTests(unittest.TestCase):
         self.event.stop_event.assert_called_once()
         self.main._send_notification.assert_awaited_once()
 
+    def test_not_accepted_evidence_is_durable_and_lookup_never_resubmits(self):
+        self.main._request = mock.AsyncMock(return_value=(503, {'error': {'code': 'NOT_ACCEPTED'}}))
+        asyncio.run(self.main.agent_message(self.event))
+        with self.main._agent_db() as db:
+            rows = db.execute('SELECT state,code FROM agent_delivery_evidence ORDER BY seq').fetchall()
+        self.assertEqual([tuple(row) for row in rows], [('calling', 'CALL_INTENT'), ('not_accepted', 'NOT_ACCEPTED')])
+        restarted = self.plugin.Main(None)
+        restarted._agent_allowed = lambda *_: True
+        restarted._control = mock.AsyncMock(return_value=(200, {'ok': False, 'code': 'NOT_FOUND'}))
+        restarted._request = mock.AsyncMock()
+        asyncio.run(restarted._agent_tick())
+        restarted._request.assert_not_awaited()
+        self.assertEqual(restarted._control.await_args.args[1]['op'], 'agent.lookup')
+        with restarted._agent_db() as db:
+            self.assertEqual(db.execute('SELECT state FROM agent_delivery_evidence ORDER BY seq DESC LIMIT 1').fetchone()[0], 'not_accepted')
+
+    def test_unknown_admission_and_host_failure_have_distinct_persistent_codes(self):
+        self.main._request = mock.AsyncMock(side_effect=TimeoutError)
+        asyncio.run(self.main.agent_message(self.event))
+        self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'state': 'uncertain',
+                    'message_id': 'chat-unknown', 'evidence': {'code': 'DRIVER_UNKNOWN'}}))
+        asyncio.run(self.main._agent_tick())
+        with self.main._agent_db() as db:
+            codes = [tuple(row) for row in db.execute('SELECT state,code FROM agent_delivery_evidence ORDER BY seq')]
+        self.assertEqual(codes, [('calling', 'CALL_INTENT'), ('accept_unknown', 'TRANSPORT_UNKNOWN'), ('uncertain', 'DRIVER_UNKNOWN')])
+        self.main._request.assert_awaited_once()
+
+    def test_restart_marks_only_latest_call_intent_unknown_and_keeps_legacy_watch(self):
+        self.main._agent_evidence('owner', 'private', 'one', 'calling', 'CALL_INTENT')
+        self.main._agent_evidence('other', 'private', 'two', 'calling', 'CALL_INTENT')
+        self.main._agent_evidence('other', 'private', 'two', 'accepted', 'ACCEPTED', 'accepted-two')
+        with self.main._agent_db() as db:
+            db.execute("INSERT INTO agent_outbox VALUES ('owner','private','legacy',NULL,'watch',0)")
+            self.main._recover_agent_evidence(db)
+            self.main._recover_agent_evidence(db)
+            rows = [tuple(row) for row in db.execute("SELECT sender,delivery,state,code FROM agent_delivery_evidence WHERE code='SENDER_RESTARTED'")]
+            self.assertEqual(rows, [('owner', 'one', 'accept_unknown', 'SENDER_RESTARTED')])
+            self.assertEqual(db.execute("SELECT state FROM agent_outbox WHERE delivery='legacy'").fetchone()[0], 'watch')
+
     def test_other_sources_and_mac_do_not_get_intercepted(self):
         self.main._request = mock.AsyncMock()
         for text in ['/mac help', 'mac help', 'mac use bridge-canary', '确认 abcdef']:

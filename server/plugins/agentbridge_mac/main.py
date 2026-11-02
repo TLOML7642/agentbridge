@@ -132,6 +132,7 @@ class Main(star.Star):
             with self._agent_db() as db:
                 db.execute("UPDATE agent_outbox SET state='unknown' WHERE state='sending'")
                 db.execute("UPDATE agent_task_outbox SET state='unknown' WHERE state='sending'")
+                self._recover_agent_evidence(db)
             self._agent_task = asyncio.create_task(self._agent_loop())
         if not NOTIFICATIONS_ENABLED or self._sender_task is not None:
             return
@@ -197,7 +198,33 @@ class Main(star.Star):
             db.execute('CREATE TABLE IF NOT EXISTS agent_task_outbox(id TEXT PRIMARY KEY,sender TEXT,channel TEXT,'
                        'payload TEXT,state TEXT)')
             db.execute('CREATE TABLE IF NOT EXISTS agent_service_sources(sender TEXT,channel TEXT,PRIMARY KEY(sender,channel))')
+            db.execute('CREATE TABLE IF NOT EXISTS agent_delivery_evidence('
+                       'seq INTEGER PRIMARY KEY AUTOINCREMENT,sender TEXT,channel TEXT,delivery TEXT,'
+                       'state TEXT,code TEXT,message_id TEXT,created REAL)')
             yield db
+
+    def _agent_evidence(self, sender, channel, delivery, state, code, message_id=''):
+        # Only host state/codes, never chat text, exception strings or secrets.
+        if state not in ('calling', 'accepted', 'not_accepted', 'accept_unknown', 'rejected',
+                         'queued', 'running', 'done', 'failed', 'cancelled', 'uncertain'):
+            raise ValueError('invalid delivery evidence state')
+        code = code if isinstance(code, str) and re.fullmatch('[A-Z_]{1,64}', code) else 'UNCLASSIFIED'
+        with self._agent_db() as db:
+            old = db.execute('SELECT state,code,message_id FROM agent_delivery_evidence '
+                             'WHERE sender=? AND channel=? AND delivery=? ORDER BY seq DESC LIMIT 1',
+                             (sender, channel, delivery)).fetchone()
+            if old and tuple(old) == (state, code, message_id):
+                return
+            db.execute('INSERT INTO agent_delivery_evidence(sender,channel,delivery,state,code,message_id,created) '
+                       'VALUES (?,?,?,?,?,?,?)', (sender, channel, delivery, state, code, message_id, time.time()))
+
+    @staticmethod
+    def _recover_agent_evidence(db):
+        db.execute('INSERT INTO agent_delivery_evidence(sender,channel,delivery,state,code,message_id,created) '
+                   "SELECT e.sender,e.channel,e.delivery,'accept_unknown','SENDER_RESTARTED',e.message_id,? "
+                   "FROM agent_delivery_evidence e WHERE e.state='calling' AND e.seq=("
+                   'SELECT max(latest.seq) FROM agent_delivery_evidence latest WHERE latest.sender=e.sender '
+                   'AND latest.channel=e.channel AND latest.delivery=e.delivery)', (time.time(),))
 
     async def _send_reminder(self, row):
         state = 'blocked'
@@ -289,6 +316,9 @@ class Main(star.Star):
                 continue
             if status != 200 or not data.get('ok'):
                 continue
+            if data.get('state') in ('queued', 'running', 'done', 'failed', 'cancelled', 'uncertain'):
+                self._agent_evidence(row['sender'], row['channel'], row['delivery'], data['state'],
+                                     (data.get('evidence') or {}).get('code', 'HOST_STATUS'), data.get('message_id', ''))
             if data.get('state') not in ('done', 'failed', 'cancelled', 'uncertain'):
                 continue
             text = data.get('reply') if data['state'] == 'done' else (
@@ -575,13 +605,25 @@ class Main(star.Star):
                     db.execute('INSERT OR IGNORE INTO agent_task_sources VALUES (?,?,0)', (sender, channel))
                 if PERSONAL_SERVICES:
                     db.execute('INSERT OR IGNORE INTO agent_service_sources VALUES (?,?)', (sender, channel))
-            status, data = await self._request(event, MESSAGES_URL, {'delivery_id': delivery, 'text': text})
+            self._agent_evidence(sender, channel, delivery, 'calling', 'CALL_INTENT')
+            try:
+                status, data = await self._request(event, MESSAGES_URL, {'delivery_id': delivery, 'text': text})
+            except Exception:
+                self._agent_evidence(sender, channel, delivery, 'accept_unknown', 'TRANSPORT_UNKNOWN')
+                raise
             if data.get('message_id'):
+                self._agent_evidence(sender, channel, delivery, 'accepted', 'ACCEPTED', data['message_id'])
                 with self._agent_db() as db:
                     db.execute('UPDATE agent_outbox SET message_id=? WHERE sender=? AND channel=? AND delivery=?', (data['message_id'], sender, channel, delivery))
                 await self._agent_tick()
             else:
-                await self._agent_local(event, '消息受理未确认，不会改用另一个聊天模型。可用 /agent status 查询；重复投递会复用原编号。')
+                error = data.get('error')
+                code = error.get('code') if isinstance(error, dict) else data.get('code')
+                state = ('not_accepted' if code == 'NOT_ACCEPTED' else
+                         'accept_unknown' if code in (None, 'ACCEPT_UNKNOWN', 'RESULT_UNKNOWN') else 'rejected')
+                self._agent_evidence(sender, channel, delivery, state, code)
+                await self._agent_local(event, ('连接未建立，这条消息未受理。' if state == 'not_accepted' else '消息受理未确认。')
+                                        + '不会自动补发或切换聊天模型；保留原编号查询对账。')
         except ReminderError as exc:
             await self._agent_local(event, str(exc))
         except Exception:
