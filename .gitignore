@@ -32,6 +32,7 @@
 !/server/assistant/package.json
 !/server/assistant/package-lock.json
 !/server/assistant/README.md
+!/server/assistant/TRIAL-READINESS.md
 !/server/assistant/runtime-artifacts.json
 !/server/assistant/Dockerfile
 !/server/plugins/
