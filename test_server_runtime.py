@@ -160,6 +160,18 @@ class LockTests(unittest.TestCase):
 
 
 class LinuxSupervisorTests(unittest.TestCase):
+    def test_native_probe_recovery_distinguishes_new_evidence_without_reexecution(self):
+        node, packages = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE'), os.environ.get('AGENTBRIDGE_TEST_NATIVE_PACKAGES')
+        if not node or not packages:
+            self.skipTest('explicit pinned native runtime required')
+        from tools.check_server_runtime import exercise
+        with tempfile.TemporaryDirectory(prefix='abpr-', dir='/tmp') as directory:
+            with mock.patch.dict(os.environ, {'HOME': directory,
+                    'AGENTBRIDGE_AGENT_NODE': node, 'AGENTBRIDGE_AGENT_PACKAGES': packages}):
+                result = exercise(Path(node), Path(packages), False)
+        for check in ('create_resume', 'durable_receipts', 'restart_recovery', 'unknown_not_replayed', 'cancel_owned_process'):
+            self.assertIs(result['checks'][check], True, check)
+
     def test_proc_members_require_matching_kernel_birth_identity_without_ps(self):
         with mock.patch.object(worker.sys, 'platform', 'linux'), \
                 mock.patch.object(worker.os, 'listdir', return_value=['self', '17', '23', '31', '١']), \

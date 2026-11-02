@@ -7,6 +7,7 @@ actions. Existing AstrBot owns reminders.db, scheduling and message delivery.
 import hmac
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -143,6 +144,8 @@ class App:
             project = self.projects.current(sender, channel)
             conversation = self.agent.current_conversation(sender, channel, project)
             if op == 'agent.events':
+                if not re.fullmatch('[0-9]{1,18}', payload.get('after', '0')):
+                    raise AgentError('INVALID_MESSAGE', '事件游标格式错误')
                 return self.executor.events(sender, channel, conversation, project, int(payload.get('after', '0')))
             subject = dict(sender=sender, channel=channel, conversation=conversation, project=project,
                            attempt='control')

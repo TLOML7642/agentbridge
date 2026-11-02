@@ -5,6 +5,7 @@ approve P0; approval additionally requires Linux, a constrained non-root cgroup,
 and two real requests using an explicitly supplied private credential document.
 """
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -178,16 +179,22 @@ def exercise(node, packages, real):
         checks['durable_receipts'] = all(executor.recover(row) == row['response'] for row in rows) and len(rows) == 2
         # Simulate the crash window after native fsync but before SQLite settlement.
         runtime.close()
-        with sqlite3.connect(root / 'conversations.db') as db:
+        with closing(sqlite3.connect(root / 'conversations.db')) as db, db:
             db.execute("UPDATE messages SET state='running',response=NULL WHERE id=?", (second['message_id'],))
         before = len(executions)
         runtime = make()
         recovered = wait_for(runtime, second['message_id'])
-        checks['restart_recovery'] = recovered == two and len(executions) == before
+        # Settlement evidence must change on recovery, but no user-visible
+        # result, identity or completion field may change or be re-executed.
+        evidence = recovered.get('evidence', {})
+        checks['restart_recovery'] = (
+            {k: v for k, v in recovered.items() if k != 'evidence'} == {k: v for k, v in two.items() if k != 'evidence'}
+            and evidence.get('state') == 'done' and evidence.get('code') == 'RECEIPT_RECOVERED'
+            and evidence.get('created', 0) >= two['evidence']['created'] and len(executions) == before)
         runtime.close()
         # A missing native receipt must block the session, not resend the input.
         (root / 'native/receipts' / (second['message_id'] + '.json')).unlink()
-        with sqlite3.connect(root / 'conversations.db') as db:
+        with closing(sqlite3.connect(root / 'conversations.db')) as db, db:
             db.execute("UPDATE messages SET state='running',response=NULL WHERE id=?", (second['message_id'],))
         runtime = make()
         unknown = wait_for(runtime, second['message_id'])
