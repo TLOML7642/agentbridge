@@ -33,7 +33,8 @@ def main():
     names = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd=root).decode().split('\0')
     repeated = ['test_agent_tasks', 'test_agent_runtime', 'test_agent_reads', 'test_agent_approvals', 'test_config_invariants',
                 'test_reminders', 'test_agent_services', 'test_manual_preferences', 'test_server_runtime', 'test_assistant',
-                'test_assistant_migration', 'test_experience', 'test_agent_diagnostics', 'test_regression_evidence']
+                'test_assistant_migration', 'test_experience', 'test_agent_diagnostics', 'test_regression_evidence',
+                'test_source_snapshot']
     results = []
     with tempfile.TemporaryDirectory(prefix='ab-background-', dir='/private/tmp') as scratch:
         scratch = Path(scratch)

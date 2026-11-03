@@ -640,6 +640,8 @@ class NativeExecutor:
         payload['root'] = str(self.root / 'native')
         payload['python'] = sys.executable
         payload['runtime_info'] = turn.get('runtime_info', {'evidence': 'runtime release not supplied'})
+        from agent_reads import LEGACY_SCOPE, SOURCE_FILES
+        payload['read_scope'] = {'scope': LEGACY_SCOPE, 'files': sorted(SOURCE_FILES)}
         if not self.file_reads:
             payload['read_mode'] = 'none'
         if self.remote is not None and self.remote.projects.target(turn['subject']['project']) == 'mac':
@@ -648,6 +650,7 @@ class NativeExecutor:
         snapshot = self.snapshots(turn['subject']['project']) if self.snapshots else None
         if snapshot:
             payload.update(read_mode='snapshot', read_root=snapshot[0], source_snapshot=snapshot[1])
+            payload['read_scope'] = {'scope': snapshot[1]['scope'], 'files': sorted(snapshot[1]['files'])}
         if self.services is not None:
             payload['services'] = self.services.issue(turn['subject'], cancel, turn['text'])
         if self.tasks is not None:

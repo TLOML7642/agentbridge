@@ -86,9 +86,12 @@ async function main() {
       + '长文件用 read_text_range：从第1行开始，默认100行、最多200行，下一页使用 next_line 并原样传 expected_version=file_version。'
       + 'file_version 是版本标记，不是整文件 SHA-256；fragment_sha256 仅为片段摘要。文件变化时丢弃旧片段，从第1行重读。'
       + '明确说明已读和未读范围，eof=false 不能冒充读完整文件；list_files 达到100项时可能截断。'
-      + '进展分为已实现、已部署、已验收、待完成；代码定位只引用已读调用关系，建议只输出分析，证据不足直接说明。' });
+      + '进展先结合ROADMAP、CHANGELOG与交付说明，分为已实现、已部署、已验收、待完成；旧记录不能覆盖较新的明确记录。'
+      + '代码定位先字面量搜索，再读取命中附近与必要调用方，引用实际文件和行号，不把命中当完整阅读。'
+      + '修改建议先给结论，再说明问题证据、涉及模块、建议改法和验证方法，只输出分析，不创建动作、不修改文件。证据不足直接说明。' });
   ctx.systemPrompt.section({ name: 'bridge:search-evidence', order: 13.5,
-    text: 'search_text 仅在既有19个审核源码路径内做区分大小写的字面量行搜索，不接受正则或shell。file省略搜索全部审核路径。'
+    text: 'search_text 仅在宿主绑定的审核源码范围内做区分大小写的字面量行搜索，不接受正则或shell。file省略搜索全部审核路径。'
+      + '当前绑定范围：' + JSON.stringify(request.read_scope ?? { scope: 'unknown' })
       + '结果最多50个匹配行及16KiB，每行预览最多300码点，column和excerpt_start_column从1开始。'
       + '匹配不是读完整文件，line_truncated、truncated、scanned_lines、unread_files及不可读文件都必须如实说明。'
       + '每个文件独立版本，不承诺多文件原子快照；用read_text_range取得该文件版本后，再持版本跳读命中附近，变化则重读。'
@@ -115,6 +118,7 @@ async function main() {
     }
     const payload = { ...range, root: readRoot, operation, value, device: directoryIdentity.dev, inode: directoryIdentity.ino,
       reviewed_snapshot: request.read_mode === 'snapshot',
+      source_scope: request.read_scope?.scope,
       private_prefixes: privatePrefixes };
     const result = await new Promise((resolve, reject) => {
       const child = spawn(request.python ?? '/usr/bin/python3', ['-I', path.join(import.meta.dirname, 'agent_reads.py')],
@@ -177,7 +181,7 @@ async function main() {
     execution_location: request.read_mode === 'snapshot' ? 'server assistant; read-only GitHub source snapshot, not runtime facts'
       : request.read_mode === 'remote' ? 'server assistant; fixed Mac executor, live availability not implied'
       : localReads ? 'legacy local executor' : 'server assistant; Mac tools unavailable',
-    search_scope: localReads ? '19 reviewed paths in the registered source pilot only' : 'disabled; no local file tools',
+    search_scope: localReads ? request.read_scope ?? { scope: 'unknown; host binding not supplied' } : null,
     reminders: request.services ? 'explicit user reminder requests take effect immediately; ambiguous time requires clarification' : 'disabled' }));
   if (request.services) {
     const service = (name, parameters, effect = 'read') => tool(name, parameters,

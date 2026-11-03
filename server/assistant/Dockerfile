@@ -1,6 +1,8 @@
 # Build only from an isolated allowlisted context, never the production tree.
 ARG PYTHON_IMAGE
 FROM ${PYTHON_IMAGE} AS runtime
+ARG SOURCE_VERSION=unknown
+ENV AGENTBRIDGE_BUILD_SOURCE_VERSION=${SOURCE_VERSION}
 WORKDIR /app
 COPY runtime/node/ /opt/node/
 COPY runtime/deps/ /opt/deps/

@@ -11,7 +11,11 @@ Mac持久executor-only。认证健康、服务器路由和个人服务已通过�
 
 `assistant.py`使用独立共享监督模块，不导入旧worker。逻辑项目、服务器工作空间和工具目标独立保存；原会话ID、Mac路径来源和聊天头保持。`/agent projects`、`/agent use <名称>`仅操作宿主预先登记的逻辑项目，不能登记任意路径。Mac的`AGENTBRIDGE_WORKER_ROLE=executor_only`会生成私有角色标记，后续普通重启仍禁止聊天写者；恢复combined必须显式迁移回退，不可仅清空环境变量绕过。
 
-`tools/migrate_assistant.py`只接受已退出的旧写者PID，并取得既有写者锁、核对无在途执行，制作新私有目录的SQLite backup/原生会话/收据/偏好副本。导入只写全新演练目录，旧审批归档但不带有效授权，未知服务请求不重放；不切路由、不覆盖生产源、不操作服务器提醒调度器。`tools/source_snapshot.py`只导出经独立GitHub核对提交的原十九路径，清单包含版本、时间及哈希，源码不是运行状态证据。
+`tools/migrate_assistant.py`只接受已退出的旧写者PID，并取得既有写者锁、核对无在途执行，制作新私有目录的SQLite backup/原生会话/收据/偏好副本。导入只写全新演练目录，旧审批归档但不带有效授权，未知服务请求不重放；不切路由、不覆盖生产源、不操作服务器提醒调度器。
+
+本轮A2候选的`tools/source_snapshot.py`只导出经独立GitHub核对的固定提交，默认`--scope agentbridge-source-v1`原19路径；显式`--scope agentbridge-project-v2`补充ROADMAP、assistant主机/项目/执行接口、个人服务、导出工具和服务器交付文档，共27路径。Mac实时读取不变。清单包括scope、版本、时间和逐文件哈希，缺scope旧清单按v1，未知scope/格式拒绝。只发布审核源码，不含配置、聊天、数据库或日志。模型无范围/根目录/执行端参数。
+
+构建时通过`--build-arg SOURCE_VERSION=<完整40位Git提交>`固定运行源码版本，`runtime_status.running_source_version`缺失或非法时为null并标明未知，不从README推断。此值是构建元数据，不是独立部署观察；源码快照版本、进程事实、Mac未探测状态及独立验收分别返回。扩展快照前先生成并保留可读v1/v2的固定回退镜像，旧3834135不可配v2；回退只换兼容代码，保留最新状态。候选未部署。
 
 Dockerfile的`baseline`与`candidate`理解同一追加式状态格式；回退只换代码镜像，绝不恢复旧SQLite。构建context必须另在私有隔离目录准备，`runtime/node`来自已校验Linux归档，`runtime/deps`为锁文件的全新Linux npm ci结果，不复制Mac依赖、配置、聊天或密钥。官方Python基镜像固定为`python@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337`，通过`--build-arg PYTHON_IMAGE=...`传入。两目标构建不等于已验收或已上线。
 

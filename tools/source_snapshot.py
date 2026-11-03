@@ -1,4 +1,4 @@
-"""Export exactly the original 19 reviewed source paths from a verified Git commit."""
+"""Export a named reviewed source scope from an independently verified Git commit."""
 import argparse
 import hashlib
 import json
@@ -10,16 +10,18 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agent_reads import SOURCE_FILES
+from agent_reads import LEGACY_SCOPE, SOURCE_SCOPES
 
 
-def export(repo, commit, destination):
+def export(repo, commit, destination, scope=LEGACY_SCOPE):
     if not re.fullmatch('[0-9a-f]{40}', commit):
         raise ValueError('full independently verified GitHub commit required')
+    if scope not in SOURCE_SCOPES:
+        raise ValueError('unknown source scope')
     destination = Path(destination)
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     hashes = {}
-    for name in sorted(SOURCE_FILES):
+    for name in sorted(SOURCE_SCOPES[scope]):
         mode = subprocess.check_output(['git', 'ls-tree', commit, '--', name], cwd=repo).decode().split()[0]
         if mode != '100644':
             raise ValueError('reviewed source must be a regular Git blob')
@@ -32,7 +34,7 @@ def export(repo, commit, destination):
         target.write_bytes(data)
         target.chmod(0o444)
         hashes[name] = hashlib.sha256(data).hexdigest()
-    manifest = {'format': 1, 'commit': commit, 'created': time.time(), 'files': hashes,
+    manifest = {'format': 1, 'scope': scope, 'commit': commit, 'created': time.time(), 'files': hashes,
                 'evidence_location': 'github_source_snapshot', 'runtime_or_mac_state': False}
     (destination / 'snapshot.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (destination / 'snapshot.json').chmod(0o444)
@@ -48,6 +50,7 @@ if __name__ == '__main__':
     parser.add_argument('--repo', type=Path, required=True)
     parser.add_argument('--verified-commit', required=True)
     parser.add_argument('--destination', type=Path, required=True)
+    parser.add_argument('--scope', choices=sorted(SOURCE_SCOPES), default=LEGACY_SCOPE)
     args = parser.parse_args()
-    result = export(args.repo, args.verified_commit, args.destination)
+    result = export(args.repo, args.verified_commit, args.destination, args.scope)
     print(json.dumps({'commit': result['commit'], 'files': len(result['files']), 'runtime_or_mac_state': False}))

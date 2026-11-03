@@ -19,12 +19,26 @@ SOURCE_FILES = frozenset(('README.md', 'CHANGELOG.md', 'AGENTS.md', 'SECURITY.md
                           'agent_reads.py', 'agent_approvals.py', 'agent_tasks.py', 'agent_actions.py',
                           'agent_task_driver.mjs', 'agent_task_executor.py', 'agent_rpc.mjs',
                           'agent_persona.mjs', 'native_boundary.mjs', 'server/plugins/agentbridge_mac/main.py'))
+LEGACY_SCOPE = 'agentbridge-source-v1'
+PROJECT_SCOPE = 'agentbridge-project-v2'
+SOURCE_SCOPES = {LEGACY_SCOPE: SOURCE_FILES, PROJECT_SCOPE: SOURCE_FILES | frozenset((
+    'ROADMAP.md', 'assistant.py', 'assistant_projects.py', 'assistant_executor.py', 'agent_services.py',
+    'tools/source_snapshot.py', 'server/assistant/README.md', 'server/assistant/TRIAL-READINESS.md'))}
 PAGE_BYTES = 16384
 FILE_BYTES = 1048576
 
 
 class RangeError(ValueError):
     pass
+
+
+def reviewed_files(request):
+    if request.get('reviewed_snapshot') is not True:
+        return SOURCE_FILES
+    scope = request.get('source_scope', LEGACY_SCOPE)
+    if not isinstance(scope, str) or scope not in SOURCE_SCOPES:
+        raise RangeError('unknown reviewed snapshot scope')
+    return SOURCE_SCOPES[scope]
 
 
 def source_allowed(candidate, directory=False):
@@ -114,7 +128,7 @@ def search_file(source, request, candidate, before):
 
 def search_project(request):
     result = {'matches': [], 'files': [], 'unread_files': [], 'truncated': False}
-    names = sorted(SOURCE_FILES)
+    names = sorted(reviewed_files(request))
     for index, name in enumerate(names):
         try:
             page = json.loads(query(dict(request, value=name, expected_version=None)))
@@ -145,14 +159,15 @@ def private_path(value, prefixes):
 
 def query(request):
     root, value = request['root'], request['value']
+    allowed = reviewed_files(request)
     if request.get('reviewed_snapshot') is True:
         # A snapshot never grants /etc/hosts or arbitrary workspace reads.
         candidate = os.path.normpath(os.path.join(root, value))
         relative = os.path.relpath(candidate, root)
         if (os.path.commonpath((candidate, root)) != root or not (
-                relative in SOURCE_FILES or request['operation'] in ('list_files', 'search_text') and
+                relative in allowed or request['operation'] in ('list_files', 'search_text') and
                 (relative == '.' or request['operation'] == 'list_files' and
-                 any(name.startswith(relative + '/') for name in SOURCE_FILES)))):
+                 any(name.startswith(relative + '/') for name in allowed)))):
             raise ValueError('outside reviewed snapshot')
     if (not isinstance(value, str) or not value or len(value) > 4096 or '\0' in value
             or request['operation'] not in ('read_text', 'read_text_range', 'list_files', 'search_text')):
@@ -161,7 +176,7 @@ def query(request):
         literal, count = request.get('literal'), request.get('max_matches', 20)
         if (root != SOURCE_PROJECT and request.get('reviewed_snapshot') is not True or not isinstance(literal, str) or not 1 <= len(literal) <= 200 or '\0' in literal
                 or type(count) is not int or not 1 <= count <= 50
-                or value != '.' and value not in SOURCE_FILES):
+                or value != '.' and value not in allowed):
             raise RangeError('literal search requires the reviewed source project, 1..200 literal characters and 1..50 matches')
         if value == '.':
             if request.get('expected_version') is not None:
@@ -170,7 +185,7 @@ def query(request):
     # Symlinks are deliberately unsupported, including intermediate components.
     # realpath + O_NOFOLLOW on just the leaf would leave parent-swap races.
     candidate = os.path.normpath(os.path.join(root, value))
-    if not source_allowed(candidate, request['operation'] == 'list_files'):
+    if request.get('reviewed_snapshot') is not True and not source_allowed(candidate, request['operation'] == 'list_files'):
         raise ValueError('not reviewed project source')
     if (os.path.commonpath((root, SOURCE_PROJECT)) == SOURCE_PROJECT
             and os.path.commonpath((candidate, SOURCE_PROJECT)) != SOURCE_PROJECT):
@@ -205,11 +220,11 @@ def query(request):
                 for name in sorted(os.listdir(descriptor)):
                     full = os.path.join(candidate, name)
                     relative = os.path.relpath(full, root)
-                    if request.get('reviewed_snapshot') is True and not (relative in SOURCE_FILES or
-                            any(file.startswith(relative + '/') for file in SOURCE_FILES)):
+                    if request.get('reviewed_snapshot') is True and not (relative in allowed or
+                            any(file.startswith(relative + '/') for file in allowed)):
                         continue
                     if (private_path(full, request['private_prefixes'])
-                            or not source_allowed(full, directory=True)):
+                            or request.get('reviewed_snapshot') is not True and not source_allowed(full, directory=True)):
                         continue
                     try:
                         info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)

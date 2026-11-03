@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Opt-in loopback conversation host. No legacy task scheduler or Mac fallback.
+"""Loopback server conversation host with host-bound read/executor targets.
 
-P1 candidate only: one host-selected project/workspace, no file tools or Mac
-actions. Existing AstrBot owns reminders.db, scheduling and message delivery.
+Existing AstrBot owns reminders.db, scheduling and message delivery.
 """
 import hmac
 import json
@@ -53,6 +52,9 @@ class App:
         self.diagnostics = Diagnostics(self.root / 'diagnostics')
         self.secret, self.senders, self.channels = secret, frozenset(senders), frozenset(channels)
         self.boot_id = uuid.uuid4().hex
+        # Captured once from the image build, never inferred from read documents.
+        version = os.environ.get('AGENTBRIDGE_BUILD_SOURCE_VERSION', '')
+        self.source_version = version if re.fullmatch('[a-f0-9]{40}', version) else None
         self.closed = False
         self.workspace = self.root / 'workspace'
         if self.workspace.is_symlink():
@@ -102,13 +104,16 @@ class App:
     def runtime_info(self):
         diagnostic_status = self.diagnostics.maintain()
         return {'host_role': 'server_assistant', 'assistant_boot_id': self.boot_id,
+                'running_source_version': self.source_version,
+                'running_source_version_evidence': 'image build metadata' if self.source_version else 'unknown; not supplied at build',
                 'diagnostics': diagnostic_status,
                 'assistant_runtime': 'running', 'mac_status': 'not_probed',
                 'file_reads': 'host-bound snapshot or fixed executor only; current project determines tools',
                 'mac_actions': ('fixed executor; availability not asserted; no offline queue' if self.executor
                                 else 'unavailable; requests are not queued'),
                 'profile_projection': 'server only; no desktop preset installed or synchronized',
-                'deployment_status': 'candidate process only; no production or phone acceptance evidence'}
+                'deployment_status': 'process running; production rollout and independent acceptance not asserted',
+                'independent_acceptance': 'not supplied; no phone receipt evidence'}
 
     @staticmethod
     def profile_result(result):
