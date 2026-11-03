@@ -57,6 +57,7 @@ export function installToolBoundary(ctx, {
   requestApproval,
   consumeApproval,
   allowServiceIntent,
+  observe = () => {},
   clock = () => ({ wall: Date.now(), monotonic: performance.now() }),
 } = {}) {
   const epoch = randomUUID();
@@ -68,6 +69,11 @@ export function installToolBoundary(ctx, {
   const usedApprovals = new Set();
   let sealed = false;
   let closed = false;
+
+  function denied(error) {
+    // Diagnostics must never change a fail-closed policy into an exception.
+    try { observe('guard', 'DENIED', error); } catch {}
+  }
 
   function revoke() {
     closed = true;
@@ -177,7 +183,8 @@ export function installToolBoundary(ctx, {
       valid(record, exec);
       record.state = 'granted';
       return { kind: 'allow' };
-    } catch {
+    } catch (error) {
+      denied(error);
       return { kind: 'deny', reason: 'AGENTBRIDGE_BOUNDARY_DENIED' };
     }
   });
@@ -190,7 +197,7 @@ export function installToolBoundary(ctx, {
       sealExecution(record, exec);
       record.guarded = true;
       return undefined;
-    } catch { return 'AGENTBRIDGE_BOUNDARY_DENIED'; }
+    } catch (error) { denied(error); return 'AGENTBRIDGE_BOUNDARY_DENIED'; }
   });
 
   return Object.freeze({

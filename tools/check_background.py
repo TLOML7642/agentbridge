@@ -11,6 +11,8 @@ import sys
 import tempfile
 import time
 
+from regression_evidence import preserve_interrupted
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -31,7 +33,7 @@ def main():
     names = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd=root).decode().split('\0')
     repeated = ['test_agent_tasks', 'test_agent_runtime', 'test_agent_reads', 'test_agent_approvals', 'test_config_invariants',
                 'test_reminders', 'test_agent_services', 'test_manual_preferences', 'test_server_runtime', 'test_assistant',
-                'test_assistant_migration', 'test_experience']
+                'test_assistant_migration', 'test_experience', 'test_agent_diagnostics', 'test_regression_evidence']
     results = []
     with tempfile.TemporaryDirectory(prefix='ab-background-', dir='/private/tmp') as scratch:
         scratch = Path(scratch)
@@ -50,26 +52,38 @@ def main():
             shutil.copyfile(file, target)
             hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
         (report / 'source-hashes.json').write_text(json.dumps(hashes, indent=2, sort_keys=True) + '\n')
+        (report / 'scene.json').write_text(json.dumps({'scratch': str(scratch), 'source': str(source),
+            'home': str(home), 'runtime': str(runtime), 'repeated_modules': repeated,
+            'evidence': 'synthetic only; private failures retained until manual cleanup'}, indent=2) + '\n')
         # Keep only the small environment required for local synthetic tests.
         env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(home), 'TMPDIR': str(scratch),
                'AGENTBRIDGE_BASE': str(runtime), 'AGENTBRIDGE_AGENT_MESSAGES': '0', 'AGENTBRIDGE_AGENT_TASKS': '0',
                'AGENTBRIDGE_AGENT_LEARNING': '0', 'AGENTBRIDGE_TEST_NATIVE_NODE': str(args.node),
                'AGENTBRIDGE_TEST_NATIVE_PACKAGES': str(args.packages), 'ELECTRON_RUN_AS_NODE': '1'}
         for index in range(1 if args.modules else args.rounds + 1):
-            modules = args.modules or (['discover', '-p', 'test_*.py'] if index == 0 else repeated)
-            command = [sys.executable, '-B', '-m', 'unittest', *modules]
+            modules = args.modules or (['discover'] if index == 0 else repeated)
+            command = [sys.executable, '-B', 'tools/regression_evidence.py',
+                       str(report / f'evidence-{index:02d}'), *modules]
             started = time.monotonic()
-            result = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, timeout=300)
-            output = result.stdout + result.stderr
+            try:
+                result = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, timeout=300)
+                output, exit_code = result.stdout + result.stderr, result.returncode
+            except subprocess.TimeoutExpired as error:
+                output = (error.stdout or b'').decode(errors='replace') + (error.stderr or b'').decode(errors='replace')
+                output += '\nREGRESSION_SUBPROCESS_TIMEOUT\n'
+                exit_code = 124
             (report / f'round-{index:02d}.log').write_text(output)
-            count = re.search(r'Ran (\d+) tests? in ', output)
-            clean = result.returncode == 0 and count is not None and not any(
+            counts = re.findall(r'^Ran (\d+) tests? in ', output, re.MULTILINE)
+            count = int(counts[-1]) if counts else None
+            clean = exit_code == 0 and count is not None and not any(
                 marker in output for marker in ('Traceback', 'ResourceWarning', 'Exception in thread', 'skipped='))
-            results.append({'round': index, 'tests': int(count[1]) if count else None, 'exit': result.returncode,
+            results.append({'round': index, 'tests': count, 'exit': exit_code,
                             'clean': clean, 'seconds': round(time.monotonic() - started, 3)})
             (report / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
             print(json.dumps(results[-1]), flush=True)
             if not clean:
+                preserve_interrupted(report / f'evidence-{index:02d}')
+                shutil.copytree(source, report / 'failed-source')
                 return 1
     return 0
 

@@ -13,6 +13,7 @@ import uuid
 from agent_approvals import ApprovalAuthority, canonical, fingerprint
 from agent_runtime import AgentError, required
 from agent_actions import prepare
+from agent_diagnostics import Diagnostics
 
 
 TOOLS = {'create_text': {'path', 'text'}, 'make_directory': {'path'},
@@ -40,6 +41,7 @@ class TaskRuntime:
         self.stop, self.wake = threading.Event(), threading.Event()
         self.uncertain = threading.Event()
         self.cancels, self.capabilities = {}, {}
+        self.diagnostics = Diagnostics(self.root / 'diagnostics')
         self.approvals = ApprovalAuthority(self.root / 'approval', tools=TOOLS, enabled=enabled)
         try:
             with self.db() as db:
@@ -87,14 +89,33 @@ class TaskRuntime:
             class Handler(socketserver.StreamRequestHandler):
                 def handle(self):
                     self.connection.settimeout(5)
+                    started = time.monotonic()
+                    correlation, state, code, error = '', None, 'OK', None
                     try:
                         line = self.rfile.readline(65537)
                         if len(line) > 65536 or not line.endswith(b'\n'):
                             raise ValueError('invalid frame')
-                        result = owner.rpc(json.loads(line))
-                    except Exception:
+                        payload = json.loads(line)
+                        # Derive identity only from the authenticated host capability.
+                        with owner.lock:
+                            cap = owner.capabilities.get(payload.get('capability')) if isinstance(payload, dict) else None
+                            correlation = cap['subject']['attempt'] if cap else ''
+                        result = owner.rpc(payload)
+                        state = result.get('state')
+                    except Exception as exc:
+                        error = exc
+                        code = ('DB_BUSY' if isinstance(exc, sqlite3.OperationalError) and
+                                (getattr(exc, 'sqlite_errorcode', 0) & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) else
+                                'TIMEOUT' if isinstance(exc, TimeoutError) else
+                                'AUTH_FAIL' if isinstance(exc, AgentError) and exc.code == 'AUTH_FAIL' else
+                                'DENIED' if isinstance(exc, AgentError) else 'UNKNOWN')
                         result = {'ok': False, 'code': 'TASK_RPC_DENIED'}
-                    self.wfile.write((canonical(result) + '\n').encode())
+                    owner.diagnostics.emit('rpc', correlation, code, state, error,
+                                           (time.monotonic() - started) * 1000)
+                    try:
+                        self.wfile.write((canonical(result) + '\n').encode())
+                    except OSError as exc:
+                        owner.diagnostics.emit('rpc', correlation, 'CLOSED', exception=exc)
 
             self.server = Server(self.socket_path, Handler)
             os.chmod(self.socket_path, 0o600)
@@ -364,6 +385,7 @@ class TaskRuntime:
                 db.execute('UPDATE tasks SET state=?,result=? WHERE id=?', (state, canonical(result) if result else '', row['id']))
                 self._event(db, row, 'terminal', {'state': state, 'result': result})
                 self.cancels.pop(row['id'], None)
+            self.diagnostics.emit('terminal', row['id'], 'OK', state)
 
     def close(self):
         with self.close_lock:

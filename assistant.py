@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from agent_runtime import AgentError, AgentRuntime, NativeExecutor, required
 from agent_services import ServiceQueue
 from assistant_projects import Projects
+from agent_diagnostics import Diagnostics
 
 
 CONTROL_FIELDS = {
@@ -49,6 +50,7 @@ class App:
         self.root = root.resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
+        self.diagnostics = Diagnostics(self.root / 'diagnostics')
         self.secret, self.senders, self.channels = secret, frozenset(senders), frozenset(channels)
         self.boot_id = uuid.uuid4().hex
         self.closed = False
@@ -98,7 +100,9 @@ class App:
             raise
 
     def runtime_info(self):
+        diagnostic_status = self.diagnostics.maintain()
         return {'host_role': 'server_assistant', 'assistant_boot_id': self.boot_id,
+                'diagnostics': diagnostic_status,
                 'assistant_runtime': 'running', 'mac_status': 'not_probed',
                 'file_reads': 'host-bound snapshot or fixed executor only; current project determines tools',
                 'mac_actions': ('fixed executor; availability not asserted; no offline queue' if self.executor

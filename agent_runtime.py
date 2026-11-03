@@ -613,6 +613,8 @@ class NativeExecutor:
         self.file_reads = file_reads
         self.remote = remote
         self.snapshots = snapshots
+        from agent_diagnostics import Diagnostics
+        self.diagnostics = Diagnostics(self.root.parent / 'diagnostics')
 
     def recover(self, turn):
         if not re.fullmatch(r'[a-f0-9]{32}', turn['id']):
@@ -652,6 +654,9 @@ class NativeExecutor:
             payload['task_events'] = turn.get('task_events', [])
             if self.tasks.can_submit(turn['subject']['project']):
                 payload['broker'] = self.tasks.issue('chat', turn['subject'], cancel=cancel)
+        for key in ('broker', 'remote_reads', 'services'):
+            if payload.get(key):
+                payload[key] = {**payload[key], 'diagnostics': str(self.diagnostics.root), 'correlation': turn['id']}
         source = Path(__file__).with_name('agent_driver.mjs')
         node = os.environ.get('AGENTBRIDGE_AGENT_NODE', str(Path.home() / '.deepseek-harness/bin/node'))
         request = self.root / (turn['id'] + '.request.json')
@@ -663,13 +668,18 @@ class NativeExecutor:
         try:
             from process_supervisor import ProcessStartError
             try:
+                self.diagnostics.emit('executor', turn['id'], 'START')
                 result = self.run_task(command, cwd=turn['subject']['cwd'], timeout=120,
                                        cancel_check=cancel.is_set)
+                code = ('CANCELLED' if result.get('cancelled') else 'TIMEOUT' if result.get('timed_out') else
+                        'OK' if result.get('exit_code') == 0 else 'UNKNOWN')
+                self.diagnostics.emit('executor', turn['id'], code, process=result)
             except ProcessStartError:
                 raise AgentError('NOT_STARTED', '后端进程未启动，无自动重试') from None
             if result.get('cancelled') and result.get('group_stopped'):
                 raise AgentError('CANCELLED', '执行器已停止')
             recovered = self.recover(turn)
+            self.diagnostics.emit('receipt', turn['id'], 'OK' if recovered is not None else 'RECEIPT_MISSING')
             if recovered is not None and result.get('group_stopped', True):
                 return recovered
             if result.get('exit_code') != 0 or result.get('timed_out') or result.get('out_truncated'):

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import shutil
 import subprocess
 import sys
@@ -613,6 +614,73 @@ class NativeTaskTests(unittest.TestCase):
         self.assertEqual(value['result']['reason'], 'approval_expired')
         self.assertEqual(value['result']['approval_state'], 'expired')
         self.assertFalse((workspace / 'result.txt').exists())
+
+    def test_approval_rpc_exception_preserves_unknown_reason_without_consuming(self):
+        runtime, workspace, _executor, subject, task, approval = self.native()
+        with mock.patch.object(runtime.approvals, 'request', side_effect=TimeoutError('synthetic private detail')), \
+                mock.patch.object(runtime.approvals, 'consume', wraps=runtime.approvals.consume) as consumed:
+            value = self.terminal(runtime, subject, task, 'denied')
+            consumed.assert_not_called()
+        self.assertEqual(value['result']['reason'], 'approval_unavailable')
+        self.assertNotIn('approval_state', value['result'])
+        self.assertFalse((workspace / 'result.txt').exists())
+        events = [json.loads(line) for file in runtime.diagnostics.root.glob('*.jsonl')
+                  for line in file.read_text().splitlines()]
+        self.assertTrue(any(e['stage'] == 'rpc' and e['code'] == 'TIMEOUT' and
+                            e['exception_type'] == 'TimeoutError' and e['correlation'] == task['task_id'] for e in events))
+        self.assertNotIn('synthetic private detail', json.dumps(events))
+
+    def test_database_lock_causes_rpc_timeout_not_fabricated_expiry(self):
+        runtime, workspace, _executor, subject, task, approval = self.native()
+        # The real SQLite lock outlives the unchanged five-second RPC deadline.
+        # Release on the native timeout evidence, not on a guessed sleep budget.
+        db = sqlite3.connect(runtime.approvals.path)
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            runtime.approvals.clock = lambda: approval['expires'] + 1
+            deadline = time.monotonic() + 9
+            timeout_seen = False
+            while time.monotonic() < deadline:
+                events = [json.loads(line) for file in runtime.diagnostics.root.glob('*.jsonl')
+                          for line in file.read_text().splitlines()]
+                timeout_seen = any(e['stage'] == 'native_rpc' and e['code'] == 'TIMEOUT' for e in events)
+                if timeout_seen:
+                    break
+                time.sleep(.02)
+            self.assertTrue(timeout_seen, 'native timeout diagnostic missing')
+        finally:
+            db.rollback()
+            db.close()
+        value = self.terminal(runtime, subject, task, 'denied')
+        self.assertEqual(value['result']['reason'], 'approval_unavailable')
+        self.assertNotIn('approval_state', value['result'])
+        self.assertFalse((workspace / 'result.txt').exists())
+        state = runtime.approvals.inspect(subject['sender'], subject['channel'], 'original', 'p',
+                                          approval['approval_id'])['state']
+        self.assertEqual(state, 'expired')
+
+    def test_disconnected_approval_rpc_does_not_invent_expiry_or_replay(self):
+        runtime, workspace, _executor, subject, task, approval = self.native()
+
+        def disconnect(handler):
+            handler.rfile.readline(65537)
+            handler.connection.shutdown(socket.SHUT_RDWR)
+
+        with mock.patch.object(runtime.server.RequestHandlerClass, 'handle', disconnect), \
+                mock.patch.object(runtime.approvals, 'consume', wraps=runtime.approvals.consume) as consumed:
+            value = self.terminal(runtime, subject, task, 'denied')
+            consumed.assert_not_called()
+        self.assertEqual(value['result']['reason'], 'approval_unavailable')
+        self.assertNotIn('approval_state', value['result'])
+        self.assertFalse((workspace / 'result.txt').exists())
+        events = [json.loads(line) for file in runtime.diagnostics.root.glob('*.jsonl')
+                  for line in file.read_text().splitlines()]
+        self.assertTrue(any(e['stage'] == 'native_rpc' and e['code'] == 'CLOSED' for e in events))
+        terminal = [event for event in runtime.events(subject['sender'], subject['channel'], 'original', 'p')['events']
+                    if event['kind'] == 'terminal']
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]['body']['result'], value['result'])
+
 
     def test_denial_reason_survives_receipt_recovery_without_rerun(self):
         runtime, workspace, executor, subject, task, approval = self.native()

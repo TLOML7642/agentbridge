@@ -20,6 +20,7 @@
 !/agent_rpc.mjs
 !/agent_task_driver.mjs
 !/agent_task_executor.py
+!/agent_diagnostics.py
 !/test_*.py
 !/tools/
 /tools/*

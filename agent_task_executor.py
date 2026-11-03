@@ -6,6 +6,7 @@ import stat
 import sys
 
 from agent_runtime import AgentError
+from agent_diagnostics import Diagnostics
 
 
 class NativeTaskExecutor:
@@ -13,6 +14,7 @@ class NativeTaskExecutor:
         self.root = Path(root)
         self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
         self.run_task, self.identity, self.settle, self.redact = run_task, identity, settle, redact
+        self.diagnostics = Diagnostics(self.root.parent / 'diagnostics')
 
     def receipt(self, task):
         try:
@@ -50,6 +52,7 @@ class NativeTaskExecutor:
         private = self.root.parent.parent
         payload = {key: task[key] for key in ('id', 'session', 'subject', 'digest', 'tool', 'broker')}
         payload.update(root=str(self.root), python=sys.executable, arguments=json.loads(task['arguments']),
+                       broker={**task['broker'], 'diagnostics': str(self.diagnostics.root), 'correlation': task['id']},
                        private_prefixes=[str(private), *[str(private.parent / name) for name in ('control', 'logs', 'audit')]])
         request = self.root / (task['id'] + '.request.json')
         descriptor = os.open(request, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -65,14 +68,20 @@ class NativeTaskExecutor:
             task['register_executor'](pgid, identity)
 
         try:
+            self.diagnostics.emit('executor', task['id'], 'START')
             result = self.run_task(command, cwd=task['cwd'], timeout=300, on_start=registered, cancel_check=cancel.is_set)
+            code = ('CANCELLED' if result.get('cancelled') else 'TIMEOUT' if result.get('timed_out') else
+                    'OK' if result.get('exit_code') == 0 else 'UNKNOWN')
+            self.diagnostics.emit('executor', task['id'], code, process=result)
             if result.get('cancelled') and result.get('group_stopped'):
                 raise AgentError('CANCELLED', '后台执行器已停止；已发生的副作用不撤销')
             if not result.get('group_stopped', False):
                 raise AgentError('TASK_UNCERTAIN', '后台执行器停止状态未知')
             receipt = self.receipt(task)
             if receipt is None:
+                self.diagnostics.emit('receipt', task['id'], 'RECEIPT_MISSING')
                 raise AgentError('TASK_UNCERTAIN', '后台动作未返回匹配的持久完成收据')
+            self.diagnostics.emit('receipt', task['id'], 'OK', receipt.get('completion'))
             return receipt
         finally:
             request.unlink(missing_ok=True)

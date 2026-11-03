@@ -8,7 +8,7 @@ import os from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { installToolBoundary } from './native_boundary.mjs';
-import { rpc } from './agent_rpc.mjs';
+import { rpc, diagnostic } from './agent_rpc.mjs';
 
 process.umask(0o077);
 let ctx, handle, boundary, timer;
@@ -77,6 +77,7 @@ async function main() {
   new Tools(ctx, { mode: 'native' }); new Sessions(ctx); new Agents(ctx); new Llm(ctx);
   new Loop(ctx, { agents: [], maxParallelToolCalls: 1 });
   boundary = installToolBoundary(ctx, { writesEnabled: true,
+    observe: (stage, code, error) => diagnostic(request.broker, stage, code, null, error),
     requestApproval: async (envelope, signal) => {
       approvalRequest = envelope;
       while (true) {
