@@ -34,7 +34,7 @@ def main():
     repeated = ['test_agent_tasks', 'test_agent_runtime', 'test_agent_reads', 'test_agent_approvals', 'test_config_invariants',
                 'test_reminders', 'test_agent_services', 'test_manual_preferences', 'test_server_runtime', 'test_assistant',
                 'test_assistant_migration', 'test_experience', 'test_agent_diagnostics', 'test_regression_evidence',
-                'test_source_snapshot']
+                'test_source_snapshot', 'test_answer_quality']
     results = []
     with tempfile.TemporaryDirectory(prefix='ab-background-', dir='/private/tmp') as scratch:
         scratch = Path(scratch)
