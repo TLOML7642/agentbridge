@@ -210,10 +210,18 @@ class SnapshotTests(unittest.TestCase):
             self.assertTrue(receipt['completed'])
             path = next((self.root / 'native-test/native/sessions').glob('*/' + session + '/session.jsonl'))
             events = [json.loads(line) for line in path.read_text().splitlines()]
+            header = next(e['data']['header'] for e in events if e['type'] == 'request/header')
+            self.assertIn('源码导航，仅为定位线索，不能代替实际搜索/读取', header['system'])
             calls = [e['data'] for e in events if e['type'] == 'tool/call']
             self.assertEqual([(c['name'], json.loads(c['arguments'])) for c in calls], [(name, arguments)])
             message = next(e['data']['message'] for e in events if e['type'] == 'tool/result')['content'][0]
             self.assertFalse(message.get('isError', False), message)
+            if name == 'read_text_range':
+                raw = json.loads(message['content'][0]['text'])
+                self.assertEqual(raw['fragment_sha256'], hashlib.sha256(raw['text'].encode()).hexdigest())
+                numbered = message['content'][1]['text']
+                self.assertIn('宿主行号视图', numbered)
+                self.assertIn(str(raw['start_line']) + ': ' + raw['text'].splitlines()[0], numbered)
             return json.loads(message['content'][0]['text'])
         with mock.patch.dict(os.environ, {'AGENTBRIDGE_AGENT_NODE': node, 'AGENTBRIDGE_AGENT_PACKAGES': packages}):
             status = tool('runtime_status')

@@ -249,10 +249,14 @@ def query(request):
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError('not regular text')
                 return read_range(source, request, candidate, info)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 16384:
+            if not stat.S_ISREG(info.st_mode):
                 raise ValueError('not small regular text')
+            if info.st_size > 16384:
+                raise RangeError('text exceeds 16 KiB; use read_text_range with a bounded line range')
             data = source.read(16385)
-            if len(data) > 16384 or b'\0' in data:
+            if len(data) > 16384:
+                raise RangeError('text exceeds 16 KiB; use read_text_range with a bounded line range')
+            if b'\0' in data:
                 raise ValueError('not small regular text')
             text = data.decode('utf-8')
             return json.dumps(dict(text=text, sha256=hashlib.sha256(data).hexdigest(),

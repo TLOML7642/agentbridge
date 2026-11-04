@@ -169,6 +169,50 @@ class NativeReplyTests(unittest.TestCase):
                 self.assertEqual(result.stdout, '')
                 self.assertEqual(next(e for e in events if e['type'] == 'turn/end')['data']['reason']['kind'], 'max-tokens')
 
+    def test_read_only_budget_withdraws_tools_before_the_hard_limit(self):
+        marker = 'if (request.syntheticTool && generated++ === 0)'
+        self.assertEqual(self.original.count(marker), 1)
+        self.driver.write_text(self.original.replace(marker,
+            'if (request.syntheticTool && options.tools?.length && generated++ < 8)')
+            .replace("id: 'synthetic-read',", "id: 'synthetic-read-' + generated,"))
+        for services in (False, True):
+            with self.subTest(services=services):
+                turn = self.turn()
+                root = self.root / turn['id']
+                payload = dict(turn, root=str(root / 'native'), synthetic=True,
+                               syntheticTool={'name': 'runtime_status', 'arguments': {}})
+                if services:
+                    # Never called: runtime_status is local, not a service RPC.
+                    payload['services'] = {'path': str(self.root / 'unused.sock')}
+                request = self.root / 'request.json'
+                request.write_text(json.dumps(payload))
+                result = subprocess.run([self.node, str(self.driver), str(request)], capture_output=True,
+                    text=True, timeout=15, env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root),
+                    'ELECTRON_RUN_AS_NODE': '1', 'AGENTBRIDGE_AGENT_PACKAGES': self.packages})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                events = self.events(root, turn['session'])
+                calls = [e for e in events if e['type'] == 'tool/call']
+                self.assertEqual(len(calls), 8 if services else 6)
+                self.assertEqual({e['data']['name'] for e in calls}, {'runtime_status'})
+                results = [e['data']['message']['content'][0] for e in events if e['type'] == 'tool/result']
+                self.assertEqual(len(results), len(calls))
+                self.assertTrue(all(not result.get('isError') for result in results), results)
+                headers = [e['data']['header'] for e in events if e['type'] == 'request/header']
+                self.assertTrue(headers[0]['tools'])
+                if services:
+                    self.assertTrue(headers[-1]['tools'])
+                    names = {tool['name'] for tool in headers[-1]['tools']}
+                    self.assertIn('preference_draft', names)
+                    self.assertIn('service_result', names)
+                    self.assertFalse(names & {'read_text', 'read_text_range', 'search_text', 'list_files'})
+                    message = next(e['data']['message'] for e in reversed(events) if e['type'] == 'tool/result')
+                    status = json.loads(message['content'][0]['content'][0]['text'])
+                    self.assertFalse(set(status['tools']) & {'read_text', 'read_text_range', 'search_text', 'list_files'})
+                else:
+                    self.assertNotIn('tools', headers[-1])
+                self.assertEqual(next(e for e in events if e['type'] == 'turn/end')['data']['reason']['kind'], 'completed')
+                self.assertTrue(json.loads(result.stdout)['completed'])
+
     def test_output_limit_is_uncertain_and_not_replayed_after_restart(self):
         self.fixture('未完整建议', 'max-tokens')
         calls = []

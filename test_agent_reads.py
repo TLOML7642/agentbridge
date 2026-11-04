@@ -11,6 +11,13 @@ from agent_reads import PAGE_BYTES, SOURCE_FILES, query
 
 
 class ReadTests(unittest.TestCase):
+    def test_large_reviewed_text_explains_range_recovery_without_disclosing_paths(self):
+        (self.workspace / 'large.txt').write_text('line\n' * 4000)
+        with self.assertRaisesRegex(ValueError, 'text exceeds 16 KiB; use read_text_range'):
+            self.query('large.txt', 'read_text')
+        page = self.query('large.txt', 'read_text_range', max_lines=2)
+        self.assertEqual(page['text'], 'line\nline\n')
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='agent-read-test-')
         self.addCleanup(temporary.cleanup)
