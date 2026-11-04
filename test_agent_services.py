@@ -4,6 +4,7 @@ import contextlib
 import json
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import threading
 import unittest
@@ -214,7 +215,7 @@ class ServiceHTTPTests(unittest.TestCase):
 class NativeServiceTests(unittest.TestCase):
     def native(self, root, node, packages, subject, tool, args, driver=None, **extra):
         request = dict(id=subject['attempt'], session=subject['session'], root=str(root / 'a/native'), subject=subject,
-                       text='synthetic direct request', resume=False, synthetic=True,
+                       text='synthetic direct request', resume=False, synthetic=True, python=sys.executable,
                        syntheticTool={'name': tool, 'arguments': args}) | extra
         path = root / 'request.json'
         path.write_text(json.dumps(request))
