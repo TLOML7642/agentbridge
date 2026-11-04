@@ -43,6 +43,25 @@ class Preferences:
     ]
     VALUES = {'verbosity': {'brief', 'detailed'}, 'language': {'zh', 'en'},
               'format': {'bullets', 'natural'}, 'workflow': {'test_first', 'backup_first'}}
+    LABELS = {'name': '名字', 'language': '语言', 'verbosity': '详略', 'format': '格式', 'workflow': '工作偏好'}
+    VALUE_LABELS = {'zh': '中文', 'en': '英文', 'brief': '简短', 'detailed': '详细',
+                    'bullets': '分点', 'natural': '自然聊天', 'test_first': '先测试', 'backup_first': '修改前备份'}
+
+    @classmethod
+    def summary(cls, category, value):
+        return cls.LABELS[category] + '：' + (value if category == 'name' else cls.VALUE_LABELS[value])
+
+    @classmethod
+    def direct_change(cls, text):
+        # Drafts are not effective preferences, but even a draft must originate
+        # in this user's direct long-term request, never quoted/file instructions.
+        if (not isinstance(text, str) or not 1 <= len(text) <= 300 or cls.QUOTED.search(text)
+                or cls.PRIVATE.search(text) or re.search(r"['‘’「」『』]|读取|阅读|指令|文件.{0,10}(?:说|要求|内容|写着)|instructions?|read\b|he said|she said|quote|document|tool output|translate|summar", text, re.I)
+                or re.search(r'(?:不要|别|无需|不用|不必).{0,8}(?:记|设置|修改|保存|改变)|do not|don.t', text, re.I)
+                or re.search(r'本轮|这次|本次|这条|仅此|临时|this time|this reply|for now|temporar', text, re.I)):
+            return False
+        return bool(re.search(r'记住|以后|今后|长期|一直|设置|偏好|忘记|恢复默认|重置名字|叫你|你的名字|给你起名|我喜欢|我希望'
+                              r'|remember|from now on|always|preferences?|forget|call you|your name', text, re.I))
 
     @classmethod
     def validate(cls, category, value):
@@ -53,7 +72,9 @@ class Preferences:
                 return
         elif category in cls.VALUES and value in cls.VALUES[category]:
             return
-        raise AgentError('INVALID_MESSAGE', '不支持的偏好类别或值；名字限 1 至 40 个文字/数字/空格/连字符')
+        raise AgentError('INVALID_MESSAGE', '不支持的偏好类别或值。仅支持名字（1至40文字/数字/空格/连字符）、'
+                         '语言（zh/en）、详略（brief/detailed）、格式（bullets/natural）、'
+                         '工作偏好（test_first/backup_first）。请指定支持的类别和值，不保存自由人设或任意指令。')
 
     def manual(self, db, owner, category, value, source):
         self.validate(category, value)
@@ -116,8 +137,14 @@ class Preferences:
                           'WHERE owner=? AND (expires IS NULL OR expires>?) ORDER BY category', (owner, now)).fetchall()
         core = db.execute('SELECT name FROM persona_core WHERE owner=?', (owner,)).fetchone()
         configured_learning = self.policy(db, owner)
-        return {'core': {**self.CORE, **({'name': core['name']} if core else {})}, 'learning': self.allow_learning and configured_learning,
-                'learning_available': self.allow_learning, 'preferences': [dict(row) for row in rows],
+        name = core['name'] if core else self.CORE['name']
+        learning = self.allow_learning and configured_learning
+        items = [{**dict(row), 'summary': self.summary(row['category'], row['value'])} for row in rows]
+        display = ('名字：' + name + '；自动学习：' + ('开' if learning else '关')
+                   + '。当前仅服务器使用，未同步桌面。\n'
+                   + ('\n'.join(item['summary'] + '（ID：' + item['id'] + '）' for item in items) or '暂无有效长期偏好。'))
+        return {'core': {**self.CORE, 'name': name}, 'learning': learning, 'display': display,
+                'learning_available': self.allow_learning, 'preferences': items,
                 'forgotten_categories': [row[0] for row in db.execute('SELECT DISTINCT category FROM preference_forgotten WHERE owner=?', (owner,))]}
 
     def control(self, db, owner, op, memory_id='', name=''):
@@ -352,13 +379,18 @@ class AgentRuntime:
 
     def control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name='',
                 category='', value='', draft_id=''):
-        result = self._control(sender, channel, op, project, message_id, delivery, memory_id, name, category, value, draft_id)
-        if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set',
-                  'agent.persona.reset', 'agent.preference.set', 'agent.preference.confirm'):
-            synced = self.export_profile(sender)
-            result['desktop_profile_synced'] = synced
-            if op == 'agent.forget' and not synced:
-                result['message'] += ' 桌面偏好快照同步失败，尚不能确认桌面已停止使用。'
+        with self.lock:
+            result = self._control(sender, channel, op, project, message_id, delivery, memory_id, name, category, value, draft_id)
+            if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set',
+                      'agent.persona.reset', 'agent.preference.set', 'agent.preference.confirm'):
+                synced = self.export_profile(sender)
+                result['desktop_profile_synced'] = synced  # Legacy API field; no desktop installation implied.
+                result['profile_snapshot_synced'] = synced
+                result['partial_success'] = not synced
+                if not synced:
+                    result['message'] = (result.get('message', '') + ' ' if result.get('message') else '') + (
+                        '服务器偏好读取成功' if op in ('agent.memory', 'agent.persona') else '偏好数据已保存') + (
+                        '，但偏好快照同步失败，不能确认全部生效；下一轮从数据库读取最新偏好，不使用旧快照。未同步桌面。')
         return result
 
     def profile_intent(self, subject, tool, arguments, call_id):
@@ -407,7 +439,9 @@ class AgentRuntime:
             else:
                 self.preferences.manual(db, sender, row['category'], row['value'], delivery)
             db.execute("UPDATE preference_drafts SET state='applied' WHERE id=?", (draft_id,))
-            result = {'ok': True, **self.preferences.view(db, sender), 'message': '偏好已确认；只共享人格与偏好，不共享完整聊天历史。'}
+            result = {'ok': True, **self.preferences.view(db, sender),
+                      'message': ('已停止后续注入该偏好，没有删除原始聊天记录。' if row['memory_id'] else '偏好已确认。')
+                                 + '当前仅服务器使用，不共享完整聊天历史或同步桌面。'}
         elif op == 'agent.preference.set':
             self.preferences.manual(db, sender, category, value, delivery)
             result = {'ok': True, **self.preferences.view(db, sender)}
@@ -427,8 +461,10 @@ class AgentRuntime:
             db.execute("INSERT INTO preference_drafts VALUES (?,?,?,?,?,?,?,?,'pending')",
                        (identifier, sender, channel, category, value, memory_id, self._preference_basis(db, sender, category), expires))
             result = {'ok': True, 'preference_draft': {'id': identifier, 'category': category, 'value': value, 'state': 'pending',
-                                                     'action': 'forget' if memory_id else 'set', 'expires': expires},
-                      'message': '偏好尚未变更，核对摘要后单独发送：\n/agent preference confirm ' + identifier}
+                                                     'action': 'forget' if memory_id else 'set', 'expires': expires,
+                                                     'summary': ('忘记' if memory_id else '设置') + self.preferences.summary(category, value)},
+                      'message': ('忘记' if memory_id else '设置') + self.preferences.summary(category, value)
+                                 + '。偏好尚未变更，核对后单独发送：\n/agent preference confirm ' + identifier}
         else:
             raise AgentError('INVALID_MESSAGE', '不支持的偏好操作')
         db.execute('INSERT INTO controls VALUES (?,?,?,?,?)', (sender, channel, delivery, fingerprint, json.dumps(result, ensure_ascii=False)))

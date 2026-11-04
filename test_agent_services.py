@@ -278,7 +278,7 @@ class NativeServiceTests(unittest.TestCase):
                 queue = ServiceQueue(root / 'svc', profile=runtime.profile_intent)
                 sid, mid = uuid.uuid4().hex, uuid.uuid4().hex
                 subject = dict(sender='owner', channel='private', conversation=sid, session=sid, project='p', cwd=str(work), attempt=mid)
-                cap = queue.issue(subject, threading.Event())
+                cap = queue.issue(subject, threading.Event(), '记住以后用英文回复')
                 result = self.native(root, node, packages, subject, 'preference_draft', {'category': 'language', 'value': 'en'}, services=cap)
                 draft = result['result']['preference_draft']
                 self.assertEqual(draft['value'], 'en')

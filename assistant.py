@@ -120,8 +120,6 @@ class App:
         if 'desktop_profile_synced' in result:
             result['server_profile_synced'] = result.pop('desktop_profile_synced')
             result['profile_projection'] = 'server_only'
-            if not result['server_profile_synced'] and 'message' in result:
-                result['message'] = '偏好变更已记录，但服务器偏好快照同步未确认；不表示桌面同步。'
         return result
 
     def profile_intent(self, *args):

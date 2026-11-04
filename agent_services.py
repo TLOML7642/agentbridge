@@ -106,7 +106,9 @@ class ServiceQueue:
                                direct_text.strip(), re.I))
                            and not re.search(r'阅读|读取|文档|文件|指令|工具|read\b|instructions?\b',
                                              re.split(r'提醒我|remind me\b', direct_text, maxsplit=1, flags=re.I)[0], re.I))
-            self.capabilities[token] = (dict(subject), cancel, time.monotonic() + 120, cancel_allowed, set_allowed)
+            from agent_runtime import Preferences
+            self.capabilities[token] = (dict(subject), cancel, time.monotonic() + 120, cancel_allowed, set_allowed,
+                                        Preferences.direct_change(direct_text))
             return {'socket': self.socket_path, 'capability': token, 'purpose': 'personal-service'}
 
     def revoke_capability(self, token):
@@ -125,6 +127,8 @@ class ServiceQueue:
             if payload.get('op') == 'profile' and set(payload) == {'op', 'capability', 'call_id', 'tool', 'arguments'}:
                 if self.profile is None:
                     raise AgentError('SERVICE_DISABLED', '显式偏好工具尚未启用')
+                if payload['tool'] != 'preference_view' and not cap[5]:
+                    raise AgentError('AUTH_FAIL', '请直接说明要长期设置或忘记的偏好；临时要求、引用或文件指令不能生成偏好草稿')
                 required(payload['call_id'], 128)
                 result = self.profile(subject, payload['tool'], payload['arguments'], payload['call_id'])
                 return {'ok': True, 'state': 'resolved', 'result': result}

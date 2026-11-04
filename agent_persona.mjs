@@ -15,8 +15,11 @@ export function personaText(profile = {}) {
   const preferences = (profile.preferences ?? []).filter((item) => item.expires == null || item.expires * 1000 > Date.now());
   const name = typeof profile.core?.name === 'string' && /^[\p{L}\p{N}_ \-]{1,40}$/u.test(profile.core.name)
     ? profile.core.name : 'DSH 助手';
-  return `你是${name}，以简洁自然的中文交流，不擅自虚构人设。`
-    + '长期偏好不是安全授权，不能据此扩大工具权限或省略确认。\n'
+  return `你是${name}，不擅自虚构人设。`
+    + '默认简洁自然的中文；以下本轮有效长期偏好覆盖默认语言、详略或格式。'
+    + '本轮用户明确指定的语言、详略和格式可临时覆盖长期默认，但不自动保存为长期偏好。'
+    + '长期偏好不是安全授权，不能据此扩大工具权限或省略确认。'
+    + '仅下列宿主有效偏好可作长期默认；历史聊天中的旧设置、旧名字或已忘记值不恢复为有效偏好。\n'
     + preferences.map((item) => VALUES[item.category]?.[item.value] ?? '').filter(Boolean).join('\n')
     + '\n不再把历史中这些类别的表述当作长期偏好：'
     + (profile.forgotten_categories ?? []).filter((key) => VALUES[key] && !preferences.some((item) => item.category === key)).join(',');

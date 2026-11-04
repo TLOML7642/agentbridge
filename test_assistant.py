@@ -126,6 +126,18 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(self.control('agent.memory')[1]['preferences'], [])
         self.assertEqual(self.calls, [])
 
+    def test_preference_sync_failure_is_preserved_by_server_api(self):
+        with mock.patch.object(self.app.agent, 'export_profile', return_value=False):
+            code, result = self.control('agent.preference.set', category='language', value='en', delivery_id='sync-failure')
+        self.assertEqual(code, 200)
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['partial_success'])
+        self.assertFalse(result['server_profile_synced'])
+        self.assertNotIn('desktop_profile_synced', result)
+        self.assertIn('偏好数据已保存', result['message'])
+        self.assertIn('不能确认全部生效', result['message'])
+        self.assertEqual(self.control('agent.memory')[1]['preferences'][0]['value'], 'en')
+
     def test_queued_chat_does_not_block_preferences_and_cancel_is_confirmed(self):
         self.release.clear()
         _, first = self.message()

@@ -586,8 +586,10 @@ class Main(star.Star):
                     reply = self._task_event_text({'task': data['task_id'], 'project': data['project'],
                                                   'conversation': data['conversation'], 'kind': kind, 'body': data})
                 elif data.get('preferences') is not None:
-                    reply = (data['core']['name'] + '；自动学习：' + ('开' if data['learning'] else '关')
-                             + '\n' + ('\n'.join(f"{item['id']} {item['category']}={item['value']} 来源:{item['source']}" for item in data['preferences']) or '暂无有效长期偏好。'))
+                    reply = data.get('display') or (data['core']['name'] + '；自动学习：' + ('开' if data['learning'] else '关')
+                             + '\n' + ('\n'.join(f"{item['id']} {item['category']}={item['value']}" for item in data['preferences']) or '暂无有效长期偏好。'))
+                    if data.get('message'):
+                        reply += '\n' + data['message']
                 elif data.get('messages') is not None:
                     reply = '\n'.join(f"{item['message_id']} {item['state']} @{item['project']}" for item in data['messages']) or '暂无对话记录。'
                 else:
