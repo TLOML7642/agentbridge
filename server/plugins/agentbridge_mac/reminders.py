@@ -260,5 +260,5 @@ class Reminders:
 
     @staticmethod
     def notification(row):
-        late = f"\n（这条消息晚到了 {row['late_seconds']} 秒。）" if row['late_seconds'] > 0 else ''
+        late = f"\n（这条消息晚到了 {row['late_seconds']} 秒。）" if row['late_seconds'] > 10 else ''
         return row['content'] + late

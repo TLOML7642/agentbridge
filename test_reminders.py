@@ -207,7 +207,7 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(self.store.notification(claim), 'synthetic reminder\n（这条消息晚到了 86400 秒。）')
         self.assertEqual(self.get(old)['reminder']['state'], 'expired')
 
-    def test_short_restart_delay_is_still_disclosed(self):
+    def test_short_restart_delay_does_not_add_a_notice(self):
         row = self.draft()
         self.confirm(row)
         self.store.close()
@@ -215,7 +215,19 @@ class ReminderTests(unittest.TestCase):
         self.store = Reminders(self.root, lambda: self.now)
         self.addCleanup(self.store.close)
         self.store.start_sender()
-        self.assertEqual(self.store.notification(self.store.claim_due()), 'synthetic reminder\n（这条消息晚到了 1 秒。）')
+        claim = self.store.claim_due()
+        self.assertEqual(claim['late_seconds'], 1)
+        self.assertEqual(self.store.notification(claim), 'synthetic reminder')
+
+    def test_notification_discloses_only_delays_over_ten_seconds(self):
+        for seconds in (0, 1, 2, 5, 9, 10, 11, 60, 86400):
+            with self.subTest(seconds=seconds):
+                row = {'content': '打卡', 'late_seconds': seconds}
+                expected = '打卡'
+                if seconds > 10:
+                    expected += f'\n（这条消息晚到了 {seconds} 秒。）'
+                self.assertEqual(self.store.notification(row), expected)
+                self.assertEqual(row, {'content': '打卡', 'late_seconds': seconds})
 
     def test_on_time_notification_is_exact_content_without_management_template(self):
         for content in ('做一次验收', '喝水\n顺便活动一下', '复核原文：提醒 af123 [UTC]'):
@@ -225,9 +237,10 @@ class ReminderTests(unittest.TestCase):
     def test_notification_does_not_mutate_record_or_hide_query_details(self):
         row = self.setting(content='做一次验收')['reminder']
         self.store.start_sender()
-        self.now += 60
+        self.now += 65
         claim = self.store.claim_due()
         snapshot = dict(claim)
+        self.assertEqual(claim['late_seconds'], 5)
         self.assertEqual(self.store.notification(claim), '做一次验收')
         self.assertEqual(claim, snapshot)
         details = self.get(row)['reminder']
