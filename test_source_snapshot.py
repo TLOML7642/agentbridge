@@ -158,6 +158,11 @@ class SnapshotTests(unittest.TestCase):
         self.addCleanup(other.close)
         self.assertIsNone(other.runtime_info()['running_source_version'])
 
+    def test_read_subprocess_keeps_host_home_without_inheriting_credentials(self):
+        driver = Path(__file__).with_name('agent_driver.mjs').read_text()
+        self.assertIn("env: { PATH: '/usr/bin:/bin', HOME: os.homedir() }", driver)
+        self.assertNotIn('env: process.env', driver)
+
     def test_native_tools_use_validated_scope_and_keep_runtime_separate(self):
         from agent_runtime import NativeExecutor
         from process_supervisor import run_task

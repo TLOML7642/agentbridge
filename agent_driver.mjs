@@ -122,7 +122,7 @@ async function main() {
       private_prefixes: privatePrefixes };
     const result = await new Promise((resolve, reject) => {
       const child = spawn(request.python ?? '/usr/bin/python3', ['-I', path.join(import.meta.dirname, 'agent_reads.py')],
-        { stdio: ['pipe', 'pipe', 'ignore'], signal, env: { PATH: '/usr/bin:/bin' } });
+        { stdio: ['pipe', 'pipe', 'ignore'], signal, env: { PATH: '/usr/bin:/bin', HOME: os.homedir() } });
       const output = [];
       let bytes = 0;
       const timeout = setTimeout(() => child.kill('SIGKILL'), 10000);
