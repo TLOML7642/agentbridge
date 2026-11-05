@@ -17,10 +17,10 @@
 
 | 对象 | 官方标签/提交 | 运行时与许可证 | 状态 |
 | --- | --- | --- | --- |
-| DSH 新原版 | [`dsh-v0.2.2-rc.1`](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.1)，`66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db` | npm `@deepseek-ai/dsh@0.2.2-rc.1`，Node >=24.9.0；MIT | 官方 prerelease，无 GitHub 附件；独立服务器容器安装中，未实测通过 |
+| DSH 新原版 | [`dsh-v0.2.2-rc.1`](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.1)，`66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db` | npm `@deepseek-ai/dsh@0.2.2-rc.1`，Node >=24.9.0；MIT | 官方 prerelease，无 GitHub 附件；服务器独立安装654包成功、原版sdk首组合成10项通过，尚无真实30题 |
 | DSH 既有原版 | 已安装 `0.1.1-rc.2` | 既有生产Node24；MIT | 原SDK局部历史诊断不代替原版完整配置30题测试 |
 | AstrBot | [`v4.29.4`](https://github.com/AstrBotDevs/AstrBot/tree/61335414433db721b3f7ecc93f90deafe0a59d78)，`61335414433db721b3f7ecc93f90deafe0a59d78` | Python >=3.12；AGPL-3.0-or-later | 官方源码已保存，原版候选尚未启动 |
-| OpenClaw | [`v2026.10.10`](https://github.com/openclaw/openclaw/tree/7dc3350cb9f08fcf9a0af5c4845a20d5b2f1a8be)，注释标签 `6eef4472c85436c7deb8563248827d7f6d29df67` 指向 `7dc3350cb9f08fcf9a0af5c4845a20d5b2f1a8be` | Node >=24.16.0 <25 或 >=26.1.0；MIT | 官方源码已保存，未安装/启动，官方DeepSeek provider插件版本仍待冻结 |
+| OpenClaw | [`v2026.10.10`](https://github.com/openclaw/openclaw/tree/7dc3350cb9f08fcf9a0af5c4845a20d5b2f1a8be)，注释标签 `6eef4472c85436c7deb8563248827d7f6d29df67` 指向 `7dc3350cb9f08fcf9a0af5c4845a20d5b2f1a8be` | Node >=24.16.0 <25 或 >=26.1.0；MIT | 官方源码已保存，未安装/启动；官方DeepSeek provider插件也冻结2026.10.10，npm元数据已核对 |
 
 本次下载的官方源码归档SHA-256（归档字节而非安装包摘要）：
 
@@ -28,7 +28,12 @@
 - AstrBot：`c40bd0585cdcff423d4b54e6baf589ba3e8f3241c797a988e71680009a38a7d6`。
 - OpenClaw：`53191aa2dde1065a745e6c938b6292fbba297a1d1d8926be2ebb5617b94c3941`。
 
-DSH npm根包官方SRI：`sha512-ijR9UEVYkG15Q/Q79JzvzLBzQOQfc63VLr9n6flpwHPhr5IKn2UxthnSoto/P9l7qGd7pPvI1Ra6TW7LH3oKpg==`。根包摘要不是全部依赖校验，安装锁文件和实际导入仍待核对。
+正式包元数据另核对如下，根包摘要不等于全部依赖审计：
+
+- DSH npm根包SRI：`sha512-ijR9UEVYkG15Q/Q79JzvzLBzQOQfc63VLr9n6flpwHPhr5IKn2UxthnSoto/P9l7qGd7pPvI1Ra6TW7LH3oKpg==`。服务器新安装锁文件SHA-256 `53817b3a1281dc6c2a64470811dd89350b3dbd5fc9cf4beb51d69beaf4a06962`，保存在私有测试目录，未升级原DSH安装。
+- OpenClaw npm根包SRI：`sha512-9HZhzq/Yck3uH3M/iYP7szqoF5JXpXfz0+orhBOKalSH+dj0IC9uWPECkR1vH4lMCytxpHjJKHh9efXRYMJl6w==`。
+- `@openclaw/deepseek-provider@2026.10.10` SRI：`sha512-Cc9H5z/o4e+e7TTTCKZob2usTtWjnNBP9cH5fGvMGpa9LPcr8EFQjGXLL9Tp+QIAAMcNptgg9wvwXVDjNxUMdw==`，冻结源码manifest同版本，声明pluginApi >=2026.10.10。
+- AstrBot PyPI `4.29.4` wheel SHA-256 `189e9b07bff6fb91fe0ebaa3e9273af6b028f190023dcc43cbbbe4d3ec00a5b5`，sdist SHA-256 `a5f67c86998028fcaee7c51c8d3c124e15a4ff7dc0c5d27a8f5e441a61a5b698`。原Python3.12官方镜像内新建独立venv安装中，非生产环境升级。
 
 MIT分发须保留版权及许可文本，第三方依赖按各自声明履约。AstrBot为AGPL，不复制其实现到本MIT仓库；涉及修改版网络服务/分发时须履行相应源码提供义务。进程或插件边界本身不构成许可证兼容性的法律保证，选型后单独审核实际集成与第三方声明。
 
@@ -45,6 +50,7 @@ MIT分发须保留版权及许可文本，第三方依赖按各自声明履约�
 ## 原版配置风险与缺口，尚非采用/淘汰结论
 
 - DSH仍为developer preview，官方声明存在破坏性兼容变化。新SDK提供stdio JSON-RPC、resume、取消和客户端审批入口，但未验证对现有rc.2历史的兼容；不能覆盖或升级正式历史尝试。
+- 新版原生 `deepseek-official` **只支持Messages协议**，默认根 `https://api.deepseek.com/anthropic`，合成实发路径已核对为 `/anthropic/v1/messages`；同Flash标识/4096/high不意味着与现网OpenAI接口相同。官方 `llm-pi-ai` 提供无需改源码的OpenAI-compatible配置入口，正在核对实发参数，尚不能宣称公平同接口对照成立。
 - 新版DSH完整和minimal配置均默认挂载 `session-log-deepseek`，默认向模型请求附加完整未接受会话日志。`DSH_TELEMETRY_MODE=DISABLED`只关闭另一条OTel路径，**不能关闭该日志贡献**。隔离测试通过官方patch将其 `enabled: false`，并用合成后端核对实际请求；测试前不放真实凭据/历史。
 - `sdk-minimal`的官方树默认 `danger-full-access`，且提供持久shell，不满足本项目现有权限边界。不能以“minimal”名称推定更安全；优先测试完整sdk的read-only/审批配置，任何安全配置变化单独注明，不把经修改Agent Loop当原版。
 - AstrBot已有原生工具循环、会话和Agent沙箱，但此时仅源码检查，未证实能直接满足单次硬审批、未知不重放和现有任务完成回填。
@@ -65,6 +71,16 @@ python3 -B tools/prepare_upstream_evaluation.py --report-dir <仓库外全新私
 - 新增工具只准备证据输入，不启动Agent、不替换上游Loop、不注入原长策略、不评分或宣称通过，不部署服务。
 
 ## 逐题/迁移/部署交付状态
+
+### DSH首组断网合成结果
+
+- 原服务器独立容器，固定既有Node24.22.2镜像，非root、1 GiB/1 CPU/pids64、只读根、去cap/no-new-privileges、`--network none`，仅挂新私有测试目录和只读官方npm安装，不挂生产库、凭据或Docker socket，不发布端口。
+- 包装器只提供合成HTTP后端和stdio JSON-RPC，调用官方 `dsh --profile sdk --patch ...`，没有替换上游Agent Loop或移植旧长提示词。配置显式read-only及关闭额外会话日志，OTel关闭，全部使用假密钥。
+- r1启动失败：原生加载器把库复制到默认noexec `/tmp`，加载映射被拒绝。直接只读预编译库可加载；通过官方 `NARB_DISABLE_NATIVE_CACHE=1` 关闭缓存后正常启动，**没有**把tmpfs改exec、加cap或改宿主/生产权限。
+- r2聊天/读取成功，但包装器尝试的apply_patch不在该配置工具表，未真正发起写入，故其“目标不存在”不足以证明写入守卫，不能算权限通过。原结果及原包装器保留。
+- r3改用实际注册的write工具，**10项合成检查通过**：官方握手、三个受理回执、原生读取合成文件及行号、写入确实被调用、原生写入错误、目标不存在、原生turn/end完成、全新进程resume带回旧聊天及工具结果、没有额外session-log字段、实发Flash/4096/high一致。仅为测试自身合成副作用，未执行真实任务。
+- r3原始结果SHA-256 `5b4f1c386ca85c3e724f7fe5854122d6a55a7f13d03a28a9e09cc0da3770d3f6`，包装器SHA-256 `cfcf86821a8fd1502ce24d0ee9bb9fce39a96d3ebf209668052d20487c705617`。本地 `/private/tmp/ab-upstream-20261105/dsh-synthetic-r3.json`，服务器 `/var/tmp/agentbridge-upstream-20261105/dsh-synthetic-r3/`。退出0、无OOM；不是安全穷尽审计、实际模型质量、微信或手机验收。回调审批路径未触发，不能声称一次性审批已通过。
+- 既有公开checkpoint `5e4937b78cdd6553755ae1904e523c0865a9cf05` 已正常推送，随后独立官方ref同SHA确认，补齐此前仅本地8d0b711的说明。该源码备份不代表新方案已部署。
 
 | 门槛 | 本轮实际状态 |
 | --- | --- |
