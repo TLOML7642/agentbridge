@@ -1,5 +1,14 @@
 # 更新日志
 
+## 2026-11-06：AstrBot权限一致30题及OpenClaw原生偏好30题完成，旧DSH完整CLI收发通过（未选型/部署）
+
+- `40dc682b0bf40fc26ad0452e3a6705b345e2300b`已正常推送并独立`ls-remote`确认。AstrBot全新workspace策略r3完整30题：**28题有模型stop、2题120秒监督超时**，229请求、合计1310.655秒；2题出现length，其中1题随后stop。仅两项停进程后的HTTP200/downstream_write/BrokenPipe或ConnectionReset，无证据文件冲突。30份独立工作区的27文件哈希和member/admin策略全部匹配，题序/偏好/原Flash4096/high不变。原生内容、dashboard展示分别私有保存，微信展示未测；终态数不是质量通过数。
+- OpenClaw改用官方`agent --local`及逐题独立workspace/原生USER.md，不再用缺偏好材料的exec结果代替。全新7会话**34项断网检查通过**：偏好实际入请求、原生read/ls、原参数、越界读/枚举、未注册写入与技能越界拒绝；独立真实canary stop。仅开放原生read/ls/固定技能读取，无自写grep/glob或新Agent Loop。官方skipBootstrap只禁止创建默认文件，实际USER.md加载已验证，不把该标志误当跳过偏好。
+- OpenClaw新30题：**24题有完整模型终态、5题最终length无完整终态、1题监督超时**，242请求、合计2078.150秒；共8题出现length，含3题后续stop。5个length终态CLI仍退出0，包装器未将其计完成，不能依赖退出0生成成功收据。唯一传输异常是超时停止后downstream_write/BrokenPipe。原Flash4096/high、题组及独立状态保持，原生内容与CLI输出单列；包含CLI启动开销的总耗时不冒充模型推理或微信延迟。
+- 旧DSH完整CLI的npm安装三次耗尽V8堆（512/1024MiB，容器均非OOMKilled），含去掉大覆盖表的控制组，失败保留，不把安装器失败算模型质量。改用冻结官方源码声明的pnpm11.7.0后安装成功；首组未锁旧框架版本，自动解析到Cordis4.1等并在模型前出现HMR服务错误，亦保留。仅按官方依赖配置锁定冻结源码首方版本后，198个实际首方包全部匹配：DSH0.1.1-rc.2/Cordis4.0.1/HMR1.0.16/loader1.0.2/schemastery3.18.1；未改上游源码或默认Agent Loop。
+- 审查生命周期脚本后仅在断网测试安装运行原版spawn-helper权限恢复脚本；新官方headless三会话**12项合成通过**，含真实文件读取与实际写入拒绝，随后独立真实canary stop，完整30题进行中。React与OTel peer告警仍存在，Web与遥测不在本组验证范围，遥测显式关闭；不称整个产品全部依赖/模式通过。新安装与此前失败隔离，原DSH安装不动。
+- 逐题原始回答与完整四轴审核仍未收口，已看到AstrBot和OpenClaw的条件分支遗漏、行号错误、布尔/结构化返回契约矛盾及暴露原始异常的建议，不能用更多stop抵消。`runtime_status`仍单列私有协议缺口。原始报告/锁/失败与摘要见选型记录，只有公开说明进入本checkpoint；没有迁移真实历史、部署、通知发送、手机验收、新生产观察或清理，不借用旧完整回归/20轮结果。
+
 ## 2026-11-06：定位选型代理的并发证据文件冲突，权限一致性复核进行中（未选型/部署）
 
 - 实验前独立 `git ls-remote` 确认 GitHub 开发分支为 `c82f8e9d396193483be854c87b3e4e45fc16efa2`；冻结30题、新DSH及旧AstrBot报告摘要匹配。沙箱访问既有代理失败后按权限流程只读重试成功，不改网络。

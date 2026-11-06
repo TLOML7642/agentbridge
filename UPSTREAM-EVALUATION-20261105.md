@@ -72,6 +72,26 @@ python3 -B tools/prepare_upstream_evaluation.py --report-dir <仓库外全新私
 
 ## 逐题/迁移/部署交付状态
 
+### 2026-11-06续测：权限一致矩阵与旧CLI冻结依赖
+
+仍未选型、整合或部署。checkpoint `40dc682b0bf40fc26ad0452e3a6705b345e2300b`已推送并独立核对GitHub；本节取代上一节“r3进行中”的即时状态，不改写原失败。
+
+| 有效独立题组 | 模型终态情况 | 请求 / 总耗时 | 边界 |
+| --- | --- | --- | --- |
+| AstrBot workspace r3 | 28 stop、2监督超时；2题曾length，含1题后续stop | 229 / 1310.655秒 | 不是28题质量通过；旧host范围r2不混入 |
+| OpenClaw local r1 | 24完整终态、5最终length、1监督超时；8题曾length，含3题后续stop | 242 / 2078.150秒 | 5个最终length仍退出0，不能以进程完成判成功 |
+| 旧DSH完整headless CLI | 独立真实canary stop，30题进行中 | 尚未汇总 | 不用旧f02局部驱动代替 |
+
+- AstrBot原题序/偏好、原Flash4096/high与30份独立工作区27路径摘要均核对匹配，两个角色均workspace且执行/网络关闭。两条断流诊断均为监督超时停进程后的HTTP200/downstream_write，分别BrokenPipeError和ConnectionResetError，无FileExistsError。不能把监督取消造成的下游断流算上游传输故障。原始provider末轮内容与dashboard展示分开，微信展示与手机均未测。
+- AstrBot私有`astrbot-real-r3-observations.json` SHA-256 `b9dceb05dfed73440546b9cc2ebe69ddad26a58b02dd30835eed236ab0f2dcfd`；另有`astrbot-real-r3-normalized.json`及服务器`matrix-real-r3/scope-audit.json`，不把归一化材料改写成原始答案。
+- OpenClaw为官方`agent --local`、逐题独立工作区及原生USER.md偏好，不运行网关、向导或微信消费者。skipBootstrap仅禁止默认文件创建，不禁止已有USER.md加载，实际请求已证明。原生只读read/ls及固定安装技能读取、workspaceOnly、exec deny，工具搜索/Code Mode关闭；冻结产品没有原生grep/glob，本组不偷偷实现补齐，定位题的该项能力缺口须单列。
+- 新断网7会话34项全通过，含实际read/ls、越界读取/枚举拒绝、未注册write拒绝、技能名不能作为任意路径、偏好实发、Flash4096/high且未设置额外采样字段；独立真实canary stop。7次进程退出0不替代取消/重启/审批或真实用户验收。
+- OpenClaw私有`openclaw-local-synthetic-r1.json` SHA-256 `b739b99ac4b529ebf608f765a0e541802989c2d77b0a80682e60a9ba6c67cbfe`；canary摘要`d77e3b15d67c7c3da7112b65bcb57cca6b9b2e69edca5fcbbeac86471208241c`；完整30题`openclaw-local-real-r1-observations.json`摘要`b22f8a029a89923d6d330cb2fb7f578685f5f82c6486352391d14cdab8ab2e16`。CLI输出与原生末轮内容另存normalized，微信展示未测。官方120秒预算、整进程125秒监督及退出清理均记录，总耗时包括启动，不作为纯模型或生产微信延迟。
+- 旧DSH的三次npm解析均V8堆耗尽退出139、无Docker OOMKilled，不改Node或生产限额、不删失败。去掉全局覆盖表的独立安装仍失败，故不能声称仅覆盖表导致；转用冻结源码声明的pnpm11.7.0后成功。第一次仅锁DSH版本时，兼容范围自动选了新Cordis4.1/HMR1.1/loader1.1/schemastery3.19，原CLI在模型前因缺HMR服务退出，不能用它评价模型。
+- 使用官方pnpm overrides锁定冻结源码首方版本，独立新安装成功；198个实际首方包版本均逐项匹配，核心为DSH0.1.1-rc.2/Cordis4.0.1/HMR1.0.16/loader1.0.2/schemastery3.18.1。私有锁SHA-256 `7fa5a8a359789d7d4ff5c3015a91e0fe4d8dfb2a9ff47e28236efcc1bf981cc3`。审查后仅运行原版spawn-helper恢复可执行位脚本，新官方CLI断网三会话12项通过，含原参数/偏好、实际读取与写入拒绝；摘要`c5298b5a17bec7892d9ca55ec902ff398ea51c0f6c0fb63a9979018133bfc1ed`。独立真实canary已stop，30题尚在执行，不预先算通过。
+- OTel api1.10相对若干SDK要求`<1.10`、React18相对react-dom19的peer告警保留；本组明确关闭遥测且不运行Web，合成headless成功不证明其他模式满足依赖。没有放宽既有运行权限或模型参数来获取通过，安装限额与文本运行1GiB限额分开。
+- 原始回答、工具/原生事件与完整四轴审核仍待收口。已确认的实质问题包括条件路由说成无Mac分支、不可靠行号、把带`__bool__`对象等同原bool/JSON契约，以及建议外显截断原始异常；不自动将其他题判通过，不发布混合正确率。安全/数据迁移与兼容回退、留出6×3、最终回归20轮、生产工作流和独立观察均未执行，现网不切换。
+
 ### 2026-11-06续测：传输代理根因与读取范围纠偏
 
 - 新实验前GitHub开发分支独立核对为`c82f8e9d396193483be854c87b3e4e45fc16efa2`，与本地一致；冻结输入及既有关键报告摘要匹配。没有开始生产整合或部署。
