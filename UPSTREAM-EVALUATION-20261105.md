@@ -72,6 +72,17 @@ python3 -B tools/prepare_upstream_evaluation.py --report-dir <仓库外全新私
 
 ## 逐题/迁移/部署交付状态
 
+### 2026-11-06续测：传输代理根因与读取范围纠偏
+
+- 新实验前GitHub开发分支独立核对为`c82f8e9d396193483be854c87b3e4e45fc16efa2`，与本地一致；冻结输入及既有关键报告摘要匹配。没有开始生产整合或部署。
+- 已确定一个可复现的**测试设施竞态**：旧代理用响应到达时的`len(records)`命名证据文件。标题非流式请求和聊天流并发时使用相同文件名，独占打开失败抛`FileExistsError`，导致下游得到HTTP200但无完整内容。原异常被宽泛`OSError`分支抹成布尔传输错误，因此旧组不足以指认上游或模型缺陷。
+- 独立合成屏障双请求复现`HTTP200 / evidence_open / FileExistsError`；请求到达时固定唯一ID后两路均成功，6项检查通过。原始失败证据私有保留于`ab-relay-collision-115ltsbx`，不改上游Agent Loop。新增公开脱敏诊断辅助类及10项测试，与原7项冻结输入测试共17项通过；首次TMPDIR夹具和沙箱回环失败分别保留。
+- 真实独立canary两题均完成，读取题确实读取同审核LICENSE；5请求均HTTP200、零传输异常，两个主流均有stop和`[DONE]`。私有`astrbot-canary-r2-observations.json`。随后单独重跑完整30题，不与旧组拼接，终态、输出上限、超时及辅助标题请求分开记录，不自动计质量通过。
+- 传输修复r2完整30题已结束：**29题模型stop、1题120秒监督超时**，208请求、1265.760秒；零FileExistsError。唯一传输异常发生在超时停进程时，类型为HTTP200/downstream_write/ConnectionResetError，不能混为上游连接故障。3题出现length，其中2题随后stop；保留所有中间结束原因，不用后续stop抵消上限。私有`astrbot-real-r2-observations.json` SHA-256 `ea58b25384f01696b9cb43eefc1dcef952654ed17c65cc73f27b03b43cf709b6`。
+- 重跑时发现另一个配置缺口：WebChat管理员默认读取范围为host，旧测试只关闭执行和网络，未收紧该范围；实际检索过其他测试会话的同字节源码。因此传输修复组只能用于诊断，**不能当作权限一致的最终对照**。仅用官方`computer_use_local_permissions`把member/admin都设workspace后，全新断网边界**10项通过**，包含实际越界读/grep拒绝；私有`astrbot-scoped-boundary-r3.json` SHA-256 `7f0dc6767bdc362d8dd5d43ac379c70a8330be245a2491dcbad0f504d6313f32`。随后两题独立真实canary均stop，新独立r3完整30题进行中，不先宣称通过。原8项边界结果只证明那些特定读取/写入/执行尝试，不证明跨目录隔离已通过；不改写原结果。
+- 旧DSH官方提交`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`源码归档SHA-256为`b7866b1d0c32c19f1ec72b3a465f9a6e15d0a447617d78f25e9df3d3a2925a72`。完整官方headless CLI和OpenClaw官方`agent --local`、独立workspace/USER.md偏好入口仅准备包装器，尚未运行；不得沿用旧局部驱动或跳过偏好的exec入口结果代替。
+- 所有新原始数据、脚本与失败留仓库外私有测试目录。尚未选择候选；公平题组、完整四轴及留出、迁移/安全回退、生产回归和工作流验收仍未收口，不触发发布或清理。
+
 ### 同Linux真实对照与控制组，尚未选型
 
 - DSH新原版配置路线：保留上游sdk/Agent Loop/默认编码persona，仅以官方配置关闭写入/shell/子Agent/动态插件/自有提醒，读工具为read/glob/grep/working_directory；关闭额外日志、包清单、失败自动重试，`maxTokensAsSuccess=false`。偏好仅设置原detailed/brief，不移植旧长策略。此为**原版安全配置对照**，非未配置默认值或生产整合通过。
