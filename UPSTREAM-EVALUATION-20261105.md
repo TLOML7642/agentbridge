@@ -72,6 +72,32 @@ python3 -B tools/prepare_upstream_evaluation.py --report-dir <仓库外全新私
 
 ## 逐题/迁移/部署交付状态
 
+### 同Linux真实对照与控制组，尚未选型
+
+- DSH新原版配置路线：保留上游sdk/Agent Loop/默认编码persona，仅以官方配置关闭写入/shell/子Agent/动态插件/自有提醒，读工具为read/glob/grep/working_directory；关闭额外日志、包清单、失败自动重试，`maxTokensAsSuccess=false`。偏好仅设置原detailed/brief，不移植旧长策略。此为**原版安全配置对照**，非未配置默认值或生产整合通过。
+- 同接口配置先经断网合成10项及安全收发9项核对；原版pi-ai默认developer角色/store字段导致首套30题全部API422，此组保留为配置失败，不评模型事实。通过官方compat关闭这两字段后，独立真实canary完成，才启动新的完整30题；首套未保留响应正文，不能判定是哪一个单独字段导致422。
+- 正式DSH新原版30题：**20轮模型完成、9轮max-tokens、1轮120秒超时**，192个请求、各题耗时合计1046.302秒，退出2、无OOM。每题原问题/偏好、实际请求、工具/原生事件、完整原回复和结束原因私有保留；30题实发均核对Flash/4096/high/启用thinking。没有扩大输出、反复重跑挑答案或把模型结束当目标verified。
+- 新原版机械格式：routing-2与recommendation-1/2/3分别658/721/584/630字符，超过原150/250明确限制；brief/missing/fields/long-input机械检查通过，不代表事实与证据四轴自动通过。fields缺runtime_status仅记协议缺口。
+- 已人工发现实质问题：routing-2说`_agent_target`只认配置服务器，但已实际读取的shim.py119–120存在ASSISTANT未设时回Mac分支；引用时省略该条件。recommendation-3建议输出“前200字符”未限定安全字段，有异常正文泄露风险，尚未完成完整四轴审核。其余题不据关键词或完成状态自动判通过。
+- `f02fd75`原字节副本同Linux/Node24、原rc.2模块/原官方Chat Completions、同30题/参数：**21轮模型完成、6轮步骤上限错误、3轮max-tokens**。六项步骤错误全部在路由类原题和自然题，原终态均明确`turn step limit reached`。30份原生header均为deepseek-official/deepseek-v4-flash、4096/high；全部公开源码及27路径快照逐字节摘要已验证。首合成夹具误把file参数写为path，修正包装器后真实原生读取通过，原失败保留。
+- f02完成回答有6项明确格式超限，4项原生/可见回复不同（2953/2857/3005/2904字符被原版显示为2400），这属于旧展示层差异，不能把2400可见内容当完整原回答。旧原版CLI另测尚未进行，局部驱动基线不冒称完整DSH原版。
+- 直连控制只测试不需工具的11题（brief/missing/long-input及8材料题）：**7题stop、4题length**，均无工具、原Flash/4096/high，不含生产对话。不把不同系统提示或抽样波动说成因果结论；逐题四轴审核未完成。
+- 传输边界：新DSH配置使用官方`/v1/chat/completions`兼容入口，旧f02与直连控制使用`/chat/completions`；同官方主机/Chat Completions/账户/模型参数，不是逐字节相同URL。该差异保留，不冒称完全相同请求。新版凭据仅在外层固定目标代理内存，Agent只能看到假密钥；旧原驱动使用私有文件只读挂载，二者均不挂生产状态库。
+
+私有逐题报告及SHA-256：
+
+- 新原版：`/private/tmp/ab-upstream-20261105/dsh-real-r2-observations.json`，`c22dca414453b83fbc3f0272175bb7c1ff83b1d64addd273c1f1366b08791e06`。
+- f02：`/private/tmp/ab-upstream-20261105/f02-real-r1-observations.json`，`b560f005960fa4235e5d27ce096bb93552849621433754b74c4df2d59cd92d36`。
+- 直连：`/private/tmp/ab-upstream-20261105/control-real-r1-observations.json`，`29140715b2a71a0bb4a48ea4e76c230fa7f6c407f2f6a87067d146daeee0d69c`。
+- 新版部分机械/人工审核另存`dsh-r2-mechanical-review.json`和`dsh-r2-preliminary-manual-review.json`，未审核轴为pending，不发布整体正确率。
+
+### AstrBot原版安装与首组断网检查
+
+- 范围依赖解析长时间等待，本轮只停唯一测试安装容器，退出137/无OOM；保留失败、缓存及venv。随后在同Python3.12官方镜像的独立venv离线安装校验过的4.29.4wheel，复用既有满足要求依赖；**pip check无缺失依赖，实际模块路径/元数据均4.29.4**，不以no-deps安装本身冒充依赖满足。
+- 原版官方`astrbot init -y`及`astrbot run`，新空数据根、假后端、认证dashboard HTTP API，无生产账号、插件或聊天：两轮聊天、实际历史续接及实发原Flash/4096/high **3项合成通过**，无修改上游源码/Loop。断网、非root、同受限资源，不发布端口。
+- 原生工具在首个非聊天辅助请求未挂载，随后真实聊天请求中包含文件读写、grep、shell/python等；本组只验证收发/续接/参数，**未实际调用读写或验证审批、取消、重启、不重放**。不能把工具表出现或无副作用当权限通过，真实30题尚未执行。
+- 私有结果`/private/tmp/ab-upstream-20261105/astrbot-synthetic-r1.json`；服务器`/var/tmp/agentbridge-upstream-20261105/astrbot/probe-r1/`。现有生产4.29.3及原微信消费者未动。
+
 ### DSH首组断网合成结果
 
 - 原服务器独立容器，固定既有Node24.22.2镜像，非root、1 GiB/1 CPU/pids64、只读根、去cap/no-new-privileges、`--network none`，仅挂新私有测试目录和只读官方npm安装，不挂生产库、凭据或Docker socket，不发布端口。
@@ -85,9 +111,9 @@ python3 -B tools/prepare_upstream_evaluation.py --report-dir <仓库外全新私
 | 门槛 | 本轮实际状态 |
 | --- | --- |
 | 新增冻结工具及相邻回归 | 新工具7项通过；空HOME/临时源码的三模块共32项通过（3.914秒），无跳过/资源警告；实际准备r2通过。不是模型测试 |
-| 三候选原版合成隔离与真实30题 | 未完成 |
-| 官方Flash无工具直连控制组 | 未执行 |
-| f02fd75同Linux运行时对照 | 输入已冻结，未执行 |
+| 三候选原版合成隔离与真实30题 | 新DSH已做30题；AstrBot首组收发合成3项通过但未做真实30题；OpenClaw及旧DSH CLI未执行 |
+| 官方Flash无工具直连控制组 | 11题已执行，7stop/4length，四轴审核待完成 |
+| f02fd75同Linux运行时对照 | 30题已执行，21完成/6步骤错误/3max-tokens，不等于质量通过 |
 | 四轴逐题审核/留出6×3 | 未执行 |
 | 采用理由/必要薄适配/重复模块合并 | 尚无依据，不提前选择 |
 | 历史、偏好、提醒、未决状态迁移对账 | 未执行，真实数据未修改 |
