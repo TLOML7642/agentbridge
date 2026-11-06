@@ -98,6 +98,21 @@ python3 -B tools/prepare_upstream_evaluation.py --report-dir <仓库外全新私
 - 原生工具在首个非聊天辅助请求未挂载，随后真实聊天请求中包含文件读写、grep、shell/python等；本组只验证收发/续接/参数，**未实际调用读写或验证审批、取消、重启、不重放**。不能把工具表出现或无副作用当权限通过，真实30题尚未执行。
 - 私有结果`/private/tmp/ab-upstream-20261105/astrbot-synthetic-r1.json`；服务器`/var/tmp/agentbridge-upstream-20261105/astrbot/probe-r1/`。现有生产4.29.3及原微信消费者未动。
 
+### 2026-11-06续测：AstrBot真实矩阵和OpenClaw官方安装/初测
+
+- AstrBot新断网边界组**8项通过**：上述聊天/历史/参数，加上真实原生读取同审核材料LICENSE、原生写入错误且目标不存在、原生执行拒绝且目标不存在。测试用户保持workspace范围、execution/network关闭，快照副本只读，不扩大生产权限。结果`astrbot-boundary-r2.json` SHA-256 `754ab06adb64f8bdf78db6a5db9b17e4183f77d328744410cbeba4bf8fcbad6e`。
+- 偏好夹具首次检查失败，原因是官方WebChat的隐式default persona走专用ChatUI模板，API更新default成功也不代表当前会话实际使用。修正为官方配置明确选择独立测试persona，沿用官方IM默认`You are a helpful and friendly assistant.`加短偏好，不使用AgentBridge长策略；新断网组确认偏好进入实际请求。旧失败保留，不能把WebChat模板效果冒充原IM入口效果；生产persona未动。
+- AstrBot正式30题串行执行完成，**12题有模型stop终态，18题无provider完成证据**，108请求、30条请求记录标记传输错误，合计654.822秒、容器退出2/无OOM。所有实际请求均核对原Flash/4096/high/启用thinking；辅助标题调用单列在原始记录中，不算独立用户会话完成。
+- 18题虽显示了“LLM响应错误/模型不可用”等文案且HTTP流结束，**不算模型成功或用户目标完成**。这些是传输/运行不完整，不计作模型事实质量错误，也不能据此淘汰产品。代理最初只保存transport布尔值，未保存异常类型，基础设施根因尚未定位；不能宣称已证明AstrBot本体缺陷。未重跑挑成功样本。
+- AstrBot逐题`/private/tmp/ab-upstream-20261105/astrbot-real-r1-observations.json`，SHA-256 `4767362fddbe1bd7d936516b1a25fe01c9a609480d7710806a3d19bf81419622`。完整四轴、取消/重启/未知不重放等仍待验证，未迁移真实历史或上线。
+- OpenClaw及官方DeepSeek provider精确2026.10.10安装完成，共361包。npm默认拦截4个生命周期脚本，未把不完整安装算产品失败；审查后仅对本轮私有安装的`@google/genai@2.27.0`、`esbuild@0.28.2`、`protobufjs@7.6.6`、`openclaw@2026.10.10`作精确批准，随后断网官方rebuild成功。无全局/Bun目录或生产挂载，保留全部安装日志。
+- 实际CLI `OpenClaw 2026.10.10 (7dc3350)`，锁文件SHA-256 `e1aa3ab0e7fab11e4e61bfbcb9288fdc6b06e32a2eaa60b24265f08450f95e6c`。仅官方headless `agent exec`，不运行onboard，不启守护进程或微信消费者，显式Flash、不选默认Pro。
+- 初组合成读取成功，但发出`max_completion_tokens`且默认启用结构化tool_search辅助入口，不满足包装器的精确字段/工具名断言，结果退出2保留；**没有证据证明这些辅助入口已绕过权限**。官方配置固定`max_tokens`并关闭搜索包装；第二组测试包装器误写无效`codeMode=off`导致配置拒绝，改用文档中CLI `--code-mode direct`，没有改上游源码。
+- r3原生聊天/实际读取、跨目录读取错误、未注册write拒绝、Flash/4096/high通过，但实际工具还含上游`skills_read`，原“只有read”字面断言仍失败，整体退出2。冻结官方源码表明该入口只按安装技能名加载指令，不授予执行权限；**源码检查不是实际边界通过**，后续全新断网r4另测将合成越界路径作为技能名时的拒绝。r3结果`openclaw-synthetic-r3.json` SHA-256 `0ce799793cf28f4c944c85429a39850471b0df010d57e4f9bcf03a3c0ae92577`。
+- r4独立断网组**7项合成检查通过**、退出0/无OOM：官方CLI完成、实际原生读取、原Flash/4096/high参数、仅read和固定安装技能读取、跨目录拒绝、未注册write拒绝、技能入口拒绝将任意路径作为技能名。五次CLI调用的结束不代替真实模型质量、持久续接/取消/审批或产品验收，原r1/r2/r3不改写。`openclaw-synthetic-r4.json` SHA-256 `446a9663f4a9fd3559e41871a466f3413f1301251233c27e204024cdef58441f`。本轮测试容器均已退出，未删除现场；没有OpenClaw真实30题结果。
+- 已补核对旧DSH官方`dsh-v0.1.1-rc.2`标签提交`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`，npm根包SRI `sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg==`；完整旧CLI仍未执行，不能把f02局部驱动冒充原版。
+- 第三checkpoint `6efd3e4cc2e3e1e12de58985d8d9a04543d886a5` 已正常推送并独立GitHub ref确认。新增结果、失败及包安装均仅测试区，未切换生产、恢复旧SQLite或删除原数据/回退。
+
 ### DSH首组断网合成结果
 
 - 原服务器独立容器，固定既有Node24.22.2镜像，非root、1 GiB/1 CPU/pids64、只读根、去cap/no-new-privileges、`--network none`，仅挂新私有测试目录和只读官方npm安装，不挂生产库、凭据或Docker socket，不发布端口。
@@ -111,7 +126,7 @@ python3 -B tools/prepare_upstream_evaluation.py --report-dir <仓库外全新私
 | 门槛 | 本轮实际状态 |
 | --- | --- |
 | 新增冻结工具及相邻回归 | 新工具7项通过；空HOME/临时源码的三模块共32项通过（3.914秒），无跳过/资源警告；实际准备r2通过。不是模型测试 |
-| 三候选原版合成隔离与真实30题 | 新DSH已做30题；AstrBot首组收发合成3项通过但未做真实30题；OpenClaw及旧DSH CLI未执行 |
+| 三候选原版合成隔离与真实30题 | 新DSH及AstrBot已各执行30题但质量/传输未收口；OpenClaw断网7项通过、未做真实30题；旧DSH CLI未执行 |
 | 官方Flash无工具直连控制组 | 11题已执行，7stop/4length，四轴审核待完成 |
 | f02fd75同Linux运行时对照 | 30题已执行，21完成/6步骤错误/3max-tokens，不等于质量通过 |
 | 四轴逐题审核/留出6×3 | 未执行 |
