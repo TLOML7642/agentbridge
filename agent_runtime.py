@@ -159,6 +159,7 @@ class Preferences:
             self.manual(db, owner, 'name', name, 'persona-command')
         if op == 'agent.persona.reset':
             db.execute('DELETE FROM persona_core WHERE owner=?', (owner,))
+            db.execute('INSERT OR IGNORE INTO character_name_lock VALUES (?)', (owner,))
         if op == 'agent.forget':
             row = db.execute('SELECT * FROM preferences WHERE id=? AND owner=?', (memory_id, owner)).fetchone()
             if row is None:

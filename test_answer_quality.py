@@ -238,15 +238,10 @@ class NativeReplyTests(unittest.TestCase):
         self.assertFalse(list((self.root / 'timeout-agent').glob('native/receipts/*.json')))
 
     def scripted_turn(self, calls, values=None, services=False, broker=False):
-        marker = 'if (request.syntheticTool && generated++ === 0)'
-        self.assertEqual(self.original.count(marker), 1)
-        self.driver.write_text(self.original.replace(marker,
-            'const script = ' + json.dumps(calls) + ';\n'
-            '      if (generated < script.length && (request.syntheticTool = script[generated++]))')
-            .replace("id: 'synthetic-read',", "id: 'synthetic-read-' + generated,"))
+        self.driver.write_text(self.original)
         turn = self.turn()
         root = self.root / turn['id']
-        payload = dict(turn, root=str(root / 'native'), synthetic=True)
+        payload = dict(turn, root=str(root / 'native'), synthetic=True, syntheticTools=calls)
         socket_path = self.root / 'rpc.sock'
         responses = iter(values or [])
         requests = []

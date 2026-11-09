@@ -199,6 +199,9 @@ class CharacterTests(unittest.TestCase):
         with self.assertRaises(AgentError): self.self_update()
         self.control('autonomy.off')
         self.assertFalse(self.control()['personality']['autonomous'])
+        self.control('autonomy.on')
+        self.runtime.control('owner', 'wechat-private', 'agent.persona.reset', 'p', delivery='reset-name')
+        with self.assertRaises(AgentError): self.self_update()
 
     def test_user_can_undo_self_name_and_trait_but_not_overwrite_later_corrections(self):
         self.control('autonomy.on')
