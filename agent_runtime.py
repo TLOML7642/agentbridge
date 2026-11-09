@@ -81,6 +81,7 @@ class Preferences:
         self.validate(category, value)
         if category == 'name':
             db.execute('INSERT OR REPLACE INTO persona_core VALUES (?,?)', (owner, value))
+            db.execute('INSERT OR IGNORE INTO character_name_lock VALUES (?)', (owner,))
             return
         prior = db.execute('SELECT id FROM preferences WHERE owner=? AND category=?', (owner, category)).fetchone()
         db.execute('INSERT INTO preferences VALUES (?,?,?,?,?,?,?,NULL) '
@@ -391,7 +392,8 @@ class AgentRuntime:
             result = self._control(sender, channel, op, project, message_id, delivery, memory_id, name, category, value, draft_id)
             if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set',
                       'agent.persona.reset', 'agent.preference.set', 'agent.preference.confirm',
-                      'agent.personality.on', 'agent.personality.off', 'agent.personality.set', 'agent.personality.forget'):
+                      'agent.personality.on', 'agent.personality.off', 'agent.personality.set', 'agent.personality.forget',
+                      'agent.personality.autonomy.on', 'agent.personality.autonomy.off', 'agent.personality.undo'):
                 synced = self.export_profile(sender)
                 result['desktop_profile_synced'] = synced  # Legacy API field; no desktop installation implied.
                 result['profile_snapshot_synced'] = synced
@@ -403,6 +405,26 @@ class AgentRuntime:
         return result
 
     def profile_intent(self, subject, tool, arguments, call_id):
+        if tool in ('persona_update', 'personality_update'):
+            delivery = 'self-profile-' + hashlib.sha256(json.dumps([subject['attempt'], call_id]).encode()).hexdigest()
+            digest = hashlib.sha256(json.dumps([tool, arguments], sort_keys=True).encode()).hexdigest()
+            with self.db() as db:
+                if not self.preferences.character.autonomous(db, subject['sender']):
+                    raise AgentError('AUTH_FAIL', '名字和性格自主管理未开启或已经冻结')
+                old = db.execute('SELECT * FROM controls WHERE sender=? AND channel=? AND delivery=?',
+                                 (subject['sender'], subject['channel'], delivery)).fetchone()
+                if old and old['digest'] != digest:
+                    raise AgentError('DELIVERY_CONFLICT', '自主修改调用已经绑定其他内容')
+                if old is None:
+                    try:
+                        self.preferences.character.self_update(db, subject['sender'], subject['attempt'], tool, arguments)
+                    except ValueError as error:
+                        raise AgentError('INVALID_MESSAGE', str(error)) from None
+                    db.execute('INSERT INTO controls VALUES (?,?,?,?,?)', (subject['sender'], subject['channel'], delivery, digest, '{}'))
+                result = {'ok': True, 'reused': old is not None, **self.preferences.view(db, subject['sender'])}
+            result['profile_snapshot_synced'] = self.export_profile(subject['sender'])
+            result['partial_success'] = not result['profile_snapshot_synced']
+            return result
         allowed = {'preference_view': set(), 'preference_draft': {'category', 'value'},
                    'preference_forget_draft': {'memory_id'}}
         if tool not in allowed or not isinstance(arguments, dict) or set(arguments) != allowed[tool]:
@@ -493,7 +515,8 @@ class AgentRuntime:
     def _control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name='',
                  category='', value='', draft_id=''):
         required(sender); required(channel)
-        if op in ('agent.personality', 'agent.personality.on', 'agent.personality.off', 'agent.personality.set', 'agent.personality.forget'):
+        if op in ('agent.personality', 'agent.personality.on', 'agent.personality.off', 'agent.personality.set', 'agent.personality.forget',
+                  'agent.personality.autonomy.on', 'agent.personality.autonomy.off', 'agent.personality.undo'):
             with self.db() as db:
                 character = self.preferences.character
                 if op == 'agent.personality':
@@ -505,12 +528,21 @@ class AgentRuntime:
                     raise AgentError('DELIVERY_CONFLICT', '性格控制投递已绑定其他变更')
                 if old is None:
                     try:
-                        if op.endswith('.on'):
+                        if op == 'agent.personality.undo':
+                            character.undo(db, sender, memory_id, 'control:' + delivery)
+                        elif op in ('agent.personality.autonomy.on', 'agent.personality.autonomy.off'):
+                            if op.endswith('.on') and not character.available:
+                                raise ValueError('性格成长尚未由宿主启用')
+                            db.execute('INSERT OR REPLACE INTO character_autonomy VALUES (?,?)', (sender, int(op.endswith('.on'))))
+                            if op.endswith('.on'):
+                                db.execute('DELETE FROM character_name_lock WHERE owner=?', (sender,))
+                        elif op.endswith('.on'):
                             if not character.available:
                                 raise ValueError('性格成长尚未由宿主启用')
                             db.execute('INSERT OR REPLACE INTO character_policy VALUES (?,1)', (sender,))
                         elif op.endswith('.off'):
                             db.execute('INSERT OR REPLACE INTO character_policy VALUES (?,0)', (sender,))
+                            db.execute('INSERT OR REPLACE INTO character_autonomy VALUES (?,0)', (sender,))
                         elif op.endswith('.set'):
                             character.set(db, sender, value, 'control:' + delivery, memory_id)
                         else:

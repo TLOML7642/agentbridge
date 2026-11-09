@@ -1316,6 +1316,8 @@ CONTROL_FIELDS = {
     "agent.preference.confirm": {"draft_id", "delivery_id"},
     'agent.personality': set(),
     'agent.personality.on': {'delivery_id'}, 'agent.personality.off': {'delivery_id'},
+    'agent.personality.autonomy.on': {'delivery_id'}, 'agent.personality.autonomy.off': {'delivery_id'},
+    'agent.personality.undo': {'memory_id', 'delivery_id'},
     'agent.personality.set': {'value', 'memory_id', 'delivery_id'},
     'agent.personality.forget': {'memory_id', 'delivery_id'},
     "agent.tasks": {"task_id"}, "agent.task.cancel": {"task_id", "delivery_id"},

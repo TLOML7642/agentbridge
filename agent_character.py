@@ -30,6 +30,12 @@ class CharacterMemory:
               owner TEXT,digest TEXT,source TEXT,created REAL,PRIMARY KEY(owner,digest,source));
             CREATE TABLE IF NOT EXISTS character_changes(
               seq INTEGER PRIMARY KEY AUTOINCREMENT,owner TEXT,trait TEXT,kind TEXT,source TEXT,created REAL);
+            CREATE TABLE IF NOT EXISTS character_autonomy(owner TEXT PRIMARY KEY,enabled INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS character_name_lock(owner TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS character_self_changes(
+              seq INTEGER PRIMARY KEY AUTOINCREMENT,owner TEXT,attempt TEXT,kind TEXT,before TEXT,after TEXT,
+              reason TEXT,created REAL,UNIQUE(owner,attempt));
+            CREATE TABLE IF NOT EXISTS character_self_undos(owner TEXT,seq INTEGER,PRIMARY KEY(owner,seq));
         ''')
 
     @classmethod
@@ -48,6 +54,49 @@ class CharacterMemory:
     def enabled(self, db, owner):
         row = db.execute('SELECT learning FROM character_policy WHERE owner=?', (owner,)).fetchone()
         return bool(self.available and row and row['learning'])
+
+    def autonomous(self, db, owner):
+        row = db.execute('SELECT enabled FROM character_autonomy WHERE owner=?', (owner,)).fetchone()
+        return bool(self.available and row and row['enabled'])
+
+    def self_update(self, db, owner, attempt, tool, arguments):
+        if not self.autonomous(db, owner):
+            raise ValueError('名字和性格自主管理未开启或已经冻结')
+        if not isinstance(arguments, dict) or set(arguments) != ({'name', 'reason'} if tool == 'persona_update' else {'description', 'memory_id', 'reason'}):
+            raise ValueError('自主修改字段无效')
+        reason = self.clean(arguments['reason'])
+        if len(reason) > 80:
+            raise ValueError('自主修改原因最多80字')
+        if db.execute('SELECT 1 FROM character_self_changes WHERE owner=? AND attempt=?', (owner, attempt)).fetchone():
+            raise ValueError('本轮已经自主修改一次，不重复或循环修改')
+        now = time.time()
+        if tool == 'persona_update':
+            name = arguments['name']
+            if not isinstance(name, str) or not re.fullmatch(r'[\w\-]{1,20}', name) or self.PRIVATE.search(name) or self.UNSAFE.search(name):
+                raise ValueError('自主名字限1至20个文字/字母/数字/下划线/连字符，不能是操作指令')
+            if db.execute('SELECT 1 FROM character_name_lock WHERE owner=?', (owner,)).fetchone():
+                raise ValueError('用户已指定名字，自主修改不能覆盖；需用户重新开启自主管理')
+            if db.execute("SELECT 1 FROM character_self_changes WHERE owner=? AND kind='name' AND created>?", (owner, now - 86400)).fetchone():
+                raise ValueError('自主改名每天最多一次，避免反复改名')
+            row = db.execute('SELECT name FROM persona_core WHERE owner=?', (owner,)).fetchone()
+            before, after = row['name'] if row else 'DSH 助手', name
+            db.execute('INSERT OR REPLACE INTO persona_core VALUES (?,?)', (owner, name))
+            kind = 'name'
+        else:
+            identifier = arguments['memory_id']
+            if not isinstance(identifier, str) or len(identifier) > 32:
+                raise ValueError('性格ID无效')
+            row = db.execute("SELECT * FROM character_traits WHERE owner=? AND id=? AND state='active'", (owner, identifier)).fetchone() if identifier else None
+            if identifier and (not row or row['manual']):
+                raise ValueError('自主修改不能覆盖或忘记用户手动设置的性格')
+            before, after = row['text'] if row else '', self.clean(arguments['description'])
+            self.set(db, owner, after, 'assistant:' + attempt, identifier, manual=False, now=now)
+            active = db.execute("SELECT id FROM character_traits WHERE owner=? AND digest=? AND state='active'", (owner, self.digest(after))).fetchone()
+            if not active:
+                raise ValueError('用户已忘记该性格，自主修改不能恢复')
+            kind = 'trait'
+        db.execute('INSERT INTO character_self_changes(owner,attempt,kind,before,after,reason,created) VALUES (?,?,?,?,?,?,?)',
+                   (owner, attempt, kind, before, after, reason, now))
 
     @staticmethod
     def change(db, owner, trait, kind, source, now):
@@ -92,6 +141,31 @@ class CharacterMemory:
         db.execute("UPDATE character_traits SET state='forgotten',updated=? WHERE id=? AND owner=?", (now, identifier, owner))
         self.change(db, owner, identifier, 'forgotten', source, now)
 
+    def undo(self, db, owner, sequence, source):
+        if not isinstance(sequence, str) or not re.fullmatch(r'[1-9][0-9]{0,12}', sequence):
+            raise ValueError('自主变化编号无效')
+        row = db.execute('SELECT * FROM character_self_changes WHERE owner=? AND seq=?', (owner, int(sequence))).fetchone()
+        if not row:
+            raise ValueError('自主变化不存在或不属于你')
+        if db.execute('SELECT 1 FROM character_self_undos WHERE owner=? AND seq=?', (owner, row['seq'])).fetchone():
+            return
+        if row['kind'] == 'name':
+            current = db.execute('SELECT name FROM persona_core WHERE owner=?', (owner,)).fetchone()
+            if not current or current['name'] != row['after']:
+                raise ValueError('名字已有后续变化，不用旧记录覆盖当前名字')
+            db.execute('INSERT OR REPLACE INTO persona_core VALUES (?,?)', (owner, row['before']))
+            db.execute('INSERT OR IGNORE INTO character_name_lock VALUES (?)', (owner,))
+        else:
+            trait = db.execute("SELECT * FROM character_traits WHERE owner=? AND digest=? AND state='active'",
+                               (owner, self.digest(row['after']))).fetchone()
+            if not trait or trait['manual']:
+                raise ValueError('性格已被纠正或忘记，不用旧记录覆盖当前性格')
+            if row['before']:
+                self.set(db, owner, row['before'], source, trait['id'])
+            else:
+                self.forget(db, owner, trait['id'], source)
+        db.execute('INSERT INTO character_self_undos VALUES (?,?)', (owner, row['seq']))
+
     def learn(self, db, owner, source, text):
         if not self.enabled(db, owner) or not isinstance(text, str) or len(text) > 180:
             return
@@ -124,13 +198,24 @@ class CharacterMemory:
             self.set(db, owner, description, source, manual=False, now=now)
 
     def view(self, db, owner):
-        traits = [dict(row) for row in db.execute("SELECT id,text,manual,updated FROM character_traits "
+        traits = [dict(row) for row in db.execute("SELECT id,text,manual,updated,source FROM character_traits "
                   "WHERE owner=? AND state='active' ORDER BY created,id LIMIT 12", (owner,))]
         for trait in traits:
+            trait['origin'] = 'assistant' if trait.pop('source').startswith('assistant:') else 'user'
             digest = self.digest(trait['text'])
             trait['evidence_count'] = db.execute('SELECT count(*) FROM character_evidence WHERE owner=? AND digest=?', (owner, digest)).fetchone()[0]
         changes = [dict(row) for row in db.execute('SELECT seq,trait,kind,created FROM character_changes WHERE owner=? ORDER BY seq DESC LIMIT 12', (owner,))]
         learning = self.enabled(db, owner)
-        display = '性格成长：' + ('开' if learning else '关') + '；只影响相处和表达，不改变权限。\n'
-        display += '\n'.join(f"{row['text']}（ID：{row['id']}；" + ('手动设置' if row['manual'] else f"用户反馈{row['evidence_count']}次") + '）' for row in traits) or '暂无性格记忆。'
-        return {'available': self.available, 'learning': learning, 'traits': traits, 'changes': changes, 'display': display}
+        autonomous = self.autonomous(db, owner)
+        self_changes = [dict(row) for row in db.execute('SELECT seq,kind,before,after,reason,created FROM character_self_changes '
+                        'WHERE owner=? ORDER BY seq DESC LIMIT 5', (owner,))]
+        name_locked = db.execute('SELECT 1 FROM character_name_lock WHERE owner=?', (owner,)).fetchone() is not None
+        for change in self_changes:
+            change['undone'] = db.execute('SELECT 1 FROM character_self_undos WHERE owner=? AND seq=?', (owner, change['seq'])).fetchone() is not None
+        display = ('性格成长：' + ('开' if learning else '关') + '；名字/性格自主管理：' + ('开' if autonomous else '关')
+                   + ('（名字由用户指定，自主改名已冻结）' if name_locked else '') + '；不改变权限。\n')
+        display += '\n'.join(f"{row['text']}（ID：{row['id']}；" + ('手动设置' if row['manual'] else '助手自主形成' if row['origin'] == 'assistant' else f"用户反馈{row['evidence_count']}次") + '）' for row in traits) or '暂无性格记忆。'
+        if self_changes:
+            display += '\n最近自主变化：\n' + '\n'.join(f"{row['seq']} {'名字' if row['kind'] == 'name' else '性格'}：{row['before'] or '未设置'} → {row['after']}；原因：{row['reason']}" + ('（已撤销）' if row['undone'] else '') for row in self_changes)
+        return {'available': self.available, 'learning': learning, 'autonomous': autonomous, 'name_locked': name_locked,
+                'traits': traits, 'changes': changes, 'self_changes': self_changes, 'display': display}

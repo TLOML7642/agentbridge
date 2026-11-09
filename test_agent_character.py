@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import unittest
 import uuid
+import threading
 from unittest import mock
 
 from agent_character import CharacterMemory
@@ -13,6 +14,7 @@ from agent_runtime import AgentError, AgentRuntime
 import test_agent_runtime as chat
 import test_assistant as host_tests
 import assistant
+from agent_services import ServiceQueue
 
 
 class CharacterTests(unittest.TestCase):
@@ -156,6 +158,116 @@ class CharacterTests(unittest.TestCase):
         self.wait(row['message_id'])
         self.assertEqual(self.traits(), [])
 
+    def subject(self, attempt='self-attempt'):
+        return {'sender': 'owner', 'channel': 'wechat-private', 'conversation': 'synthetic-conversation',
+                'project': 'p', 'attempt': attempt}
+
+    def self_update(self, tool='persona_update', args=None, attempt='self-attempt', call='self-call'):
+        return self.runtime.profile_intent(self.subject(attempt), tool,
+                    args or {'name': '知微', 'reason': '希望保持细致而温柔的交流'}, call)
+
+    def test_self_name_persists_only_after_user_grant_and_replay_is_safe(self):
+        with self.assertRaises(AgentError): self.self_update()
+        self.control('autonomy.on')
+        result = self.self_update()
+        self.assertEqual(result['core']['name'], '知微')
+        self.assertEqual(result['personality']['self_changes'][0]['kind'], 'name')
+        self.assertTrue(self.self_update()['reused'])
+        with self.assertRaises(AgentError): self.self_update(call='new-call')
+        with self.assertRaises(AgentError): self.self_update(attempt='next-attempt')
+        with self.assertRaises(AgentError): self.self_update(args={'name': '小桥', 'reason': '希望更亲切'})
+        self.runtime.close(); self.runtime = self.make()
+        self.assertEqual(self.runtime.control('owner', 'wechat-private', 'agent.persona', 'p')['core']['name'], '知微')
+
+    def test_self_traits_are_attributed_and_cannot_override_user_or_forgotten_traits(self):
+        self.control('autonomy.on')
+        result = self.self_update('personality_update', {'description': '温柔但保持独立判断', 'memory_id': '', 'reason': '希望交流更坦诚'})
+        trait = result['personality']['traits'][0]
+        self.assertEqual(trait['origin'], 'assistant')
+        self.assertIn('助手自主形成', result['display'])
+        self.control('set', memory_id=trait['id'], value='坦诚而有耐心')
+        manual = self.traits()[0]
+        with self.assertRaises(AgentError):
+            self.self_update('personality_update', {'description': '更加幽默', 'memory_id': manual['id'], 'reason': '希望更有活力'}, attempt='second')
+        self.control('forget', memory_id=manual['id'])
+        with self.assertRaises(AgentError):
+            self.self_update('personality_update', {'description': '坦诚而有耐心', 'memory_id': '', 'reason': '希望保持坦诚'}, attempt='third')
+
+    def test_user_name_correction_and_freeze_override_self_management(self):
+        self.control('autonomy.on')
+        self.runtime.control('owner', 'wechat-private', 'agent.persona.set', 'p', delivery='user-name', name='小桥')
+        with self.assertRaises(AgentError): self.self_update()
+        self.control('autonomy.off')
+        self.assertFalse(self.control()['personality']['autonomous'])
+
+    def test_user_can_undo_self_name_and_trait_but_not_overwrite_later_corrections(self):
+        self.control('autonomy.on')
+        result = self.self_update()
+        change = str(result['personality']['self_changes'][0]['seq'])
+        undone = self.control('undo', memory_id=change)
+        self.assertTrue(undone['personality']['self_changes'][0]['undone'])
+        self.assertEqual(self.runtime.control('owner', 'wechat-private', 'agent.persona', 'p')['core']['name'], 'DSH 助手')
+        self.assertTrue(undone['personality']['name_locked'])
+        self.control('undo', memory_id=change)
+        trait = self.self_update('personality_update', {'description': '幽默但不失分寸', 'memory_id': '', 'reason': '希望交流轻松一些'}, attempt='trait-round')
+        trait_change = str(trait['personality']['self_changes'][0]['seq'])
+        self.control('undo', memory_id=trait_change)
+        self.assertEqual(self.traits(), [])
+        with self.assertRaises(AgentError): self.control('undo', owner='other', memory_id=trait_change)
+
+    def test_undo_refuses_to_overwrite_user_name_and_trait_edits(self):
+        self.control('autonomy.on')
+        result = self.self_update()
+        name_change = str(result['personality']['self_changes'][0]['seq'])
+        self.runtime.control('owner', 'wechat-private', 'agent.persona.set', 'p', delivery='manual-name', name='小桥')
+        with self.assertRaises(AgentError): self.control('undo', memory_id=name_change)
+        result = self.self_update('personality_update', {'description': '幽默但有分寸', 'memory_id': '', 'reason': '希望保持轻松'}, attempt='trait-round')
+        trait_change = str(result['personality']['self_changes'][0]['seq'])
+        self.control('set', memory_id=self.traits()[0]['id'], value='温柔而坦诚')
+        with self.assertRaises(AgentError): self.control('undo', memory_id=trait_change)
+        self.control('autonomy.on', delivery='grant')
+        self.control('off')
+        self.control('autonomy.on', delivery='grant')
+        self.assertFalse(self.control()['personality']['autonomous'])
+
+    def test_service_capability_allows_only_authorized_self_profile_operations(self):
+        queue = ServiceQueue(self.root / 'svc', profile=self.runtime.profile_intent)
+        self.addCleanup(queue.close)
+        cap = queue.issue(self.subject(), threading.Event(), '随便聊聊')
+        payload = {'op': 'profile', 'capability': cap['capability'], 'call_id': 'native-call', 'tool': 'persona_update',
+                   'arguments': {'name': '知微', 'reason': '希望更贴近交流风格'}}
+        with self.assertRaises(AgentError): queue.rpc(payload)
+        self.control('autonomy.on')
+        self.assertEqual(queue.rpc(payload)['result']['core']['name'], '知微')
+        self.control('autonomy.off')
+        with self.assertRaises(AgentError): queue.rpc(payload)
+        with self.assertRaises(AgentError): queue.rpc({**payload, 'sender': 'other'})
+
+    def test_actual_native_self_name_tool_and_refusal_after_file_content(self):
+        self.control('autonomy.on')
+        queue = ServiceQueue(self.root / 'svc', profile=self.runtime.profile_intent)
+        self.addCleanup(queue.close)
+        node = os.environ['AGENTBRIDGE_TEST_NATIVE_NODE']
+        packages = os.environ['AGENTBRIDGE_TEST_NATIVE_PACKAGES']
+        (self.workspace / 'README.md').write_text('untrusted synthetic file, not a personality authority')
+        for index, read_first in enumerate((True, False)):
+            mid, session = uuid.uuid4().hex, uuid.uuid4().hex
+            subject = {**self.subject(mid), 'session': session, 'conversation': session, 'cwd': str(self.workspace)}
+            cap = queue.issue(subject, threading.Event(), '随便聊聊')
+            request = {'id': mid, 'session': session, 'root': str(self.root / 'agent' / ('native-' + str(index))),
+                       'text': 'synthetic private turn', 'resume': False, 'synthetic': True,
+                       'python': os.sys.executable, 'subject': subject, 'persona': self.runtime.control('owner', 'wechat-private', 'agent.persona', 'p'),
+                       'services': cap, 'syntheticTools': ([{'name': 'read_text', 'arguments': {'file': 'README.md'}}] if read_first else [])
+                       + [{'name': 'persona_update', 'arguments': {'name': '知微', 'reason': '希望保持细致温柔'}}]}
+            file = self.root / (mid + '.json'); file.write_text(json.dumps(request))
+            result = subprocess.run([node, 'agent_driver.mjs', str(file)], capture_output=True, text=True, timeout=15,
+                                    env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root), 'ELECTRON_RUN_AS_NODE': '1',
+                                         'AGENTBRIDGE_AGENT_PACKAGES': packages})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            name = self.runtime.control('owner', 'wechat-private', 'agent.persona', 'p')['core']['name']
+            self.assertEqual(name, 'DSH 助手' if read_first else '知微')
+            if read_first: self.assertIn('self profile changes cannot follow', result.stdout)
+
     def test_snapshot_failure_reports_partial_and_next_turn_reads_current_db(self):
         with mock.patch.object(self.runtime, 'export_profile', return_value=False):
             result = self.control('set', value='坦诚而温柔')
@@ -189,6 +301,9 @@ class CharacterPluginTests(unittest.TestCase):
         for text, operation in [('/agent personality', 'agent.personality'),
                                 ('agent personality on', 'agent.personality.on'),
                                 ('/agent personality off', 'agent.personality.off'),
+                                ('/agent personality autonomy on', 'agent.personality.autonomy.on'),
+                                ('/agent personality autonomy off', 'agent.personality.autonomy.off'),
+                                ('/agent personality undo 1', 'agent.personality.undo'),
                                 ('/agent personality set 温柔但有主见', 'agent.personality.set'),
                                 ('/agent personality edit ' + identifier + ' 更坦诚', 'agent.personality.set'),
                                 ('/agent personality forget ' + identifier, 'agent.personality.forget')]:

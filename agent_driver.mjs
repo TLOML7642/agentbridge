@@ -73,6 +73,7 @@ async function main() {
   const readEvidence = new Set();
   const warnedEvidence = new Set();
   const pendingNotices = new Set();
+  let untrustedToolRead = Boolean(request.task_events?.length);
   const canonical = (value) => JSON.stringify(value, (_key, item) =>
     item && typeof item === 'object' && !Array.isArray(item)
       ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
@@ -150,7 +151,8 @@ async function main() {
   new Llm(ctx);
   new Persistence(ctx, { root: path.join(request.root, 'sessions'), compression: 'none' });
   new Loop(ctx, { agents: [], maxParallelToolCalls: 1 });
-  const serviceIntents = new Set(['reminder_set', 'reminder_cancel', 'preference_draft', 'preference_forget_draft']);
+  const serviceIntents = new Set(['reminder_set', 'reminder_cancel', 'preference_draft', 'preference_forget_draft',
+    'persona_update', 'personality_update']);
   const boundary = installToolBoundary(ctx, {
     allowServiceIntent: (envelope) => Boolean(request.services) && serviceIntents.has(envelope.tool),
   }); // File writes remain OFF, independently of personal service intents.
@@ -220,6 +222,7 @@ async function main() {
         return blocks;
       } },
       execute: async (args, exec) => {
+        if (fileTools.has(name) || name === 'service_result' || name === 'task_snapshot') untrustedToolRead = true;
         const value = await execute(args, exec);
         if (fileTools.has(name)) {
           const key = evidenceKey(name, args, value);
@@ -280,6 +283,17 @@ async function main() {
       ['preference_forget_draft', { memory_id: { type: 'string', required: true } }, 'service-intent'],
     ]) tool(name, parameters, async (args, exec) => JSON.stringify(await rpc(request.services, 'profile',
       { call_id: exec.callId, tool: name, arguments: args }, exec.signal)), effect);
+    if (request.persona?.personality?.autonomous) {
+      for (const [name, parameters] of [
+        ['persona_update', { name: { type: 'string', required: true }, reason: { type: 'string', required: true } }],
+        ['personality_update', { description: { type: 'string', required: true }, memory_id: { type: 'string', required: true },
+          reason: { type: 'string', required: true } }],
+      ]) tool(name, parameters, async (args, exec) => {
+        assert.equal(untrustedToolRead, false, 'self profile changes cannot follow file/tool content in this turn');
+        return JSON.stringify(await rpc(request.services, 'profile',
+          { call_id: exec.callId, tool: name, arguments: args }, exec.signal));
+      }, 'service-intent');
+    }
   }
   ctx.systemPrompt.section({ name: 'bridge:host-capabilities', order: 14,
     text: '当前项目、可用工具和审批边界由宿主提供，不从README推断。工具列表：' + availableTools.join(',') + (request.broker ? ',submit_task' : '')
@@ -317,18 +331,20 @@ async function main() {
     // Only private synthetic CLI fixtures set this. The worker never forwards
     // arbitrary message fields or environment-selected fake model settings.
     let generated = 0;
+    const syntheticTools = request.syntheticTools ?? (request.syntheticTool ? [request.syntheticTool] : []);
     ctx.on('llm/stream', async function* (options) {
-      if (request.syntheticTool && generated++ === 0) {
+      if (generated < syntheticTools.length) {
+        const syntheticTool = syntheticTools[generated++];
         yield { type: 'block-start', index: 0, blockType: 'tool-call' };
-        yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'synthetic-read',
-          name: request.syntheticTool.name, arguments: JSON.stringify(request.syntheticTool.arguments) } };
+        yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: generated === 1 ? 'synthetic-read' : 'synthetic-read-' + generated,
+          name: syntheticTool.name, arguments: JSON.stringify(syntheticTool.arguments) } };
         yield { type: 'finish', reason: { kind: 'tool-calls' } };
         return;
       }
       const users = options.messages.filter((message) => message.source.kind === 'user');
       const texts = users.map((message) => message.content.filter((block) => block.type === 'text').map((b) => b.text).join(''));
       const text = JSON.stringify({ turns: texts.length, first: texts[0], last: texts.at(-1),
-        ...(request.syntheticTool ? { toolResult: JSON.stringify(options.messages.findLast((message) => message.source.kind === 'tool')) } : {}),
+        ...(syntheticTools.length ? { toolResult: JSON.stringify(options.messages.findLast((message) => message.source.kind === 'tool')) } : {}),
         evidence: options.messages.filter((message) => message.source.kind === 'plugin'
           && message.source.plugin === 'agentbridge-task-events').map((message) => message.content) });
       yield { type: 'block-start', index: 0, blockType: 'text' };

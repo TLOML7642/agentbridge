@@ -127,7 +127,7 @@ class ServiceQueue:
             if payload.get('op') == 'profile' and set(payload) == {'op', 'capability', 'call_id', 'tool', 'arguments'}:
                 if self.profile is None:
                     raise AgentError('SERVICE_DISABLED', '显式偏好工具尚未启用')
-                if payload['tool'] != 'preference_view' and not cap[5]:
+                if payload['tool'] not in ('preference_view', 'persona_update', 'personality_update') and not cap[5]:
                     raise AgentError('AUTH_FAIL', '请直接说明要长期设置或忘记的偏好；临时要求、引用或文件指令不能生成偏好草稿')
                 required(payload['call_id'], 128)
                 result = self.profile(subject, payload['tool'], payload['arguments'], payload['call_id'])
