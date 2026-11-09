@@ -20,6 +20,7 @@ class BudgetTests(unittest.TestCase):
             fixture = root / 'fetch.mjs'
             fixture.write_text('''
 import { appendFile } from 'node:fs/promises';
+Date.now = () => Date.parse('2026-11-09T03:00:00Z');
 globalThis.fetch = async () => {
   await appendFile(process.env.SYNTHETIC_COUNTER, '1\\n');
   if (process.env.SYNTHETIC_HTTP_FAILURE === '1') return new Response('', { status: 402 });
