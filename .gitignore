@@ -12,6 +12,7 @@
 !/agent_runtime.py
 !/agent_services.py
 !/agent_driver.mjs
+!/model_budget.mjs
 !/agent_persona.mjs
 !/agent_approvals.py
 !/agent_reads.py

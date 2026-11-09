@@ -8,6 +8,7 @@ COPY runtime/node/ /opt/node/
 COPY runtime/deps/ /opt/deps/
 COPY assistant.py assistant_projects.py assistant_executor.py agent_runtime.py agent_services.py process_supervisor.py agent_diagnostics.py ./
 COPY agent_driver.mjs agent_persona.mjs agent_rpc.mjs native_boundary.mjs agent_reads.py ./
+COPY model_budget.mjs ./
 COPY tools/check_server_runtime.py ./tools/check_server_runtime.py
 COPY server/assistant/package.json server/assistant/package-lock.json server/assistant/runtime-artifacts.json ./server/assistant/
 ENV PATH=/opt/node/bin:/usr/local/bin:/usr/bin:/bin \

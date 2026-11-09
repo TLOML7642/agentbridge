@@ -351,7 +351,13 @@ async function main() {
     ctx.provide('credentials', { resolve: async (key) => key === ref ? { value: values.get(key), source: 'file' } : undefined });
     const provider = await load('dsh-llm-deepseek');
     stage = 'provider';
-    provider.apply(ctx, { apiKeyEnv: ref, maxTokens: 4096, streamIdleTimeoutMs: 45000 });
+    const budget = process.env.AGENTBRIDGE_PAID_PROBE_LEDGER;
+    if (budget) {
+      const { createBudgetFetch } = await import('./model_budget.mjs');
+      globalThis.fetch = createBudgetFetch(budget);
+    }
+    provider.apply(ctx, { apiKeyEnv: ref, maxTokens: 4096, streamIdleTimeoutMs: 45000,
+      ...(budget ? { retryPolicy: { mode: 'normal', maxRetries: 0 } } : {}) });
   }
   ctx.on('agent/pre-step', async (_payload, next) => {
     if (request.broker) assert.ok(++steps <= 12, 'turn step limit reached');
