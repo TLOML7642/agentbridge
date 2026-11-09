@@ -416,13 +416,15 @@ class AgentRuntime:
                                  (subject['sender'], subject['channel'], delivery)).fetchone()
                 if old and old['digest'] != digest:
                     raise AgentError('DELIVERY_CONFLICT', '自主修改调用已经绑定其他内容')
+                changed = False
                 if old is None:
                     try:
-                        self.preferences.character.self_update(db, subject['sender'], subject['attempt'], tool, arguments)
+                        changed = self.preferences.character.self_update(db, subject['sender'], subject['attempt'], tool, arguments)
                     except ValueError as error:
                         raise AgentError('INVALID_MESSAGE', str(error)) from None
                     db.execute('INSERT INTO controls VALUES (?,?,?,?,?)', (subject['sender'], subject['channel'], delivery, digest, '{}'))
-                result = {'ok': True, 'reused': old is not None, **self.preferences.view(db, subject['sender'])}
+                result = {'ok': True, 'reused': old is not None, 'profile_changed': changed,
+                          **self.preferences.view(db, subject['sender'])}
             result['profile_snapshot_synced'] = self.export_profile(subject['sender'])
             result['partial_success'] = not result['profile_snapshot_synced']
             return result

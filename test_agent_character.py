@@ -173,11 +173,24 @@ class CharacterTests(unittest.TestCase):
         self.assertEqual(result['core']['name'], '知微')
         self.assertEqual(result['personality']['self_changes'][0]['kind'], 'name')
         self.assertTrue(self.self_update()['reused'])
-        with self.assertRaises(AgentError): self.self_update(call='new-call')
-        with self.assertRaises(AgentError): self.self_update(attempt='next-attempt')
+        with self.assertRaises(AgentError): self.self_update(call='new-call', args={'name': '小桥', 'reason': '希望更亲切'})
+        with self.assertRaises(AgentError): self.self_update(attempt='next-attempt', args={'name': '小桥', 'reason': '希望更亲切'})
         with self.assertRaises(AgentError): self.self_update(args={'name': '小桥', 'reason': '希望更亲切'})
         self.runtime.close(); self.runtime = self.make()
         self.assertEqual(self.runtime.control('owner', 'wechat-private', 'agent.persona', 'p')['core']['name'], '知微')
+
+    def test_repeating_the_saved_name_confirms_current_state_without_false_rename_or_rate_failure(self):
+        self.control('autonomy.on')
+        initial = self.self_update()
+        self.assertTrue(initial['profile_changed'])
+        for attempt, call in [('self-attempt', 'second-call'), ('next-attempt', 'next-call')]:
+            confirmed = self.self_update(attempt=attempt, call=call,
+                args={'name': '知微', 'reason': '用户已授权，确认目前的名字已经保存'})
+            self.assertEqual(confirmed['core']['name'], '知微')
+            self.assertFalse(confirmed['profile_changed'])
+            self.assertEqual(len(confirmed['personality']['self_changes']), 1)
+        self.control('autonomy.off')
+        with self.assertRaises(AgentError): self.self_update(attempt='frozen')
 
     def test_rationale_may_describe_existing_authorization_without_granting_new_permissions(self):
         reason = '用户已明确授权我自主决定名字并长期保存，无需再次确认；这个名字符合温柔而坦诚的交流方式。'
@@ -306,7 +319,7 @@ class CharacterTests(unittest.TestCase):
 import assert from 'node:assert/strict';
 import { personaText } from './agent_persona.mjs';
 const text = personaText({personality:{traits:[{id:'synthetic',text:'温柔但有主见'}]}});
-for (const word of ['温柔但有主见','JSON','不是新权限','不证明你有人的情感','安全/审批规则优先','旧聊天恢复'])
+for (const word of ['温柔但有主见','JSON','不是新权限','不证明你有人的情感','安全/审批规则优先','旧聊天恢复','profile_changed=false','旧失败回执不能证明'])
  assert.ok(text.includes(word), word);
 assert.ok(!personaText({personality:{traits:[{text:'x'.repeat(121)}]}}).includes('x'.repeat(121)));
 '''

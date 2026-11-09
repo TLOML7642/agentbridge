@@ -72,8 +72,7 @@ class CharacterMemory:
         reason = ' '.join(unicodedata.normalize('NFKC', raw_reason).split())
         if not 2 <= len(reason) <= 240 or self.PRIVATE.search(reason):
             raise ValueError('自主修改原因须为2至240字，不含敏感信息')
-        if db.execute('SELECT 1 FROM character_self_changes WHERE owner=? AND attempt=?', (owner, attempt)).fetchone():
-            raise ValueError('本轮已经自主修改一次，不重复或循环修改')
+        already_changed = db.execute('SELECT 1 FROM character_self_changes WHERE owner=? AND attempt=?', (owner, attempt)).fetchone() is not None
         now = time.time()
         if tool == 'persona_update':
             name = arguments['name']
@@ -81,13 +80,19 @@ class CharacterMemory:
                 raise ValueError('自主名字限1至20个文字/字母/数字/下划线/连字符，不能是操作指令')
             if db.execute('SELECT 1 FROM character_name_lock WHERE owner=?', (owner,)).fetchone():
                 raise ValueError('用户已指定名字，自主修改不能覆盖；需用户重新开启自主管理')
+            row = db.execute('SELECT name FROM persona_core WHERE owner=?', (owner,)).fetchone()
+            if row and row['name'] == name:
+                return False
+            if already_changed:
+                raise ValueError('本轮已经自主修改一次，不重复或循环修改')
             if db.execute("SELECT 1 FROM character_self_changes WHERE owner=? AND kind='name' AND created>?", (owner, now - 86400)).fetchone():
                 raise ValueError('自主改名每天最多一次，避免反复改名')
-            row = db.execute('SELECT name FROM persona_core WHERE owner=?', (owner,)).fetchone()
             before, after = row['name'] if row else 'DSH 助手', name
             db.execute('INSERT OR REPLACE INTO persona_core VALUES (?,?)', (owner, name))
             kind = 'name'
         else:
+            if already_changed:
+                raise ValueError('本轮已经自主修改一次，不重复或循环修改')
             identifier = arguments['memory_id']
             if not isinstance(identifier, str) or len(identifier) > 32:
                 raise ValueError('性格ID无效')
@@ -102,6 +107,7 @@ class CharacterMemory:
             kind = 'trait'
         db.execute('INSERT INTO character_self_changes(owner,attempt,kind,before,after,reason,created) VALUES (?,?,?,?,?,?,?)',
                    (owner, attempt, kind, before, after, reason, now))
+        return True
 
     @staticmethod
     def change(db, owner, trait, kind, source, now):
