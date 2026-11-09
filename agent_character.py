@@ -64,9 +64,14 @@ class CharacterMemory:
             raise ValueError('名字和性格自主管理未开启或已经冻结')
         if not isinstance(arguments, dict) or set(arguments) != ({'name', 'reason'} if tool == 'persona_update' else {'description', 'memory_id', 'reason'}):
             raise ValueError('自主修改字段无效')
-        reason = self.clean(arguments['reason'])
-        if len(reason) > 80:
-            raise ValueError('自主修改原因最多80字')
+        # Rationale is an audit explanation, never a new personality rule or
+        # authorization. It may accurately mention the user's existing grant.
+        raw_reason = arguments['reason']
+        if not isinstance(raw_reason, str) or re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', raw_reason):
+            raise ValueError('自主修改原因须为文字')
+        reason = ' '.join(unicodedata.normalize('NFKC', raw_reason).split())
+        if not 2 <= len(reason) <= 240 or self.PRIVATE.search(reason):
+            raise ValueError('自主修改原因须为2至240字，不含敏感信息')
         if db.execute('SELECT 1 FROM character_self_changes WHERE owner=? AND attempt=?', (owner, attempt)).fetchone():
             raise ValueError('本轮已经自主修改一次，不重复或循环修改')
         now = time.time()
