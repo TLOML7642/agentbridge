@@ -31,6 +31,10 @@ CONTROL_FIELDS = {
     'agent.persona.reset': {'delivery_id'},
     'agent.preference.set': {'category', 'value', 'delivery_id'},
     'agent.preference.confirm': {'draft_id', 'delivery_id'},
+    'agent.personality': set(),
+    'agent.personality.on': {'delivery_id'}, 'agent.personality.off': {'delivery_id'},
+    'agent.personality.set': {'value', 'memory_id', 'delivery_id'},
+    'agent.personality.forget': {'memory_id', 'delivery_id'},
     'agent.service.requests': set(), 'agent.service.resolve': {'request_id', 'result'},
 }
 MAC_CONTROLS = frozenset(('agent.tasks', 'agent.task.cancel', 'agent.approvals',
@@ -39,7 +43,7 @@ MAC_CONTROLS = frozenset(('agent.tasks', 'agent.task.cancel', 'agent.approvals',
 
 class App:
     def __init__(self, root, secret, senders, channels, services=False, runner=None,
-                 executor_url=None, executor_secret=None, task_projects=()):
+                 executor_url=None, executor_secret=None, task_projects=(), allow_personality=False):
         required(secret, 512)
         if not senders or not channels or any(not isinstance(v, str) or not v.strip() for v in (*senders, *channels)):
             raise AgentError('AUTH_FAIL', '服务器助手须显式配置发送者和会话允许列表')
@@ -92,7 +96,7 @@ class App:
             self.agent = AgentRuntime(self.root / 'agent', run, self.projects.workspace,
                                       recover=getattr(runner, 'recover', lambda _: None),
                                       allow_learning=False, services=queue, runtime_info=self.runtime_info,
-                                      logical_projects=True, tasks=self.executor)
+                                      logical_projects=True, tasks=self.executor, allow_personality=allow_personality)
             ready.set()
         except BaseException:
             if queue:
@@ -296,7 +300,8 @@ def main():
               executor_url=os.environ.get('AGENTBRIDGE_EXECUTOR_URL'),
               executor_secret=(private_credential(os.environ['AGENTBRIDGE_EXECUTOR_SECRET_FILE']).decode().strip()
                                if os.environ.get('AGENTBRIDGE_EXECUTOR_URL') else None),
-              task_projects={v for v in os.environ.get('AGENTBRIDGE_AGENT_TASK_PROJECTS', '').split(',') if v})
+              task_projects={v for v in os.environ.get('AGENTBRIDGE_AGENT_TASK_PROJECTS', '').split(',') if v},
+              allow_personality=os.environ.get('AGENTBRIDGE_PERSONALITY_GROWTH', '0') == '1')
     server = None
 
     def stop(*_):

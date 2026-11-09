@@ -527,6 +527,21 @@ class Main(star.Star):
                     status, data = await self._control(event, {'op': 'agent.' + parts[1]})
                 elif parts == ['/agent', 'preference']:
                     status, data = await self._control(event, {'op': 'agent.memory'})
+                elif parts == ['/agent', 'personality']:
+                    status, data = await self._control(event, {'op': 'agent.personality'})
+                elif parts[:2] == ['/agent', 'personality'] and len(parts) == 3 and parts[2] in ('on', 'off'):
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.personality.' + parts[2], 'delivery_id': delivery})
+                elif parts[:3] == ['/agent', 'personality', 'set'] and len(parts) >= 4:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.personality.set', 'value': ' '.join(parts[3:]), 'delivery_id': delivery})
+                elif parts[:3] == ['/agent', 'personality', 'edit'] and len(parts) >= 5:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.personality.set', 'memory_id': parts[3],
+                                                            'value': ' '.join(parts[4:]), 'delivery_id': delivery})
+                elif parts[:3] == ['/agent', 'personality', 'forget'] and len(parts) == 4:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    status, data = await self._control(event, {'op': 'agent.personality.forget', 'memory_id': parts[3], 'delivery_id': delivery})
                 elif parts[:3] == ['/agent', 'preference', 'set'] and len(parts) >= 5:
                     delivery, _ = self._agent_delivery(event, text, 'agent-control')
                     status, data = await self._control(event, {'op': 'agent.preference.set', 'category': parts[3],
@@ -562,6 +577,7 @@ class Main(star.Star):
                 else:
                     await self._agent_local(event, '用法：/agent new；/agent status [消息ID]；/agent cancel <消息ID>；/agent memory [on|off]；/agent forget <偏好ID>；/agent persona。'
                                             + '\n显式偏好：/agent preference；/agent preference set <类别> <值>；/agent preference confirm <ID>；/agent persona reset。'
+                                            + '\n性格：/agent personality [on|off]；/agent personality set <描述>；/agent personality edit <ID> <描述>；/agent personality forget <ID>。'
                                             + ('\n提醒：/agent reminders [ID]；/agent remind confirm <ID>；/agent remind cancel <ID>。' if PERSONAL_SERVICES else '')
                                             + ('后台：/agent tasks [ID]；/agent task-cancel <ID>；/agent approvals [ID]；/agent approve <ID>；/agent deny <ID>。'
                                                if AGENT_TASKS else '当前后台动作未启用。'))
@@ -585,6 +601,10 @@ class Main(star.Star):
                             and status == 200 and data.get('ok') is True else 'snapshot')
                     reply = self._task_event_text({'task': data['task_id'], 'project': data['project'],
                                                   'conversation': data['conversation'], 'kind': kind, 'body': data})
+                elif data.get('personality') is not None and data.get('preferences') is None:
+                    reply = data.get('display') or data['personality']['display']
+                    if data.get('message'):
+                        reply += '\n' + data['message']
                 elif data.get('preferences') is not None:
                     reply = data.get('display') or (data['core']['name'] + '；自动学习：' + ('开' if data['learning'] else '关')
                              + '\n' + ('\n'.join(f"{item['id']} {item['category']}={item['value']}" for item in data['preferences']) or '暂无有效长期偏好。'))

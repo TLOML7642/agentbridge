@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from agent_character import CharacterMemory
 
 
 class AgentError(Exception):
@@ -88,8 +89,9 @@ class Preferences:
                    (prior['id'] if prior else uuid.uuid4().hex, owner, category, value, 1, time.time(), 'manual:' + source))
         db.execute('DELETE FROM preference_forgotten WHERE owner=? AND category=? AND value=?', (owner, category, value))
 
-    def __init__(self, allow_learning=False):
+    def __init__(self, allow_learning=False, allow_personality=False):
         self.allow_learning = allow_learning
+        self.character = CharacterMemory(allow_personality)
 
     def policy(self, db, owner):
         db.execute('INSERT OR IGNORE INTO preference_policy VALUES (?,?)', (owner, int(self.allow_learning)))
@@ -143,7 +145,11 @@ class Preferences:
         display = ('名字：' + name + '；自动学习：' + ('开' if learning else '关')
                    + '。当前仅服务器使用，未同步桌面。\n'
                    + ('\n'.join(item['summary'] + '（ID：' + item['id'] + '）' for item in items) or '暂无有效长期偏好。'))
+        personality = self.character.view(db, owner)
+        if personality['available'] or personality['traits']:
+            display += '\n' + personality['display']
         return {'core': {**self.CORE, 'name': name}, 'learning': learning, 'display': display,
+                'personality': personality,
                 'learning_available': self.allow_learning, 'preferences': items,
                 'forgotten_categories': [row[0] for row in db.execute('SELECT DISTINCT category FROM preference_forgotten WHERE owner=?', (owner,))]}
 
@@ -173,7 +179,7 @@ class AgentRuntime:
     their native session instead of automatically replaying a possibly used input.
     """
     def __init__(self, root, runner, project, evidence=lambda *_: [], recover=lambda *_: None, allow_learning=False, tasks=None,
-                 services=None, runtime_info=None, logical_projects=False):
+                 services=None, runtime_info=None, logical_projects=False, allow_personality=False):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -192,7 +198,7 @@ class AgentRuntime:
         self.tasks = tasks
         self.services, self.runtime_info = services, runtime_info
         self.logical_projects = logical_projects
-        self.preferences = Preferences(allow_learning)
+        self.preferences = Preferences(allow_learning, allow_personality)
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.stop = threading.Event()
@@ -231,6 +237,7 @@ class AgentRuntime:
                 CREATE TABLE IF NOT EXISTS message_evidence(
                   seq INTEGER PRIMARY KEY AUTOINCREMENT,message TEXT,state TEXT,code TEXT,created REAL);
             ''')
+            CharacterMemory.initialize(db)
             if self.logical_projects:
                 if db.execute('SELECT 1 FROM heads GROUP BY sender,channel,project HAVING count(DISTINCT session)>1 LIMIT 1').fetchone():
                     raise AgentError('MIGRATION_AMBIGUOUS', '旧项目会话头不唯一，停止迁移')
@@ -321,6 +328,7 @@ class AgentRuntime:
             db.execute('SAVEPOINT preference_learning')
             try:
                 self.preferences.learn(db, sender, mid, text)
+                self.preferences.character.learn(db, sender, mid, text)
             except Exception:
                 db.execute('ROLLBACK TO preference_learning')
             finally:
@@ -382,7 +390,8 @@ class AgentRuntime:
         with self.lock:
             result = self._control(sender, channel, op, project, message_id, delivery, memory_id, name, category, value, draft_id)
             if op in ('agent.memory', 'agent.memory.on', 'agent.memory.off', 'agent.forget', 'agent.persona', 'agent.persona.set',
-                      'agent.persona.reset', 'agent.preference.set', 'agent.preference.confirm'):
+                      'agent.persona.reset', 'agent.preference.set', 'agent.preference.confirm',
+                      'agent.personality.on', 'agent.personality.off', 'agent.personality.set', 'agent.personality.forget'):
                 synced = self.export_profile(sender)
                 result['desktop_profile_synced'] = synced  # Legacy API field; no desktop installation implied.
                 result['profile_snapshot_synced'] = synced
@@ -484,6 +493,33 @@ class AgentRuntime:
     def _control(self, sender, channel, op, project, message_id='', delivery='', memory_id='', name='',
                  category='', value='', draft_id=''):
         required(sender); required(channel)
+        if op in ('agent.personality', 'agent.personality.on', 'agent.personality.off', 'agent.personality.set', 'agent.personality.forget'):
+            with self.db() as db:
+                character = self.preferences.character
+                if op == 'agent.personality':
+                    return {'ok': True, 'personality': character.view(db, sender), 'display': character.view(db, sender)['display']}
+                required(delivery, 128)
+                digest = hashlib.sha256(json.dumps([op, memory_id, value]).encode()).hexdigest()
+                old = db.execute('SELECT digest FROM controls WHERE sender=? AND channel=? AND delivery=?', (sender, channel, delivery)).fetchone()
+                if old and old['digest'] != digest:
+                    raise AgentError('DELIVERY_CONFLICT', '性格控制投递已绑定其他变更')
+                if old is None:
+                    try:
+                        if op.endswith('.on'):
+                            if not character.available:
+                                raise ValueError('性格成长尚未由宿主启用')
+                            db.execute('INSERT OR REPLACE INTO character_policy VALUES (?,1)', (sender,))
+                        elif op.endswith('.off'):
+                            db.execute('INSERT OR REPLACE INTO character_policy VALUES (?,0)', (sender,))
+                        elif op.endswith('.set'):
+                            character.set(db, sender, value, 'control:' + delivery, memory_id)
+                        else:
+                            character.forget(db, sender, memory_id, 'control:' + delivery)
+                    except ValueError as error:
+                        raise AgentError('INVALID_MESSAGE', str(error)) from None
+                    db.execute('INSERT INTO controls VALUES (?,?,?,?,?)', (sender, channel, delivery, digest, '{}'))
+                result = character.view(db, sender)
+                return {'ok': True, 'reused': old is not None, 'personality': result, 'display': result['display']}
         if op in ('agent.preference.set', 'agent.preference.draft', 'agent.preference.confirm'):
             with self.db() as db:
                 return self._preference_control(db, sender, channel, op, delivery, memory_id, category, value, draft_id)

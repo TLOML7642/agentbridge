@@ -894,7 +894,7 @@ class App:
     def _agent_source_evidence(self):
         # These are host facts, never inferred from the selected project's docs.
         source = Path(__file__).resolve().parent
-        files = ('worker.py', 'agent_runtime.py', 'agent_driver.mjs', 'agent_services.py', 'agent_reads.py',
+        files = ('worker.py', 'agent_runtime.py', 'agent_character.py', 'agent_driver.mjs', 'agent_services.py', 'agent_reads.py',
                  'process_supervisor.py', 'worker_role.py', 'executor_api.py',
                  'native_boundary.mjs', 'agent_persona.mjs', 'agent_rpc.mjs', 'agent_actions.py', 'agent_approvals.py',
                  'agent_tasks.py', 'agent_task_driver.mjs', 'agent_task_executor.py')
@@ -1314,6 +1314,10 @@ CONTROL_FIELDS = {
     "agent.persona.reset": {"delivery_id"},
     "agent.preference.set": {"category", "value", "delivery_id"},
     "agent.preference.confirm": {"draft_id", "delivery_id"},
+    'agent.personality': set(),
+    'agent.personality.on': {'delivery_id'}, 'agent.personality.off': {'delivery_id'},
+    'agent.personality.set': {'value', 'memory_id', 'delivery_id'},
+    'agent.personality.forget': {'memory_id', 'delivery_id'},
     "agent.tasks": {"task_id"}, "agent.task.cancel": {"task_id", "delivery_id"},
     "agent.approvals": {"approval_id"}, "agent.approve": {"approval_id", "delivery_id"},
     "agent.deny": {"approval_id", "delivery_id"}, "agent.events": {"after"},

@@ -169,12 +169,16 @@ CONTROL_FIELDS = {
     "agent.persona.reset": {"delivery_id"},
     "agent.preference.set": {"category", "value", "delivery_id"},
     "agent.preference.confirm": {"draft_id", "delivery_id"},
+    'agent.personality': set(),
+    'agent.personality.on': {'delivery_id'}, 'agent.personality.off': {'delivery_id'},
+    'agent.personality.set': {'value', 'memory_id', 'delivery_id'},
+    'agent.personality.forget': {'memory_id', 'delivery_id'},
     "agent.tasks": {"task_id"}, "agent.task.cancel": {"task_id", "delivery_id"},
     "agent.approvals": {"approval_id"}, "agent.approve": {"approval_id", "delivery_id"},
     "agent.deny": {"approval_id", "delivery_id"}, "agent.events": {"after"},
     "agent.service.requests": set(), "agent.service.resolve": {"request_id", "result"},
 }
-QUERY_OPS = frozenset(("status", "project.list", "diag", "jobs", "pending", "status.batch", "agent.status", "agent.lookup", "agent.memory", "agent.persona", "agent.tasks", "agent.approvals", "agent.events", "agent.service.requests"))
+QUERY_OPS = frozenset(("status", "project.list", "diag", "jobs", "pending", "status.batch", "agent.status", "agent.lookup", "agent.memory", "agent.persona", "agent.personality", "agent.tasks", "agent.approvals", "agent.events", "agent.service.requests"))
 _HEALTH_LOCK = threading.Lock()
 _LAST_WORKER_HEALTH = None
 
