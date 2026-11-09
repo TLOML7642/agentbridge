@@ -296,6 +296,9 @@ class CharacterTests(unittest.TestCase):
                        'python': os.sys.executable, 'subject': subject, 'persona': self.runtime.control('owner', 'wechat-private', 'agent.persona', 'p'),
                        'services': cap, 'syntheticTools': ([{'name': 'read_text', 'arguments': {'file': 'README.md'}}] if read_first else [])
                        + [{'name': 'persona_update', 'arguments': {'name': '知微', 'reason': '用户已经授权我自主命名并长期保存，希望保持细致温柔'}}]}
+            if not read_first:
+                request['syntheticTools'].append({'name': 'persona_update',
+                    'arguments': {'name': '知微', 'reason': '再次确认同一个名字已经保存，无需重新改名'}})
             file = self.root / (mid + '.json'); file.write_text(json.dumps(request))
             result = subprocess.run([node, 'agent_driver.mjs', str(file)], capture_output=True, text=True, timeout=15,
                                     env={'PATH': '/usr/bin:/bin', 'HOME': str(self.root), 'ELECTRON_RUN_AS_NODE': '1',
@@ -304,6 +307,12 @@ class CharacterTests(unittest.TestCase):
             name = self.runtime.control('owner', 'wechat-private', 'agent.persona', 'p')['core']['name']
             self.assertEqual(name, 'DSH 助手' if read_first else '知微')
             if read_first: self.assertIn('self profile changes cannot follow', result.stdout)
+            else:
+                reply = json.loads(json.loads(result.stdout)['reply'])
+                message = json.loads(reply['toolResult'])
+                receipt = json.loads(message['content'][0]['content'][0]['text'])
+                self.assertFalse(receipt['result']['profile_changed'])
+                self.assertEqual(receipt['result']['core']['name'], '知微')
 
     def test_snapshot_failure_reports_partial_and_next_turn_reads_current_db(self):
         with mock.patch.object(self.runtime, 'export_profile', return_value=False):
