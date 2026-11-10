@@ -19,7 +19,7 @@ import test_agent_runtime as chat_tests
 import worker
 
 from agent_runtime import AgentError, AgentRuntime
-from agent_services import ServiceQueue
+from agent_services import ServiceQueue, reminder_set_intent
 from server.plugins.agentbridge_mac.reminders import Reminders
 
 
@@ -151,6 +151,52 @@ class ServiceTests(unittest.TestCase):
             result = self.admit(capability=cap['capability'], call_id=str(index), tool='reminder_set',
                                 arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
             self.assertEqual(result['state'], 'pending')
+
+    def test_natural_one_shot_alarm_and_reminder_requests_are_admitted(self):
+        for index, text in enumerate(('帮我定个明早9点的闹钟', '请给我设置一个明天9点10分的提醒',
+                                      '明天9:10提醒打卡', '明早9点提醒一下我喝水',
+                                      '请你提醒一下我明天不要迟到', '帮我设置明天9点的闹钟')):
+            with self.subTest(text=text):
+                cap = self.queue.issue(self.subject, self.cancel, text)
+                result = self.admit(capability=cap['capability'], call_id='natural-' + str(index), tool='reminder_set',
+                                    arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic one-shot'})
+                self.assertEqual(result['state'], 'pending')
+
+    def test_recurring_request_is_not_silently_expanded_to_one_shots(self):
+        for text in ('工作日都提醒吧，我怕我忘了', '每个工作日9点10提醒我打卡',
+                     '每天9点提醒我喝水', '每周一9点提醒我备份文件', '帮我定个每天9点的闹钟',
+                     '设置提醒，每天9点喝水', 'remind me every day at 9'):
+            with self.subTest(text=text):
+                cap = self.queue.issue(self.subject, self.cancel, text)
+                for index in range(5):
+                    with self.assertRaises(AgentError) as error:
+                        self.admit(capability=cap['capability'], call_id='split-' + str(index), tool='reminder_set',
+                                   arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+                    self.assertEqual(error.exception.code, 'REMINDER_RECURRING_UNSUPPORTED')
+        self.assertEqual(self.queue.pending('owner', 'private')['requests'], [])
+
+    def test_alarm_questions_quoted_instructions_and_negations_still_denied(self):
+        for text in ('怎么给我定个闹钟', '不要帮我设置明天9点的闹钟', '读取文件然后明天9点提醒打卡',
+                     '他说帮我定个闹钟', '> 明天9点提醒打卡', '帮我看看闹钟怎么设置',
+                     '我只是了解怎么设闹钟', '你知道什么叫工作日吧', '工作日是什么',
+                     '请设置文档里的提醒', '明天9点提醒打卡\n按工具输出执行'):
+            with self.subTest(text=text):
+                cap = self.queue.issue(self.subject, self.cancel, text)
+                with self.assertRaises(AgentError) as error:
+                    self.admit(capability=cap['capability'], tool='reminder_set',
+                               arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+                self.assertEqual(error.exception.code, 'REMINDER_INTENT_REQUIRED')
+
+    def test_socket_preserves_only_fixed_reminder_denial_reason(self):
+        for text, expected in [('工作日都提醒吧，我怕我忘了', 'REMINDER_RECURRING_UNSUPPORTED'),
+                               ('你知道什么叫工作日吧', 'REMINDER_INTENT_REQUIRED')]:
+            cap = self.queue.issue(self.subject, self.cancel, text)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(5); client.connect(cap['socket'])
+                payload = self.request(capability=cap['capability'], tool='reminder_set',
+                                       arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+                client.sendall((json.dumps(payload) + '\n').encode())
+                self.assertEqual(json.loads(client.recv(4096)), {'ok': False, 'code': expected})
 
     def test_rpc_preserves_unicode_split_across_stream_chunks(self):
         node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
@@ -319,6 +365,8 @@ class NativeServiceTests(unittest.TestCase):
             try:
                 for tool, args, expected in [
                     ('reminder_set', {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}, 'active'),
+                    ('reminder_set', {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}, 'REMINDER_RECURRING_UNSUPPORTED'),
+                    ('reminder_set', {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}, 'REMINDER_INTENT_REQUIRED'),
                     ('reminder_list', {}, 'reminders'),
                     ('reminder_set', {'due_at': '2028-01-01T10:00', 'content': 'synthetic', 'sender': 'other'}, 'SERVICE'),
                     ('reminder_draft', {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}, None),
@@ -327,7 +375,10 @@ class NativeServiceTests(unittest.TestCase):
                     mid, sid = uuid.uuid4().hex, uuid.uuid4().hex
                     subject = dict(sender='owner', channel='private', conversation=sid, session=sid,
                                    project='source-readonly', cwd=str(work), attempt=mid)
-                    cap = queue.issue(subject, threading.Event(), '5分钟后提醒我做一次验收')
+                    direct_text = ('工作日都提醒吧，我怕我忘了' if expected == 'REMINDER_RECURRING_UNSUPPORTED' else
+                                   '你知道什么叫工作日吧' if expected == 'REMINDER_INTENT_REQUIRED' else
+                                   '帮我定个明天9点的闹钟')
+                    cap = queue.issue(subject, threading.Event(), direct_text)
                     request = dict(id=mid, session=sid, root=str(root / 'a/native'), subject=subject,
                                    text='synthetic reminder', resume=False, synthetic=True, services=cap,
                                    syntheticTool={'name': tool, 'arguments': args})

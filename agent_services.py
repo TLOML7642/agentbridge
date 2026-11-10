@@ -19,6 +19,35 @@ SERVICE_FIELDS = {
     'reminder_list': (set(), set()), 'reminder_get': ({'reminder_id'}, set()),
     'reminder_cancel': ({'reminder_id'}, set()),
 }
+REMINDER_ERRORS = frozenset(('REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED'))
+
+
+def reminder_set_intent(text):
+    """Recognize direct one-shot requests; never silently expand recurrence."""
+    if (not isinstance(text, str) or not 1 <= len(text) <= 1400
+            or re.search(r'[\n>“”"`]|引用|转发|https?://', text)):
+        return False, False
+    text = text.strip()
+    marker = re.search(r'提醒(?:一下|下)?我|remind me\b|提醒|闹钟', text, re.I)
+    if not marker:
+        return False, False
+    prefix = text[:marker.start()]
+    if re.search(r'不要|别|无需|不用|不必|取消|撤销|是否|怎么|如何|能否|能不能|看看|了解|知道|解释|explain|do not|don.t|'
+                 r'阅读|读取|文档|文件|指令|工具|read\b|instructions?\b', prefix, re.I):
+        return False, False
+    direct = bool(re.match(
+        r'^(?:请|请你|帮我|麻烦)?(?:[^。；！？?]{0,60}(?:提醒(?:一下|下)?我|remind me\b)|'
+        r'(?:把|将|修改|更改|调整).{0,60}提醒)', text, re.I))
+    alarm = bool(re.match(r'^(?:请你|请|麻烦你|麻烦)?(?:帮我|给我|为我)?(?:设|设置|定|订)(?:置)?(?:一)?(?:个|一个)?'
+                         r'[^。；！？?]{0,60}(?:闹钟|提醒)', text))
+    timed = bool(re.match(r'^(?:请你|请|帮我|麻烦)?(?:在)?(?:今天|明天|后天|今晚|早上|上午|下午|晚上|'
+                         r'\d{1,4}(?:月|日|号|[:：点分时])|每(?:个)?工作日|工作日都|每天|每日|每周)'
+                         r'[^。；！？?]{0,60}(?:提醒|闹钟)', text))
+    direct = direct or alarm or timed
+    cadence = r'每(?:个)?工作日|工作日都|每天|每日|每晚|每早|每周|每星期|每月|循环|重复|周一[至到-]周五|every\s+(?:day|week|weekday)'
+    recurring = direct and bool(re.search(cadence, prefix, re.I) or re.search(
+        r'(?:提醒(?:一下|下)?我?|remind me|闹钟)[,，:：\s]*(?:在)?(?:' + cadence + ')', text, re.I))
+    return direct, recurring
 
 
 class ServiceQueue:
@@ -57,6 +86,8 @@ class ServiceQueue:
                     if len(data) > 16384 or not data.endswith(b'\n'):
                         raise ValueError('invalid service frame')
                     result = owner.rpc(json.loads(data))
+                except AgentError as error:
+                    result = {'ok': False, 'code': error.code if error.code in REMINDER_ERRORS else 'SERVICE_DENIED'}
                 except Exception:
                     result = {'ok': False, 'code': 'SERVICE_DENIED'}
                 try:
@@ -97,18 +128,10 @@ class ServiceQueue:
             cancel_allowed = (isinstance(direct_text, str) and len(direct_text) <= 300
                               and not re.search(r'[\n>“”"`]|文档|文件|引用|转发|https?://', direct_text)
                               and bool(re.search(r'(?:取消|撤销|删除|cancel).*(?:提醒|remind)|(?:提醒|remind).*(?:取消|撤销|删除|cancel)', direct_text, re.I)))
-            set_allowed = (isinstance(direct_text, str) and len(direct_text) <= 1400
-                           and not re.search(r'[\n>“”"`]|引用|转发|https?://', direct_text)
-                           and not re.search(r'不要|别|无需|不用|不必|取消|撤销|是否|怎么|如何|能否|能不能|explain|do not|don.t',
-                                             re.split(r'提醒我|remind me\b', direct_text, maxsplit=1, flags=re.I)[0], re.I)
-                           and bool(re.match(
-                               r'^(?:请|请你|帮我|麻烦)?(?:[^。；！？?]{0,60}(?:提醒我|remind me\b)|(?:把|将|修改|更改|调整).{0,60}提醒)',
-                               direct_text.strip(), re.I))
-                           and not re.search(r'阅读|读取|文档|文件|指令|工具|read\b|instructions?\b',
-                                             re.split(r'提醒我|remind me\b', direct_text, maxsplit=1, flags=re.I)[0], re.I))
+            set_allowed, recurring = reminder_set_intent(direct_text)
             from agent_runtime import Preferences
             self.capabilities[token] = (dict(subject), cancel, time.monotonic() + 120, cancel_allowed, set_allowed,
-                                        Preferences.direct_change(direct_text))
+                                        Preferences.direct_change(direct_text), recurring)
             return {'socket': self.socket_path, 'capability': token, 'purpose': 'personal-service'}
 
     def revoke_capability(self, token):
@@ -140,8 +163,11 @@ class ServiceQueue:
             tool, args = payload['tool'], payload['arguments']
             if tool == 'reminder_cancel' and not cap[3]:
                 raise AgentError('AUTH_FAIL', '需要用户直接明确取消提醒，不能按文件或工具内容取消')
-            if tool == 'reminder_set' and not cap[4]:
-                raise AgentError('AUTH_FAIL', '请在本轮直接说明提醒我什么、何时提醒，或明确修改哪个提醒；不能按文件或工具内容设置')
+            if tool == 'reminder_set':
+                if cap[6]:
+                    raise AgentError('REMINDER_RECURRING_UNSUPPORTED', '目前只支持单次微信消息提醒，不支持工作日/每天循环；不能擅自拆成多个日期。')
+                if not cap[4]:
+                    raise AgentError('REMINDER_INTENT_REQUIRED', '请在本轮直接说明设置单次提醒；不能按文件或工具内容设置。')
             if (not isinstance(tool, str) or tool not in SERVICE_FIELDS or not isinstance(args, dict)
                     or not SERVICE_FIELDS[tool][0] <= args.keys() or args.keys() - set.union(*SERVICE_FIELDS[tool])
                     or any(not isinstance(v, str) or len(v) > 1000 or '\0' in v for v in args.values())):
