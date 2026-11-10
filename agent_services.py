@@ -19,7 +19,40 @@ SERVICE_FIELDS = {
     'reminder_list': (set(), set()), 'reminder_get': ({'reminder_id'}, set()),
     'reminder_cancel': ({'reminder_id'}, set()),
 }
-REMINDER_ERRORS = frozenset(('REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED'))
+REMINDER_ERRORS = frozenset(('REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED', 'REMINDER_FOLLOWUP_CONFLICT'))
+
+
+def reminder_retry(text):
+    if not isinstance(text, str) or len(text) > 80:
+        return False
+    text = text.strip()
+    maintenance = re.match(r'^我(?:刚刚|刚才|已经)?(?:修复|修改|调整|更新|处理|改动|优化|检查|完善|修|改)'
+                           r'(?:了)?(?:一下)?[^\W\d_]{1,8}(?:了)?[，,。\s]+', text, re.I)
+    if maintenance and not re.search(r'审批|权限|授权|提醒|闹钟|文件|指令|工具|密码|密钥', maintenance[0]):
+        text = text[maintenance.end():]
+    return ('试' in text and re.fullmatch(r'(?:你|请|麻烦|帮我|现在|再|重新|试试|试一下|试下|试一次|试试看|试看|重试|一下|一次|看看|看|吧|呢|啊|呀|好|了|[。！!？?，,\s])+', text) is not None)
+
+
+def reminder_context(db, message, now=None):
+    """Only host-owned direct user messages in this exact recent conversation."""
+    if not reminder_retry(message['text']):
+        return None
+    now = time.time() if now is None else now
+    rows = db.execute('SELECT id,text,state,created FROM messages WHERE sender=? AND channel=? AND session=? AND seq<? '
+                      'ORDER BY seq DESC LIMIT 6', (message['sender'], message['channel'], message['session'], message['seq'])).fetchall()
+    for row in rows:
+        if row['state'] != 'done' or not 0 <= now - row['created'] <= 7200:
+            return None
+        direct, recurring = reminder_set_intent(row['text'])
+        if direct:
+            return {'attempt': row['id'], 'direct': True, 'recurring': recurring}
+        # Only fixed retry/acknowledgement and a narrow workday-definition
+        # question may intervene. Unrelated turns, cancellations and quoted
+        # instructions break the chain rather than revive an old request.
+        if not (reminder_retry(row['text']) or re.fullmatch(r'(?:好|好的|行|嗯|收到|知道了|(?:我)?先看看怎么回事吧?)[。！!]?|'
+                r'(?:你)?(?:知道|明白|懂)(?:什么叫|什么是)?工作日(?:吧|吗|么)?[？?。]?', row['text'].strip())):
+            return None
+    return None
 
 
 def reminder_set_intent(text):
@@ -116,7 +149,7 @@ class ServiceQueue:
             finally:
                 db.close()
 
-    def issue(self, subject, cancel, direct_text=''):
+    def issue(self, subject, cancel, direct_text='', reminder_context=None):
         with self.lock:
             if self.closed:
                 raise AgentError('UNAVAILABLE', '个人服务已停止')
@@ -129,10 +162,18 @@ class ServiceQueue:
                               and not re.search(r'[\n>“”"`]|文档|文件|引用|转发|https?://', direct_text)
                               and bool(re.search(r'(?:取消|撤销|删除|cancel).*(?:提醒|remind)|(?:提醒|remind).*(?:取消|撤销|删除|cancel)', direct_text, re.I)))
             set_allowed, recurring = reminder_set_intent(direct_text)
+            origin = None
+            if reminder_retry(direct_text) and reminder_context is not None:
+                required(reminder_context.get('attempt'), 128)
+                set_allowed = reminder_context.get('direct') is True
+                recurring = reminder_context.get('recurring') is True
+                origin = reminder_context['attempt'] if set_allowed else None
             from agent_runtime import Preferences
             self.capabilities[token] = (dict(subject), cancel, time.monotonic() + 120, cancel_allowed, set_allowed,
-                                        Preferences.direct_change(direct_text), recurring)
-            return {'socket': self.socket_path, 'capability': token, 'purpose': 'personal-service'}
+                                        Preferences.direct_change(direct_text), recurring, origin)
+            return {'socket': self.socket_path, 'capability': token, 'purpose': 'personal-service',
+                    'reminder_intent': 'recurring_unsupported' if recurring else 'followup_one_shot' if origin else
+                                       'direct_one_shot' if set_allowed else 'missing'}
 
     def revoke_capability(self, token):
         with self.lock:
@@ -176,6 +217,18 @@ class ServiceQueue:
             digest = hashlib.sha256(json.dumps([subject, tool, encoded], sort_keys=True).encode()).hexdigest()
             identifier = hashlib.sha256(json.dumps([subject['attempt'], call]).encode()).hexdigest()
             with self.db() as db:
+                if tool == 'reminder_set' and cap[7]:
+                    previous = db.execute('SELECT * FROM service_requests WHERE attempt=? AND sender=? AND channel=? '
+                                          'AND conversation=? AND project=? AND tool=?',
+                                          (cap[7], subject['sender'], subject['channel'], subject['conversation'], subject['project'], tool)).fetchall()
+                    if not previous:
+                        raise AgentError('REMINDER_FOLLOWUP_CONFLICT', '原单次参数尚未持久绑定，不能猜测原时间或内容；请明确这一次的时间和内容。')
+                    if len(previous) != 1 or previous[0]['arguments'] != encoded:
+                        raise AgentError('REMINDER_FOLLOWUP_CONFLICT', '原单次请求已绑定参数或不唯一；请查询，不自动换日期、改内容或新建。')
+                    self._expire(db, self.clock())
+                    old = db.execute('SELECT * FROM service_requests WHERE id=?', (previous[0]['id'],)).fetchone()
+                    return {'ok': True, 'request_id': old['id'], 'state': old['state'], 'reused': True,
+                            'result': json.loads(old['result']) if old['result'] else None}
                 old = db.execute('SELECT * FROM service_requests WHERE id=?', (identifier,)).fetchone()
                 if old:
                     if old['digest'] != digest:

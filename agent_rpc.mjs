@@ -48,7 +48,7 @@ export function rpc(broker, op, fields, signal) {
           // Preserve only fixed host outcome codes, never remote prose or
           // model-supplied fields. Offline is not an approval rejection.
           const codes = ['MAC_OFFLINE', 'EXECUTOR_UNKNOWN', ...(purpose === 'SERVICE_RPC'
-            ? ['REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED'] : [])];
+            ? ['REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED', 'REMINDER_FOLLOWUP_CONFLICT'] : [])];
           const code = codes.includes(value?.code) ? value.code : purpose + '_DENIED';
           throw new Error(code);
         }
@@ -61,7 +61,7 @@ export function rpc(broker, op, fields, signal) {
       completed = true;
       const code = error.message === purpose + '_TIMEOUT' ? 'TIMEOUT' :
         error.message === purpose + '_CANCELLED' ? 'CANCELLED' :
-        [purpose + '_DENIED', 'REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED'].includes(error.message) ? 'DENIED' : 'UNKNOWN';
+        [purpose + '_DENIED', 'REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED', 'REMINDER_FOLLOWUP_CONFLICT'].includes(error.message) ? 'DENIED' : 'UNKNOWN';
       diagnostic(broker, 'native_rpc', code, null, error, performance.now() - started);
       clean(); reject(error);
     });

@@ -647,6 +647,8 @@ class AgentRuntime:
                     turn = {**dict(row), 'subject': {k: session[k] for k in ('sender', 'channel', 'project', 'cwd')},
                             'resume': db.execute("SELECT 1 FROM messages WHERE session=? AND state='done' LIMIT 1", (row['session'],)).fetchone() is not None}
                     turn['subject'].update(conversation=session['id'], session=session['id'], attempt=row['id'])
+                    from agent_services import reminder_context
+                    turn['reminder_context'] = reminder_context(db, dict(row))
                     turn['persona'] = self.preferences.view(db, session['sender'])
                     cursor = db.execute('SELECT seq FROM task_cursors WHERE session=?', (session['id'],)).fetchone()
                     turn['task_cursor'] = cursor['seq'] if cursor else 0
@@ -759,7 +761,8 @@ class NativeExecutor:
             payload.update(read_mode='snapshot', read_root=snapshot[0], source_snapshot=snapshot[1])
             payload['read_scope'] = {'scope': snapshot[1]['scope'], 'files': sorted(snapshot[1]['files'])}
         if self.services is not None:
-            payload['services'] = self.services.issue(turn['subject'], cancel, turn['text'])
+            payload['services'] = self.services.issue(turn['subject'], cancel, turn['text'],
+                                                     **({'reminder_context': turn['reminder_context']} if turn.get('reminder_context') else {}))
         if self.tasks is not None:
             payload['task_events'] = turn.get('task_events', [])
             if self.tasks.can_submit(turn['subject']['project']):

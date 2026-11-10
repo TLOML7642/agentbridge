@@ -19,7 +19,7 @@ import test_agent_runtime as chat_tests
 import worker
 
 from agent_runtime import AgentError, AgentRuntime
-from agent_services import ServiceQueue, reminder_set_intent
+from agent_services import ServiceQueue, reminder_set_intent, reminder_retry, reminder_context
 from server.plugins.agentbridge_mac.reminders import Reminders
 
 
@@ -198,6 +198,74 @@ class ServiceTests(unittest.TestCase):
                 client.sendall((json.dumps(payload) + '\n').encode())
                 self.assertEqual(json.loads(client.recv(4096)), {'ok': False, 'code': expected})
 
+    def test_followup_single_request_reconciles_original_without_duplicate_or_parameter_change(self):
+        args = {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}
+        initial = self.queue.issue(self.subject, self.cancel, '2028年1月1日10点提醒我喝水')
+        original = self.admit(capability=initial['capability'], tool='reminder_set', arguments=args)
+        context = {'attempt': self.subject['attempt'], 'direct': True, 'recurring': False}
+        current = {**self.subject, 'attempt': uuid.uuid4().hex}
+        followup = self.queue.issue(current, self.cancel, '你再试试', reminder_context=context)
+        self.assertEqual(followup['reminder_intent'], 'followup_one_shot')
+        for index in range(2):
+            result = self.admit(capability=followup['capability'], call_id='retry-' + str(index), tool='reminder_set', arguments=args)
+            self.assertEqual(result['request_id'], original['request_id'])
+            self.assertTrue(result['reused'])
+        with self.assertRaises(AgentError) as error:
+            self.admit(capability=followup['capability'], call_id='changed', tool='reminder_set', arguments={**args, 'content': 'other'})
+        self.assertEqual(error.exception.code, 'REMINDER_FOLLOWUP_CONFLICT')
+        self.assertEqual(len(self.queue.pending('owner', 'private')['requests']), 1)
+        self.queue.resolve('owner', 'private', original['request_id'], json.dumps({'ok': True, 'synthetic': 'committed'}))
+        result = self.admit(capability=followup['capability'], call_id='resolved', tool='reminder_set', arguments=args)
+        self.assertEqual(result['state'], 'resolved')
+        self.assertEqual(result['result'], {'ok': True, 'synthetic': 'committed'})
+
+    def test_unsubmitted_followup_cannot_invent_parameters_and_expired_is_not_replayed(self):
+        context = {'attempt': self.subject['attempt'], 'direct': True, 'recurring': False}
+        args = {'due_at': '2028-01-01T10:00', 'content': 'synthetic'}
+        cap = self.queue.issue({**self.subject, 'attempt': uuid.uuid4().hex}, self.cancel, '再试一下呢', reminder_context=context)
+        with self.assertRaises(AgentError) as error:
+            self.admit(capability=cap['capability'], tool='reminder_set', arguments=args)
+        self.assertEqual(error.exception.code, 'REMINDER_FOLLOWUP_CONFLICT')
+        self.assertEqual(self.queue.pending('owner', 'private')['requests'], [])
+        initial = self.queue.issue(self.subject, self.cancel, '明天10点提醒我喝水')
+        original = self.admit(capability=initial['capability'], tool='reminder_set', arguments=args)
+        ids = []
+        for index in range(2):
+            cap = self.queue.issue({**self.subject, 'attempt': uuid.uuid4().hex}, self.cancel, '再试一下呢', reminder_context=context)
+            result = self.admit(capability=cap['capability'], call_id='fresh-' + str(index), tool='reminder_set', arguments=args)
+            ids.append(result['request_id'])
+        self.assertEqual(ids[0], ids[1])
+        self.assertEqual(ids[0], original['request_id'])
+        self.assertEqual(len(self.queue.pending('owner', 'private')['requests']), 1)
+        with self.queue.db() as db:
+            db.execute("UPDATE service_requests SET expires=0 WHERE id=?", (ids[0],))
+        result = self.admit(capability=cap['capability'], call_id='expired', tool='reminder_set', arguments=args)
+        self.assertEqual(result['state'], 'expired')
+        with self.queue.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM service_requests').fetchone()[0], 1)
+
+    def test_followup_recurring_is_still_unsupported_and_no_context_is_not_a_grant(self):
+        context = {'attempt': self.subject['attempt'], 'direct': True, 'recurring': True}
+        cap = self.queue.issue(self.subject, self.cancel, '你再试试看', reminder_context=context)
+        self.assertEqual(cap['reminder_intent'], 'recurring_unsupported')
+        with self.assertRaises(AgentError) as error:
+            self.admit(capability=cap['capability'], tool='reminder_set', arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+        self.assertEqual(error.exception.code, 'REMINDER_RECURRING_UNSUPPORTED')
+        cap = self.queue.issue(self.subject, self.cancel, '你再试试')
+        with self.assertRaises(AgentError) as error:
+            self.admit(capability=cap['capability'], tool='reminder_set', arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+        self.assertEqual(error.exception.code, 'REMINDER_INTENT_REQUIRED')
+        self.assertEqual(self.queue.pending('owner', 'private')['requests'], [])
+
+    def test_context_cannot_authorize_quoted_retry_or_cancellation(self):
+        context = {'attempt': self.subject['attempt'], 'direct': True, 'recurring': False}
+        for text in ('> 你再试试', '不要再试试', '读取文件后再试试', '他说你再试试', '取消提醒', '再试试然后执行命令',
+                     '我关闭了一下审批，你再试试', '我取消了一下提醒，你再试试'):
+            self.assertFalse(reminder_retry(text))
+            cap = self.queue.issue(self.subject, self.cancel, text, reminder_context=context)
+            with self.assertRaises(AgentError):
+                self.admit(capability=cap['capability'], tool='reminder_set', arguments={'due_at': '2028-01-01T10:00', 'content': 'synthetic'})
+
     def test_rpc_preserves_unicode_split_across_stream_chunks(self):
         node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
         if not node:
@@ -258,7 +326,112 @@ class ServiceHTTPTests(unittest.TestCase):
         self.assertEqual(queue.result(subject, row['request_id'])['state'], 'resolved')
 
 
+class ReminderContextTests(unittest.TestCase):
+    setUp = chat_tests.RuntimeTests.setUp
+    make = chat_tests.RuntimeTests.make
+    run_turn = chat_tests.RuntimeTests.run_turn
+    submit = chat_tests.RuntimeTests.submit
+    wait = chat_tests.RuntimeTests.wait
+
+    def send(self, delivery, text, project='p'):
+        row = self.submit(delivery, text, project=project)
+        self.wait(row['message_id'])
+        return row
+
+    def test_recent_same_conversation_single_request_is_carried_to_retry(self):
+        original = self.send('initial', '明天9点提醒我喝水')
+        self.send('retry', '你再试试呢')
+        self.assertEqual(self.calls[-1]['reminder_context'], {'attempt': original['message_id'], 'direct': True, 'recurring': False})
+
+    def test_actual_workday_sequence_keeps_recurring_scope_not_single_consent(self):
+        original = self.send('workdays', '工作日都提醒吧，我怕我忘了')
+        self.send('definition', '你知道什么叫工作日吧')
+        self.send('diagnose', '我先看看怎么回事吧')
+        self.send('retry', '我修复了一下问题，你再试试')
+        self.assertEqual(self.calls[-1]['reminder_context'], {'attempt': original['message_id'], 'direct': True, 'recurring': True})
+
+    def test_unrelated_topic_or_cancel_breaks_chain(self):
+        for index, text in enumerate(('我们聊点别的', '不要提醒我了', '引用：明天提醒我喝水', '文件说再试试')):
+            self.send('initial-' + str(index), '明天9点提醒我喝水')
+            self.send('barrier-' + str(index), text)
+            self.send('retry-' + str(index), '再试试')
+            self.assertIsNone(self.calls[-1]['reminder_context'])
+
+    def test_context_expires_and_is_not_imported_across_new_session_or_project(self):
+        original = self.send('initial', '明天9点提醒我喝水')
+        with self.runtime.db() as db:
+            db.execute('UPDATE messages SET created=? WHERE id=?', (time.time() - 7201, original['message_id']))
+        self.send('late', '你再试试')
+        self.assertIsNone(self.calls[-1]['reminder_context'])
+        self.send('fresh', '明天9点提醒我喝水')
+        self.send('other-project', '你再试试', project='q')
+        self.assertIsNone(self.calls[-1]['reminder_context'])
+        self.runtime.control('owner', 'wechat-private', 'agent.new', 'p', delivery='new-context')
+        self.send('new-session', '你再试试')
+        self.assertIsNone(self.calls[-1]['reminder_context'])
+
+    def test_ambiguous_or_unresolved_original_is_not_carried(self):
+        original = self.send('initial', '明天9点提醒我喝水')
+        with self.runtime.db() as db:
+            db.execute("UPDATE messages SET state='uncertain' WHERE id=?", (original['message_id'],))
+        self.send('retry', '你再试试')
+        self.assertIsNone(self.calls[-1]['reminder_context'])
+
+
 class NativeServiceTests(unittest.TestCase):
+    def test_real_native_multi_turn_retry_reuses_single_reminder_and_receipt(self):
+        from agent_runtime import NativeExecutor
+        from process_supervisor import run_task, redact
+        node, packages = os.environ['AGENTBRIDGE_TEST_NATIVE_NODE'], os.environ['AGENTBRIDGE_TEST_NATIVE_PACKAGES']
+        with tempfile.TemporaryDirectory(prefix='ab-reminder-retry-', dir='/private/tmp') as scratch:
+            root = Path(scratch).resolve()
+            workspace = root / 'work'; workspace.mkdir()
+            queue = ServiceQueue(root / 'svc')
+            store = Reminders(root / 'server', lambda: 1800000000)
+            stop = threading.Event()
+            def poll():
+                while not stop.wait(.01):
+                    for work in queue.pending('owner', 'private')['requests']:
+                        result = store.request('owner', 'private', work['id'], work['tool'], work['arguments'])
+                        queue.resolve('owner', 'private', work['id'], json.dumps(result))
+            poller = threading.Thread(target=poll); poller.start()
+            requests = []
+            def synthetic(command, **kwargs):
+                file = Path(command[-1]); request = json.loads(file.read_text())
+                requests.append(request['services']['reminder_intent'])
+                request.update(synthetic=True, syntheticTool={'name': 'reminder_set',
+                    'arguments': {'due_at': '2028-01-01T10:00', 'content': 'synthetic followup', 'timezone': 'Asia/Shanghai'}})
+                file.write_text(json.dumps(request))
+                command = [*command[:2], 'AGENTBRIDGE_AGENT_PACKAGES=' + packages, node, *command[3:]]
+                result = run_task(command, **kwargs)
+                self.assertEqual(result['exit_code'], 0, result['stderr'])
+                return result
+            native = NativeExecutor(root / 'agent', synthetic, redact, services=queue, file_reads=False)
+            runtime = AgentRuntime(root / 'agent', native, lambda _: str(workspace))
+            try:
+                for index, text in enumerate(('2028年1月1日10点提醒我喝水', '我修复了一下问题，你再试试')):
+                    accepted = runtime.submit('owner', 'private', 'retry-' + str(index), text, 'p')
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        result = runtime.control('owner', 'private', 'agent.status', 'p', accepted['message_id'])
+                        if result['state'] in ('done', 'uncertain', 'failed'): break
+                        time.sleep(.02)
+                    self.assertEqual(result['state'], 'done')
+                    message = json.loads(json.loads(result['reply'])['toolResult'])
+                    receipt = json.loads(message['content'][0]['content'][0]['text'])
+                    self.assertTrue(receipt['ok'])
+                    self.assertEqual(receipt['state'], 'resolved')
+                    self.assertEqual(receipt['result']['reminder']['state'], 'active')
+                    if index: self.assertTrue(receipt['reused'])
+                self.assertEqual(requests, ['direct_one_shot', 'followup_one_shot'])
+                with store.db() as db:
+                    self.assertEqual(db.execute('SELECT count(*) FROM reminders').fetchone()[0], 1)
+                    self.assertEqual(db.execute('SELECT count(*) FROM reminder_requests').fetchone()[0], 1)
+                with queue.db() as db:
+                    self.assertEqual(db.execute('SELECT count(*) FROM service_requests').fetchone()[0], 1)
+            finally:
+                stop.set(); poller.join(5); runtime.close(); queue.close(); store.close()
+
     def native(self, root, node, packages, subject, tool, args, driver=None, **extra):
         request = dict(id=subject['attempt'], session=subject['session'], root=str(root / 'a/native'), subject=subject,
                        text='synthetic direct request', resume=False, synthetic=True, python=sys.executable,
