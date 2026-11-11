@@ -157,6 +157,35 @@ class RuntimeTests(unittest.TestCase):
         self.wait('interrupted', 'uncertain')
         self.assertEqual(self.calls, [])
 
+    def test_host_exception_logs_only_safe_metadata_and_persists_diagnostic(self):
+        private = 'synthetic-secret-body-key-path'
+        self.runtime.runner = mock.Mock(side_effect=RuntimeError(private))
+        self.runtime.runtime_info = lambda: {'running_source_version': 'c' * 40}
+        with mock.patch('sys.stderr') as stderr:
+            row = self.submit()
+            result = self.wait(row['message_id'], 'uncertain')
+            deadline = time.monotonic() + 2
+            while not stderr.write.called and time.monotonic() < deadline:
+                time.sleep(.01)
+        printed = ''.join(call.args[0] for call in stderr.write.call_args_list)
+        self.assertIn('AGENTBRIDGE_CHAT_ERROR', printed)
+        self.assertIn(row['message_id'], printed)
+        self.assertNotIn(private, printed + json.dumps(result))
+        self.assertEqual(result['diagnostic']['issue'], 'host_exception')
+        self.assertEqual(result['diagnostic']['source_version'], 'c' * 40)
+        self.assertTrue(result['diagnostic']['session_blocked'])
+        private_log = next(self.runtime.diagnostics.root.glob('*.jsonl')).read_text()
+        self.assertNotIn(private, private_log)
+        self.assertIn('host_exception', private_log)
+
+    def test_broken_error_output_does_not_stop_the_chat_lane(self):
+        self.runtime.runner = mock.Mock(side_effect=[AgentError('NOT_STARTED', 'synthetic not started'), 'next reply'])
+        with mock.patch('sys.stderr.write', side_effect=BrokenPipeError('synthetic closed log pipe')):
+            first = self.submit()
+            self.wait(first['message_id'], 'failed')
+            second = self.submit('d2', 'next input')
+            self.assertEqual(self.wait(second['message_id'])['reply'], 'next reply')
+
     def test_lookup_without_new_submission_and_private_modes(self):
         row = self.submit()
         result = self.runtime.control('owner', 'wechat-private', 'agent.lookup', 'p', delivery='d1')
@@ -205,6 +234,7 @@ class NativeFailureTests(unittest.TestCase):
         with self.assertRaises(AgentError) as caught:
             self.executor(turn, threading.Event())
         self.assertEqual(caught.exception.code, code)
+        self.last_error = caught.exception
         return turn
 
     def path(self, turn, kind):
@@ -234,8 +264,19 @@ class NativeFailureTests(unittest.TestCase):
         failed = runtime.submit('owner', 'channel', 'failed', 'fail', 'p')
         result = self.wait(runtime, failed['message_id'], 'failed')
         self.assertEqual(result['evidence']['code'], 'MODEL_FAILED')
+        details = result['diagnostic']
+        self.assertEqual(details['reference'], failed['message_id'])
+        self.assertEqual(details['model_code'], 'SERVER')
+        self.assertEqual(details['http_status'], 500)
+        self.assertEqual(details['stage'], 'turn')
+        self.assertFalse(details['session_blocked'])
+        self.assertTrue(details['group_stopped'])
+        self.assertIn('milliseconds', details)
+        self.assertNotIn('fail', json.dumps({k: v for k, v in details.items() if k != 'issue'}))
         runtime.close()
         runtime = self.runtime()
+        restored = runtime.control('owner', 'channel', 'agent.status', 'p', failed['message_id'])
+        self.assertEqual(restored['diagnostic'], details)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             rows = list(pool.map(lambda _: runtime.submit('owner', 'channel', 'next', 'new input', 'p'), range(8)))
         two = rows[0]
@@ -328,6 +369,7 @@ class NativeFailureTests(unittest.TestCase):
         self.assertFalse(self.executor.recover_failure(turn, legacy=True))
         self.options = {'syntheticFailure': {'code': 'TIMEOUT'}}
         turn = self.fail_turn(self.turn('timeout'), code='DRIVER_UNKNOWN')
+        self.assertEqual(self.last_error.diagnostic['model_code'], 'TIMEOUT')
         self.assertFalse(self.path(turn, 'failures').exists())
         self.assertFalse(self.executor.recover_failure(turn, legacy=True))
 
@@ -479,6 +521,20 @@ class ReceiptTests(unittest.TestCase):
     def test_exact_completed_receipt_can_recover_without_stdout(self):
         self.write()
         self.assertEqual(self.executor.recover(self.turn), 'synthetic receipt')
+
+    def test_driver_diagnostic_is_bound_and_drops_raw_error_response(self):
+        private = 'synthetic-private-upstream-body'
+        payload = {'code': 'DRIVER_FAILED', **{key: self.data[key] for key in ('id', 'session', 'digest')},
+                   'stage': 'turn', 'model_code': 'SERVER', 'http_status': 500, 'message': private, 'frames': [private]}
+        result = {'stderr': json.dumps(payload)}
+        details = self.executor._driver_metadata(self.turn, result)
+        self.assertEqual(details, {'stage': 'turn', 'model_code': 'SERVER', 'http_status': 500})
+        self.assertNotIn(private, json.dumps(details))
+        for field in ('id', 'session', 'digest'):
+            self.assertEqual(self.executor._driver_metadata(self.turn,
+                {'stderr': json.dumps({**payload, field: 'wrong'})}), {})
+        for stderr in ('{', private, None, []):
+            self.assertEqual(self.executor._driver_metadata(self.turn, {'stderr': stderr}), {})
 
     def test_wrong_message_session_or_text_never_recovers(self):
         for field, value in [('id', 'different'), ('session', 'different'), ('digest', 'different'),
@@ -817,10 +873,41 @@ class PluginAgentTests(unittest.TestCase):
             'state': 'failed', 'evidence': {'code': 'MODEL_FAILED'}}))
         asyncio.run(self.main.agent_message(self.event))
         self.main._send_notification.assert_awaited_once_with(Event.unified_msg_origin,
-            '刚才模型服务出了点问题，那条没完成，你可以继续说。')
+            '刚才模型服务出了点问题，那条没完成，你可以继续说。\n排查：MODEL_FAILED')
         asyncio.run(self.main._agent_tick())
         self.main._request.assert_awaited_once()
         self.main._send_notification.assert_awaited_once()
+
+    def test_error_output_has_scoped_lookup_reference_and_safe_category_only(self):
+        mid = 'd' * 32
+        private = 'synthetic-secret-message-and-path'
+        data = {'ok': True, 'message_id': mid, 'state': 'failed', 'evidence': {'code': 'MODEL_FAILED'},
+                'diagnostic': {'model_code': 'SERVER', 'http_status': 500, 'stage': 'turn', 'message': private,
+                               'stack': private, 'source_version': private, 'session_blocked': False}}
+        self.main._control = mock.AsyncMock(return_value=(200, data))
+        self.main._request = mock.AsyncMock()
+        self.event.get_message_str = lambda: '/agent status ' + mid
+        asyncio.run(self.main.agent_message(self.event))
+        text = self.main._send_notification.await_args.args[1]
+        self.assertIn('MODEL_FAILED / SERVER / HTTP 500 / stage=turn', text)
+        self.assertIn('诊断编号：' + mid, text)
+        self.assertIn('/agent status ' + mid, text)
+        self.assertNotIn(private, text)
+        self.main._request.assert_not_awaited()
+        data['diagnostic']['session_blocked'] = True
+        self.assertNotIn('你可以继续说', self.main._agent_failure_text(data))
+        data['diagnostic'].update(model_code=private, http_status=True, stage=private)
+        data['evidence']['code'] = private
+        self.assertNotIn(private, self.main._agent_failure_text(data))
+
+    def test_transport_unknown_prints_delivery_reference_without_resubmit(self):
+        self.main._request = mock.AsyncMock(side_effect=TimeoutError('synthetic private upstream response'))
+        asyncio.run(self.main.agent_message(self.event))
+        text = self.main._send_notification.await_args.args[1]
+        self.assertIn('TRANSPORT_UNKNOWN', text)
+        self.assertIn('投递编号：', text)
+        self.assertNotIn('synthetic private', text)
+        self.main._request.assert_awaited_once()
 
     def test_restart_marks_only_latest_call_intent_unknown_and_keeps_legacy_watch(self):
         self.main._agent_evidence('owner', 'private', 'one', 'calling', 'CALL_INTENT')

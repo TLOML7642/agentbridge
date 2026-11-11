@@ -13,12 +13,14 @@ import threading
 import time
 import uuid
 from agent_character import CharacterMemory
+from agent_diagnostics import Diagnostics, CODES, failure_metadata
 
 
 class AgentError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, diagnostic=None):
         super().__init__(message)
         self.code, self.message = code, message
+        self.diagnostic = failure_metadata(diagnostic)
 
 
 def required(value, limit=256):
@@ -197,6 +199,7 @@ class AgentRuntime:
             self.lease.close()
             raise
         self.runner, self.project, self.evidence = runner, project, evidence
+        self.diagnostics = Diagnostics(self.root.parent / 'diagnostics')
         self.recover_failure = (recover_failure if recover_failure is not None else
                                 runner.recover_failure if callable(getattr(type(runner), 'recover_failure', None)) else None)
         self.tasks = tasks
@@ -242,6 +245,7 @@ class AgentRuntime:
                   seq INTEGER PRIMARY KEY AUTOINCREMENT,message TEXT,state TEXT,code TEXT,created REAL);
                 CREATE TABLE IF NOT EXISTS session_recoveries(
                   message TEXT PRIMARY KEY,session TEXT,created REAL);
+                CREATE TABLE IF NOT EXISTS message_diagnostics(message TEXT PRIMARY KEY,details TEXT);
             ''')
             CharacterMemory.initialize(db)
             if self.logical_projects:
@@ -377,11 +381,21 @@ class AgentRuntime:
         session = db.execute('SELECT * FROM sessions WHERE id=?', (row['session'],)).fetchone()
         evidence = db.execute('SELECT state,code,created FROM message_evidence WHERE message=? ORDER BY seq DESC LIMIT 1',
                               (row['id'],)).fetchone()
-        return {'ok': True, 'message_id': row['id'], 'session_id': row['session'],
+        result = {'ok': True, 'message_id': row['id'], 'session_id': row['session'],
                 'project': session['project'], 'state': row['state'],
                 'reply': row['response'] or '', 'reused': reused,
                 'completion': 'model_turn_completed' if row['state'] == 'done' else row['state'],
                 'evidence': dict(evidence) if evidence else None}
+        if row['state'] in ('failed', 'uncertain', 'cancelled'):
+            saved = db.execute('SELECT details FROM message_diagnostics WHERE message=?', (row['id'],)).fetchone()
+            try:
+                details = failure_metadata(json.loads(saved[0])) if saved else {}
+            except (ValueError, TypeError):
+                details = {}
+            result['diagnostic'] = {**details, 'reference': row['id'],
+                                    'code': evidence['code'] if evidence and evidence['code'] in CODES else 'UNKNOWN',
+                                    'session_blocked': bool(session['blocked'])}
+        return result
 
     def export_profile(self, owner):
         # Serialize the DB snapshot and publication with forgetting/learning.
@@ -691,6 +705,7 @@ class AgentRuntime:
                 self.wake.wait(.25); self.wake.clear()
                 continue
             state, reply, code = 'uncertain', '', 'CALL_UNKNOWN'
+            diagnostic = {}
             try:
                 try:
                     turn['runtime_info'] = self.runtime_info() if self.runtime_info else {'evidence': 'runtime release not supplied'}
@@ -712,13 +727,18 @@ class AgentRuntime:
                 state = 'done'
                 code = 'RECEIPT_COMPLETED'
             except AgentError as exc:
+                diagnostic = exc.diagnostic
                 code = exc.code if re.fullmatch('[A-Z_]{1,64}', exc.code) else 'CALL_UNKNOWN'
                 if exc.code == 'CANCELLED':
                     state = 'cancelled'
                 elif exc.code in ('PROJECT_CHANGED', 'NOT_STARTED', 'MODEL_FAILED'):
                     state = 'failed'
-            except Exception:
-                pass
+            except Exception as exc:
+                diagnostic = {'stage': 'host', 'issue': 'host_exception',
+                              'error_type': type(exc).__name__ if type(exc).__name__ in (
+                                  'OSError', 'ValueError', 'TypeError', 'RuntimeError') else 'Exception'}
+            if state != 'done':
+                diagnostic = failure_metadata({**diagnostic, 'source_version': turn.get('runtime_info', {}).get('running_source_version')})
             with self.db() as db:
                 db.execute('UPDATE messages SET state=?,response=?,ended=? WHERE id=?', (state, reply, time.time(), row['id']))
                 db.execute('INSERT INTO message_evidence(message,state,code,created) VALUES (?,?,?,?)',
@@ -726,6 +746,9 @@ class AgentRuntime:
                 if state == 'failed' and code == 'MODEL_FAILED':
                     db.execute('INSERT OR IGNORE INTO session_recoveries VALUES (?,?,?)',
                                (row['id'], session['id'], time.time()))
+                if state != 'done':
+                    db.execute('INSERT OR REPLACE INTO message_diagnostics VALUES (?,?)',
+                               (row['id'], json.dumps(diagnostic)))
                 if state == 'done' and turn.get('task_events'):
                     db.execute('INSERT OR REPLACE INTO task_cursors VALUES (?,?)',
                                (session['id'], max(event['seq'] for event in turn['task_events'])))
@@ -733,6 +756,14 @@ class AgentRuntime:
                     db.execute('UPDATE sessions SET blocked=1 WHERE id=?', (session['id'],))
                     db.execute("UPDATE messages SET state='uncertain',ended=? WHERE session=? AND state='queued'", (time.time(), session['id']))
                 self.cancels.pop(row['id'], None)
+            if state != 'done':
+                self.diagnostics.emit('terminal', row['id'], code, state=state, details=diagnostic)
+                try:
+                    sys.stderr.write('AGENTBRIDGE_CHAT_ERROR ' + json.dumps({
+                        'reference': row['id'], 'code': code if code in CODES else 'UNKNOWN', 'state': state,
+                        'details': diagnostic}, separators=(',', ':')) + '\n')
+                except (OSError, ValueError):
+                    pass
 
     def close(self):
         self.stop.set()
@@ -934,6 +965,22 @@ class NativeExecutor:
         except (OSError, ValueError, TypeError, AttributeError):
             return None
 
+    @staticmethod
+    def _driver_metadata(turn, result):
+        stderr = result.get('stderr')
+        if not isinstance(stderr, str):
+            return {}
+        for line in reversed(stderr[-8192:].splitlines()[-8:]):
+            try:
+                value = json.loads(line)
+                if (value.get('code') == 'DRIVER_FAILED' and value.get('id') == turn['id']
+                        and value.get('session') == turn['session']
+                        and value.get('digest') == hashlib.sha256(turn['text'].encode()).hexdigest()):
+                    return failure_metadata(value)
+            except (ValueError, TypeError, AttributeError):
+                continue
+        return {}
+
     def __call__(self, turn, cancel):
         payload = {k: turn[k] for k in ('id', 'session', 'text', 'subject', 'resume', 'recent_tasks', 'persona')}
         payload['root'] = str(self.root / 'native')
@@ -971,6 +1018,7 @@ class NativeExecutor:
         command = ['/usr/bin/env', 'ELECTRON_RUN_AS_NODE=1', node, str(source), str(request)]
         try:
             from process_supervisor import ProcessStartError
+            started = time.monotonic()
             try:
                 self._persist_process_record(turn, 'attempts')
                 self.diagnostics.emit('executor', turn['id'], 'START')
@@ -980,9 +1028,12 @@ class NativeExecutor:
                         'OK' if result.get('exit_code') == 0 else 'UNKNOWN')
                 self.diagnostics.emit('executor', turn['id'], code, process=result)
             except ProcessStartError:
-                raise AgentError('NOT_STARTED', '后端进程未启动，无自动重试') from None
+                raise AgentError('NOT_STARTED', '后端进程未启动，无自动重试',
+                                 {'stage': 'executor', 'issue': 'process_not_started'}) from None
+            diagnostic = {**self._driver_metadata(turn, result),
+                          **failure_metadata(result), 'milliseconds': (time.monotonic() - started) * 1000}
             if result.get('cancelled') and result.get('group_stopped'):
-                raise AgentError('CANCELLED', '执行器已停止')
+                raise AgentError('CANCELLED', '执行器已停止', {**diagnostic, 'issue': 'cancelled'})
             recovered = self.recover(turn)
             self.diagnostics.emit('receipt', turn['id'], 'OK' if recovered is not None else 'RECEIPT_MISSING')
             if recovered is not None and result.get('group_stopped', True):
@@ -990,17 +1041,24 @@ class NativeExecutor:
             try:
                 self._persist_process_record(turn, 'stopped', result)
             except (OSError, ValueError):
-                raise AgentError('DRIVER_UNKNOWN', '缺少持久进程停止证据') from None
+                raise AgentError('DRIVER_UNKNOWN', '缺少持久进程停止证据',
+                                 {**diagnostic, 'issue': 'receipt_write_failed'}) from None
             if (result.get('group_stopped') is True and result.get('cancelled') is False
                     and result.get('timed_out') is False and result.get('exit_code') == 1
                     and self.recover_failure(turn)):
-                raise AgentError('MODEL_FAILED', '刚才模型服务出了点问题，那条没完成，你可以继续说')
+                raise AgentError('MODEL_FAILED', '刚才模型服务出了点问题，那条没完成，你可以继续说',
+                                 {**diagnostic, 'issue': 'safe_model_failure'})
             if result.get('exit_code') != 0 or result.get('timed_out') or result.get('out_truncated'):
-                raise AgentError('DRIVER_UNKNOWN', '对话进程未完整返回，不会自动重试')
-            data = json.loads(result['stdout'])
-            if data.get('id') != turn['id'] or data.get('session') != turn['session'] or data.get('completed') is not True:
-                raise AgentError('DRIVER_UNKNOWN', '对话收据不匹配')
-            raise AgentError('DRIVER_UNKNOWN', '缺少持久对话收据，不会自动重试')
+                issue = ('timeout' if result.get('timed_out') else 'process_not_stopped'
+                         if result.get('group_stopped') is not True else diagnostic.get('issue', 'nonzero_exit'))
+                raise AgentError('DRIVER_UNKNOWN', '对话进程未完整返回，不会自动重试', {**diagnostic, 'issue': issue})
+            try:
+                data = json.loads(result['stdout'])
+            except (ValueError, KeyError, TypeError):
+                raise AgentError('DRIVER_UNKNOWN', '对话输出无法核对', {**diagnostic, 'issue': 'invalid_output'}) from None
+            if not isinstance(data, dict) or data.get('id') != turn['id'] or data.get('session') != turn['session'] or data.get('completed') is not True:
+                raise AgentError('DRIVER_UNKNOWN', '对话收据不匹配', {**diagnostic, 'issue': 'invalid_output'})
+            raise AgentError('DRIVER_UNKNOWN', '缺少持久对话收据，不会自动重试', {**diagnostic, 'issue': 'receipt_missing'})
         finally:
             if payload.get('broker'):
                 self.tasks.revoke_capability(payload['broker']['capability'])

@@ -11,9 +11,42 @@ import time
 
 STAGES = frozenset(('rpc', 'native_rpc', 'guard', 'executor', 'receipt', 'terminal'))
 CODES = frozenset(('OK', 'DENIED', 'TIMEOUT', 'CLOSED', 'CANCELLED', 'INVALID_FRAME',
-                   'AUTH_FAIL', 'DB_BUSY', 'UNAVAILABLE', 'UNKNOWN', 'START', 'RECEIPT_MISSING'))
+                   'AUTH_FAIL', 'DB_BUSY', 'UNAVAILABLE', 'UNKNOWN', 'START', 'RECEIPT_MISSING',
+                   'MODEL_FAILED', 'DRIVER_UNKNOWN', 'CALL_UNKNOWN', 'EMPTY_REPLY', 'PROJECT_CHANGED', 'NOT_STARTED'))
 STATES = frozenset(('pending', 'approved', 'expired', 'revoked', 'denied', 'consumed',
                     'verified', 'process-ended', 'cancelled', 'uncertain', 'failed', 'running'))
+
+MODEL_CODES = frozenset(('SERVER', 'AUTH', 'RATE_LIMIT', 'INVALID_REQUEST', 'TIMEOUT', 'TRANSPORT',
+                        'ABORTED', 'STREAM_CLOSED', 'EMPTY_RESPONSE', 'MALFORMED_RESPONSE', 'UNKNOWN'))
+
+
+def failure_metadata(value):
+    """Never accept messages, stack strings, paths, or provider response bodies."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    enums = {'stage': ('request', 'credentials', 'provider', 'session', 'turn', 'flush', 'dispose', 'receipt', 'executor', 'host'),
+             'model_code': MODEL_CODES,
+             'turn_end': ('completed', 'error', 'aborted', 'blocked', 'max-tokens'),
+             'issue': ('safe_model_failure', 'process_not_started', 'process_not_stopped', 'timeout', 'cancelled',
+                       'receipt_missing', 'receipt_write_failed', 'nonzero_exit', 'invalid_output', 'host_exception'),
+             'error_type': ('Error', 'AssertionError', 'LlmError', 'TypeError', 'RangeError', 'SyntaxError',
+                            'AbortError', 'OSError', 'ValueError', 'RuntimeError', 'AgentError', 'Exception')}
+    for key, allowed in enums.items():
+        if isinstance(value.get(key), str) and value[key] in allowed:
+            result[key] = value[key]
+    for key in ('side_effect_attempted', 'inbox_pending', 'group_stopped', 'timed_out', 'cancelled', 'out_truncated'):
+        if type(value.get(key)) is bool:
+            result[key] = value[key]
+    if type(value.get('http_status')) is int and 400 <= value['http_status'] <= 599:
+        result['http_status'] = value['http_status']
+    if type(value.get('exit_code')) is int and -255 <= value['exit_code'] <= 255:
+        result['exit_code'] = value['exit_code']
+    if type(value.get('milliseconds')) in (int, float) and 0 <= value['milliseconds'] <= 3600000:
+        result['milliseconds'] = round(value['milliseconds'], 3)
+    if isinstance(value.get('source_version'), str) and re.fullmatch('[a-f0-9]{40}', value['source_version']):
+        result['source_version'] = value['source_version']
+    return result
 
 
 class Diagnostics:
@@ -57,7 +90,7 @@ class Diagnostics:
         return {'retention_days': 30, 'bytes': size, 'capacity_warning': size is not None and size >= 200 * 1024 * 1024,
                 'write_failed': self.failed, 'failure_evidence': 'private manual cleanup only'}
 
-    def emit(self, stage, correlation='', code='UNKNOWN', state=None, exception=None, milliseconds=None, process=None):
+    def emit(self, stage, correlation='', code='UNKNOWN', state=None, exception=None, milliseconds=None, process=None, details=None):
         try:
             if int(self.clock() // 86400) != self.last_day:
                 self.maintain()
@@ -67,6 +100,8 @@ class Diagnostics:
                 event['correlation'] = correlation
             if state in STATES:
                 event['state'] = state
+            if details is not None:
+                event['details'] = failure_metadata(details)
             if exception is not None:
                 event['exception_type'] = type(exception).__name__ if type(exception).__name__ in (
                     'AgentError', 'OperationalError', 'TimeoutError', 'ConnectionError', 'BrokenPipeError',

@@ -20,7 +20,6 @@ process.umask(0o077);
 let ctx;
 let handle;
 let timer;
-let synthetic = false;
 let stage = 'request';
 let receiptRoot;
 let binding;
@@ -53,7 +52,6 @@ async function persistReceipt(result, kind = 'receipts') {
 
 async function main() {
   const request = JSON.parse(await readFile(process.argv[2], 'utf8'));
-  synthetic = request.synthetic === true;
   assert.match(request.id, /^[a-f0-9]{32}$/);
   assert.match(request.session, /^[a-f0-9]{32}$/);
   assert.equal(request.subject.session, request.session);
@@ -492,8 +490,12 @@ async function main() {
 
 let result;
 let failure;
+let diagnostic;
 try { result = await main(); }
 catch (error) {
+  diagnostic = { ...binding, code: 'DRIVER_FAILED', stage,
+    error_type: ['Error', 'AssertionError', 'LlmError', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError'].includes(error?.name)
+      ? error.name : 'Error' };
   try {
     if (handle && first !== undefined && await ctx.sessions.flush(handle.agent.session)) {
       const events = handle.agent.session.events.filter((event) => event.seq >= first);
@@ -501,6 +503,13 @@ catch (error) {
       const reason = end?.data.reason;
       const status = reason?.error?.status;
       const code = reason?.error?.code;
+      diagnostic.turn_end = reason?.kind;
+      if (['error', 'aborted', 'blocked', 'max-tokens'].includes(reason?.kind)) diagnostic.stage = 'turn';
+      diagnostic.side_effect_attempted = toolAttempted || events.some((event) => event.type.startsWith('tool/'));
+      diagnostic.inbox_pending = handle.agent.inbox.hasPending;
+      if (['SERVER', 'AUTH', 'RATE_LIMIT', 'INVALID_REQUEST', 'TIMEOUT', 'TRANSPORT', 'ABORTED',
+        'STREAM_CLOSED', 'EMPTY_RESPONSE', 'MALFORMED_RESPONSE', 'UNKNOWN'].includes(code)) diagnostic.model_code = code;
+      if (Number.isInteger(status) && status >= 400 && status <= 599) diagnostic.http_status = status;
       if (reason?.kind === 'error' && ['SERVER', 'AUTH', 'RATE_LIMIT', 'INVALID_REQUEST'].includes(code)
           && Number.isInteger(status) && status >= 400 && status <= 599) {
         failure = { ...binding, failed: true, error_code: code, http_status: status,
@@ -512,21 +521,25 @@ catch (error) {
       }
     }
   } catch { failure = undefined; }
-  if (synthetic) process.stderr.write(String(error.stack) + '\n');
-  else process.stderr.write(JSON.stringify({ code: 'DRIVER_FAILED', stage, type: error?.name,
-    frames: String(error?.stack).split('\n').filter((line) => /^\s+at /.test(line)).slice(0, 5) }) + '\n');
   process.exitCode = 1;
 }
 finally {
   clearInterval(timer);
   try { if (handle) await handle.dispose(); if (ctx) await ctx.fiber.dispose(); }
-  catch { failure = undefined; process.exitCode = 1; }
+  catch { failure = undefined; diagnostic = { ...binding, code: 'DRIVER_FAILED', stage: 'dispose' }; process.exitCode = 1; }
+}
+if (diagnostic) {
+  // Emit only typed metadata, never error.message/stack/cause or response bodies.
+  if (!['completed', 'error', 'aborted', 'blocked', 'max-tokens'].includes(diagnostic.turn_end)) delete diagnostic.turn_end;
+  process.stderr.write(JSON.stringify(diagnostic) + '\n');
 }
 if (failure) {
   try { await persistReceipt(failure, 'failures'); }
-  catch { process.stderr.write('DRIVER_FAILURE_RECEIPT_FAILED\n'); }
+  catch { process.stderr.write(JSON.stringify({ ...diagnostic, code: 'DRIVER_FAILED', stage: 'receipt',
+    issue: 'receipt_write_failed' }) + '\n'); }
 }
 if (!process.exitCode && result) {
   try { await persistReceipt(result); io.write(JSON.stringify(result) + '\n'); }
-  catch { process.stderr.write('DRIVER_RECEIPT_FAILED\n'); process.exitCode = 1; }
+  catch { process.stderr.write(JSON.stringify({ ...binding, code: 'DRIVER_FAILED', stage: 'receipt',
+    issue: 'receipt_write_failed' }) + '\n'); process.exitCode = 1; }
 }

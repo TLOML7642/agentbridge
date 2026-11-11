@@ -5,10 +5,30 @@ import tempfile
 import unittest
 from unittest import mock
 
-from agent_diagnostics import Diagnostics
+from agent_diagnostics import Diagnostics, failure_metadata
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_failure_details_are_typed_allowlist_not_redacted_raw_error_text(self):
+        private = 'synthetic-secret-message-and-path'
+        details = {'stage': 'turn', 'model_code': 'SERVER', 'http_status': 500, 'turn_end': 'error',
+                   'side_effect_attempted': False, 'inbox_pending': False, 'group_stopped': True,
+                   'exit_code': 1, 'source_version': 'c' * 40, 'message': private, 'stack': private,
+                   'stderr': private, 'api_key': private, 'error_type': private}
+        sanitized = failure_metadata(details)
+        self.assertEqual(sanitized['http_status'], 500)
+        self.assertNotIn('error_type', sanitized)
+        self.assertNotIn(private, json.dumps(sanitized))
+        with tempfile.TemporaryDirectory() as root:
+            diag = Diagnostics(root)
+            diag.emit('terminal', 'a' * 32, 'MODEL_FAILED', state='failed', details=details)
+            event = json.loads(next(diag.root.glob('*.jsonl')).read_text())
+            self.assertEqual(event['details'], sanitized)
+            self.assertEqual(event['code'], 'MODEL_FAILED')
+        for value in ({'http_status': True, 'exit_code': True, 'milliseconds': float('nan'),
+                       'model_code': private, 'stage': private, 'source_version': private}, None, private, []):
+            self.assertEqual(failure_metadata(value), {})
+
     def test_health_metadata_remains_available_when_diagnostic_directory_is_unreadable(self):
         with tempfile.TemporaryDirectory() as root:
             diag = Diagnostics(root)

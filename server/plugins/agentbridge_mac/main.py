@@ -299,15 +299,47 @@ class Main(star.Star):
         return self._delivery(event, text, project)
 
     @staticmethod
-    def _agent_failure_text(data):
+    def _agent_diagnostic_text(data, code=None, delivery=None):
+        details = data.get('diagnostic') if isinstance(data.get('diagnostic'), dict) else {}
+        evidence = data.get('evidence') if isinstance(data.get('evidence'), dict) else {}
+        code = code or evidence.get('code') or details.get('code')
+        allowed = {'MODEL_FAILED', 'DRIVER_UNKNOWN', 'CALL_UNKNOWN', 'RESTART_UNKNOWN', 'CANCELLED',
+                   'PROJECT_CHANGED', 'NOT_STARTED', 'EMPTY_REPLY', 'SESSION_UNCERTAIN', 'NOT_ACCEPTED',
+                   'TRANSPORT_UNKNOWN', 'ACCEPT_UNKNOWN', 'RESULT_UNKNOWN', 'BUSY', 'UNAVAILABLE',
+                   'AUTH_FAIL', 'INVALID_MESSAGE', 'DELIVERY_CONFLICT', 'ENTRY_ERROR'}
+        parts = [code if isinstance(code, str) and code in allowed else 'UNKNOWN']
+        model = details.get('model_code')
+        if isinstance(model, str) and model in {'SERVER', 'AUTH', 'RATE_LIMIT', 'INVALID_REQUEST', 'TIMEOUT',
+                                              'TRANSPORT', 'ABORTED', 'STREAM_CLOSED', 'EMPTY_RESPONSE',
+                                              'MALFORMED_RESPONSE', 'UNKNOWN'}:
+            parts.append(model)
+        if type(details.get('http_status')) is int and 400 <= details['http_status'] <= 599:
+            parts.append('HTTP ' + str(details['http_status']))
+        stage = details.get('stage')
+        if isinstance(stage, str) and stage in {'request', 'credentials', 'provider', 'session', 'turn',
+                                              'flush', 'dispose', 'receipt', 'executor', 'host'}:
+            parts.append('stage=' + stage)
+        text = '\n排查：' + ' / '.join(parts)
+        reference = data.get('message_id')
+        if isinstance(reference, str) and re.fullmatch('[a-f0-9]{32}', reference):
+            text += '\n诊断编号：' + reference + '\n查询：/agent status ' + reference
+        elif isinstance(delivery, str) and re.fullmatch('[a-f0-9]{32,64}', delivery):
+            text += '\n投递编号：' + delivery
+        return text
+
+    @classmethod
+    def _agent_failure_text(cls, data):
+        suffix = cls._agent_diagnostic_text(data)
         if data.get('state') == 'failed' and (data.get('evidence') or {}).get('code') == 'MODEL_FAILED':
-            return '刚才模型服务出了点问题，那条没完成，你可以继续说。'
+            blocked = (data.get('diagnostic') or {}).get('session_blocked') is True
+            return ('刚才模型服务出了点问题，那条没完成。当前会话仍需核对最新状态。' if blocked else
+                    '刚才模型服务出了点问题，那条没完成，你可以继续说。') + suffix
         if data.get('state') == 'uncertain':
             return ('上一条是否完成还不能确认，我不会自动重发。可用 /agent status 查询、'
-                    '/agent cancel <消息ID> 取消，或 /agent new 明确开启新会话。')
+                    '/agent cancel <消息ID> 取消，或 /agent new 明确开启新会话。') + suffix
         if data.get('state') == 'cancelled':
-            return '这轮已停止，不会自动重发。可用 /agent status 查询，或 /agent new 开新会话。'
-        return '这条消息没有完成。可用 /agent status 查看原因。'
+            return '这轮已停止，不会自动重发。可用 /agent status 查询，或 /agent new 开新会话。' + suffix
+        return '这条消息没有完成。可用 /agent status 查看原因。' + suffix
 
     async def _agent_tick(self):
         with self._agent_db() as db:
@@ -506,6 +538,7 @@ class Main(star.Star):
             text = '/' + text
         # Stop AstrBot's ordinary model path BEFORE network calls, including failures.
         event.stop_event()
+        delivery = None
         try:
             components = getattr(event.message_obj, 'message', [])
             if not text or not components or any(type(part).__name__ != 'Plain' for part in components):
@@ -630,6 +663,8 @@ class Main(star.Star):
                         reply += '\n' + data['message']
                 elif data.get('messages') is not None:
                     reply = '\n'.join(f"{item['message_id']} {item['state']} @{item['project']}" for item in data['messages']) or '暂无对话记录。'
+                elif data.get('state') in ('failed', 'uncertain', 'cancelled') and data.get('message_id'):
+                    reply = self._agent_failure_text(data)
                 else:
                     reply = data.get('reply') or data.get('message') or data.get('state') or str(data.get('error', {}).get('message', status))
                 await self._agent_local(event, reply)
@@ -650,7 +685,9 @@ class Main(star.Star):
                 status, data = await self._request(event, MESSAGES_URL, {'delivery_id': delivery, 'text': text})
             except Exception:
                 self._agent_evidence(sender, channel, delivery, 'accept_unknown', 'TRANSPORT_UNKNOWN')
-                raise
+                await self._agent_local(event, '连接中断，消息是否受理还不能确认，我不会自动重发。'
+                                        + self._agent_diagnostic_text({}, code='TRANSPORT_UNKNOWN', delivery=delivery))
+                return
             if data.get('message_id'):
                 self._agent_evidence(sender, channel, delivery, 'accepted', 'ACCEPTED', data['message_id'])
                 with self._agent_db() as db:
@@ -671,11 +708,12 @@ class Main(star.Star):
                     reply = '这条消息被入口拒绝，没有交给模型。可用 /agent status 查询。'
                 else:
                     reply = '消息是否受理还不能确认，我不会自动重发。可用 /agent status 查询，或 /agent new 明确开启新会话。'
-                await self._agent_local(event, reply)
+                await self._agent_local(event, reply + self._agent_diagnostic_text(data, code=code, delivery=delivery))
         except ReminderError as exc:
             await self._agent_local(event, str(exc))
         except Exception:
-            await self._agent_local(event, 'DSH 对话入口暂不可用，不会自动切换模型或新建任务。请查询原消息状态。')
+            await self._agent_local(event, 'DSH 对话入口暂不可用，不会自动切换模型或新建任务。请查询原消息状态。'
+                                    + self._agent_diagnostic_text({}, code='ENTRY_ERROR', delivery=delivery))
 
     @staticmethod
     def _reminder_reply(result):
