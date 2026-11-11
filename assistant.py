@@ -97,6 +97,7 @@ class App:
 
             self.agent = AgentRuntime(self.root / 'agent', run, self.projects.workspace,
                                       recover=getattr(runner, 'recover', lambda _: None),
+                                      recover_failure=runner.recover_failure if isinstance(runner, NativeExecutor) else None,
                                       allow_learning=False, services=queue, runtime_info=self.runtime_info,
                                       logical_projects=True, tasks=self.executor, allow_personality=allow_personality)
             ready.set()

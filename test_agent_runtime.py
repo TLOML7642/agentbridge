@@ -434,6 +434,31 @@ class NativeFailureTests(unittest.TestCase):
             runtime.submit('owner', 'channel', 'new', 'hello', 'p')
         self.assertEqual(len(self.calls), 1)
 
+    def test_real_assistant_wrapper_preserves_read_only_legacy_recovery(self):
+        import assistant
+        runtime = self.runtime()
+        failed = runtime.submit('owner', 'channel', 'failed', 'fail', 'p')
+        self.wait(runtime, failed['message_id'], 'failed')
+        runtime.close()
+        turn = self.calls[-1]
+        with runtime.db() as db:
+            db.execute("UPDATE messages SET state='uncertain' WHERE id=?", (turn['id'],))
+            db.execute('DELETE FROM session_recoveries')
+            db.execute('UPDATE sessions SET blocked=1')
+            db.execute("INSERT INTO message_evidence(message,state,code,created) VALUES (?,'uncertain','DRIVER_UNKNOWN',?)",
+                       (turn['id'], time.time()))
+        app = assistant.App(self.root, 'synthetic-secret', {'owner'}, {'channel'}, services=False,
+                            runner=self.executor)
+        try:
+            self.assertIsNot(app.agent.runner, self.executor)
+            restored = self.wait(app.agent, turn['id'], 'failed')
+            self.assertEqual(restored['evidence']['code'], 'MODEL_FAILED')
+            self.assertEqual(len(self.calls), 1)
+            with app.agent.db() as db:
+                self.assertEqual(db.execute('SELECT blocked FROM sessions').fetchone()[0], 0)
+        finally:
+            app.close()
+
 
 class ReceiptTests(unittest.TestCase):
     def setUp(self):

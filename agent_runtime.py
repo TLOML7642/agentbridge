@@ -181,7 +181,7 @@ class AgentRuntime:
     their native session instead of automatically replaying a possibly used input.
     """
     def __init__(self, root, runner, project, evidence=lambda *_: [], recover=lambda *_: None, allow_learning=False, tasks=None,
-                 services=None, runtime_info=None, logical_projects=False, allow_personality=False):
+                 services=None, runtime_info=None, logical_projects=False, allow_personality=False, recover_failure=None):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -197,6 +197,8 @@ class AgentRuntime:
             self.lease.close()
             raise
         self.runner, self.project, self.evidence = runner, project, evidence
+        self.recover_failure = (recover_failure if recover_failure is not None else
+                                runner.recover_failure if callable(getattr(type(runner), 'recover_failure', None)) else None)
         self.tasks = tasks
         self.services, self.runtime_info = services, runtime_info
         self.logical_projects = logical_projects
@@ -316,7 +318,7 @@ class AgentRuntime:
                    (row['id'], row['session'], time.time()))
 
     def _recover_failed(self, db, session):
-        recover = getattr(type(self.runner), 'recover_failure', None)
+        recover = self.recover_failure
         if not recover:
             return
         rows = db.execute("SELECT * FROM messages WHERE session=? AND state='uncertain'", (session,)).fetchall()
@@ -325,7 +327,7 @@ class AgentRuntime:
                                   (row['id'],)).fetchone()
             # Queued inputs quarantined behind an unknown turn were never run.
             if evidence and evidence['code'] in ('DRIVER_UNKNOWN', 'RESTART_UNKNOWN', 'CALL_UNKNOWN'):
-                if recover(self.runner, dict(row), legacy=True) is True:
+                if recover(dict(row), legacy=True) is True:
                     self._record_failure(db, row)
         if not db.execute("SELECT 1 FROM messages WHERE session=? AND state IN ('uncertain','cancelled','running')",
                           (session,)).fetchone():
