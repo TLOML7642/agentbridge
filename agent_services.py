@@ -83,6 +83,29 @@ def reminder_set_intent(text):
     return direct, recurring
 
 
+def reminder_dialogue_allowed(text):
+    """Source gate, not an NLP command grammar. The existing model interprets
+    the user's dialogue and asks about ambiguity before calling reminder_set.
+    """
+    if not isinstance(text, str) or not text.strip() or len(text) > 12000 or '\0' in text:
+        return False
+    marker = re.search(r'提醒|闹钟|remind me\b', text, re.I)
+    prefix = text[:marker.start()] if marker else text
+    head = text[:marker.end()] if marker else text
+    if re.search(r'^\s*[>“"「]|(?:^|\n)\s*>|```|工具输出|引用|转发', text):
+        return False
+    if re.search(r'他说|她说|它说|阅读|读取|(?:文档|文件|网页).{0,8}(?:里|中|内|指令|要求|说|写)|'
+                 r'https?://|read\b|instructions?\b|执行.{0,8}命令|取消|撤销|是否|怎么|如何|看看|了解|知道|解释|什么|explain', prefix, re.I):
+        return False
+    if re.search(r'(?:关闭|取消|跳过|绕过|修改).{0,8}(?:审批|权限|授权)', prefix):
+        return False
+    if re.search(r'(?:不要|无需|不用|不必|别)(?:再|给我|帮我|设置|任何|这个|这条|定|设){0,3}(?:提醒|闹钟|设|定)|do not|don.t', head, re.I):
+        return False
+    if re.search(r'(?:不要|别|不用|无需|不必).{0,6}(?:试|重试)', head):
+        return False
+    return True
+
+
 class ServiceQueue:
     def __init__(self, root, clock=time.time, profile=None):
         self.root, self.clock = Path(root), clock
@@ -161,19 +184,22 @@ class ServiceQueue:
             cancel_allowed = (isinstance(direct_text, str) and len(direct_text) <= 300
                               and not re.search(r'[\n>“”"`]|文档|文件|引用|转发|https?://', direct_text)
                               and bool(re.search(r'(?:取消|撤销|删除|cancel).*(?:提醒|remind)|(?:提醒|remind).*(?:取消|撤销|删除|cancel)', direct_text, re.I)))
-            set_allowed, recurring = reminder_set_intent(direct_text)
+            explicit, recurring = reminder_set_intent(direct_text)
+            set_allowed = reminder_dialogue_allowed(direct_text)
             origin = None
-            if reminder_retry(direct_text) and reminder_context is not None:
-                required(reminder_context.get('attempt'), 128)
-                set_allowed = reminder_context.get('direct') is True
-                recurring = reminder_context.get('recurring') is True
-                origin = reminder_context['attempt'] if set_allowed else None
+            if reminder_retry(direct_text):
+                set_allowed = False
+                if reminder_context is not None:
+                    required(reminder_context.get('attempt'), 128)
+                    set_allowed = reminder_context.get('direct') is True
+                    recurring = reminder_context.get('recurring') is True
+                    origin = reminder_context['attempt'] if set_allowed else None
             from agent_runtime import Preferences
             self.capabilities[token] = (dict(subject), cancel, time.monotonic() + 120, cancel_allowed, set_allowed,
                                         Preferences.direct_change(direct_text), recurring, origin)
             return {'socket': self.socket_path, 'capability': token, 'purpose': 'personal-service',
                     'reminder_intent': 'recurring_unsupported' if recurring else 'followup_one_shot' if origin else
-                                       'direct_one_shot' if set_allowed else 'missing'}
+                                       'direct_one_shot' if set_allowed and explicit else 'dialogue' if set_allowed else 'missing'}
 
     def revoke_capability(self, token):
         with self.lock:
@@ -208,7 +234,7 @@ class ServiceQueue:
                 if cap[6]:
                     raise AgentError('REMINDER_RECURRING_UNSUPPORTED', '目前只支持单次微信消息提醒，不支持工作日/每天循环；不能擅自拆成多个日期。')
                 if not cap[4]:
-                    raise AgentError('REMINDER_INTENT_REQUIRED', '请在本轮直接说明设置单次提醒；不能按文件或工具内容设置。')
+                    raise AgentError('REMINDER_INTENT_REQUIRED', '当前来源或接续范围未能安全确定；只追问缺少的信息，不要求固定口令。')
             if (not isinstance(tool, str) or tool not in SERVICE_FIELDS or not isinstance(args, dict)
                     or not SERVICE_FIELDS[tool][0] <= args.keys() or args.keys() - set.union(*SERVICE_FIELDS[tool])
                     or any(not isinstance(v, str) or len(v) > 1000 or '\0' in v for v in args.values())):
@@ -229,6 +255,18 @@ class ServiceQueue:
                     old = db.execute('SELECT * FROM service_requests WHERE id=?', (previous[0]['id'],)).fetchone()
                     return {'ok': True, 'request_id': old['id'], 'state': old['state'], 'reused': True,
                             'result': json.loads(old['result']) if old['result'] else None}
+                if tool == 'reminder_set' and not args.get('reminder_id'):
+                    same = db.execute('SELECT * FROM service_requests WHERE sender=? AND channel=? AND conversation=? '
+                                      'AND project=? AND tool=? AND arguments=? AND expires>? ORDER BY seq DESC LIMIT 2',
+                                      (subject['sender'], subject['channel'], subject['conversation'], subject['project'],
+                                       tool, encoded, self.clock() - 7200)).fetchall()
+                    if len(same) > 1:
+                        raise AgentError('REMINDER_FOLLOWUP_CONFLICT', '存在多条相同原请求，请先查询，不自动增加副本。')
+                    if same:
+                        self._expire(db, self.clock())
+                        old = db.execute('SELECT * FROM service_requests WHERE id=?', (same[0]['id'],)).fetchone()
+                        return {'ok': True, 'request_id': old['id'], 'state': old['state'], 'reused': True,
+                                'result': json.loads(old['result']) if old['result'] else None}
                 old = db.execute('SELECT * FROM service_requests WHERE id=?', (identifier,)).fetchone()
                 if old:
                     if old['digest'] != digest:
