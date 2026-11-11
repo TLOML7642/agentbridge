@@ -23,6 +23,9 @@ let timer;
 let synthetic = false;
 let stage = 'request';
 let receiptRoot;
+let binding;
+let first;
+let toolAttempted = false;
 
 function displayReply(reply) {
   const limit = 2400;
@@ -34,8 +37,8 @@ function displayReply(reply) {
   return reply.slice(0, end) + notice;
 }
 
-async function persistReceipt(result) {
-  const directory = path.join(receiptRoot, 'receipts');
+async function persistReceipt(result, kind = 'receipts') {
+  const directory = path.join(receiptRoot, kind);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const temporary = path.join(directory, result.id + '.tmp');
   const output = await open(temporary, 'wx', 0o600);
@@ -58,6 +61,8 @@ async function main() {
   assert.ok(path.isAbsolute(request.root));
   await mkdir(request.root, { recursive: true, mode: 0o700 });
   receiptRoot = request.root;
+  binding = { id: request.id, session: request.session,
+    digest: createHash('sha256').update(request.text).digest('hex') };
   process.env.DSH_HOME = request.root;
   const { Context } = await load('cordis');
   const { default: Agents } = await load('dsh-agent');
@@ -157,6 +162,9 @@ async function main() {
   const boundary = installToolBoundary(ctx, {
     allowServiceIntent: (envelope) => Boolean(request.services) && serviceIntents.has(envelope.tool),
   }); // File writes remain OFF, independently of personal service intents.
+  // Count attempts before dispatch, including denied calls. Conservatively
+  // treat every tool as potentially effectful, not just successful writes.
+  ctx.on('tools/pre-execute', (_exec, next) => { toolAttempted = true; return next(); });
   const root = await realpath(request.subject.cwd);
   const readRoot = request.read_mode === 'snapshot' ? await realpath(request.read_root) : root;
   const privateRoot = await realpath(path.dirname(request.root));
@@ -362,6 +370,11 @@ async function main() {
         return;
       }
       const users = options.messages.filter((message) => message.source.kind === 'user');
+      if (request.syntheticFailure) {
+        const { LlmError } = await load('dsh-llm');
+        throw new LlmError('synthetic model failure', request.syntheticFailure.code,
+          { status: request.syntheticFailure.status });
+      }
       const texts = users.map((message) => message.content.filter((block) => block.type === 'text').map((b) => b.text).join(''));
       const text = JSON.stringify({ turns: texts.length, first: texts[0], last: texts.at(-1),
         ...(syntheticTools.length ? { toolResult: JSON.stringify(options.messages.findLast((message) => message.source.kind === 'tool')) } : {}),
@@ -421,6 +434,17 @@ async function main() {
     ? await ctx.agents.resume({ resumeSessionId: request.session, agentOptions, setup })
     : await ctx.agents.create({ sessionId: request.session, agentOptions, meta: { cwd: root }, setup });
   boundary.seal();
+  for (const recovery of request.recoveries ?? []) {
+    assert.match(recovery, /^[a-f0-9]{32}$/);
+    const message = freezeMessage({ id: 'bridge-recovery:' + recovery, role: 'user',
+      source: { kind: 'plugin', plugin: 'agentbridge-recovery', form: 'notice' },
+      content: [{ type: 'text', text: '宿主恢复说明：上一轮模型服务明确失败，未完成且没有工具动作尝试。'
+        + '宿主没有重试或补做失败请求。保留历史仅作上下文，只处理当前新输入；不得自行补做旧请求。' }] });
+    const previous = handle.agent.session.events.find((event) => event.type === 'user/message'
+      && event.data.id === message.id);
+    if (previous) assert.deepEqual(previous.data, message, 'recovery notice conflict');
+    else handle.agent.session.append('user/message', message, { surfaceOp: 'append' });
+  }
   // Use the native context-message surface with explicit plugin provenance,
   // not a custom event (this runtime cannot register custom durable types).
   // A single append commits identity AND evidence, without an inbox/marker gap.
@@ -451,7 +475,7 @@ async function main() {
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
     boundary.revoke(); handle.agent.cancel({ kind: 'user' });
   });
-  const first = handle.agent.session.seq;
+  first = handle.agent.session.seq;
   stage = 'turn';
   handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: request.text }], source: { kind: 'user' } }));
   await handle.agent.whenIdle();
@@ -467,8 +491,27 @@ async function main() {
 }
 
 let result;
+let failure;
 try { result = await main(); }
 catch (error) {
+  try {
+    if (handle && first !== undefined && await ctx.sessions.flush(handle.agent.session)) {
+      const events = handle.agent.session.events.filter((event) => event.seq >= first);
+      const end = events.findLast((event) => event.type === 'turn/end');
+      const reason = end?.data.reason;
+      const status = reason?.error?.status;
+      const code = reason?.error?.code;
+      if (reason?.kind === 'error' && ['SERVER', 'AUTH', 'RATE_LIMIT', 'INVALID_REQUEST'].includes(code)
+          && Number.isInteger(status) && status >= 400 && status <= 599) {
+        failure = { ...binding, failed: true, error_code: code, http_status: status,
+          turn: end.data.turn, end_seq: end.seq, stage: 'turn/end',
+          side_effect_attempted: toolAttempted || events.some((event) => event.type.startsWith('tool/'))
+            || events.some((event) => event.type === 'assistant/message'
+              && event.data.message.content.some((block) => block.type === 'tool-call')),
+          inbox_pending: handle.agent.inbox.hasPending };
+      }
+    }
+  } catch { failure = undefined; }
   if (synthetic) process.stderr.write(String(error.stack) + '\n');
   else process.stderr.write(JSON.stringify({ code: 'DRIVER_FAILED', stage, type: error?.name,
     frames: String(error?.stack).split('\n').filter((line) => /^\s+at /.test(line)).slice(0, 5) }) + '\n');
@@ -477,7 +520,11 @@ catch (error) {
 finally {
   clearInterval(timer);
   try { if (handle) await handle.dispose(); if (ctx) await ctx.fiber.dispose(); }
-  catch { process.exitCode = 1; }
+  catch { failure = undefined; process.exitCode = 1; }
+}
+if (failure) {
+  try { await persistReceipt(failure, 'failures'); }
+  catch { process.stderr.write('DRIVER_FAILURE_RECEIPT_FAILED\n'); }
 }
 if (!process.exitCode && result) {
   try { await persistReceipt(result); io.write(JSON.stringify(result) + '\n'); }

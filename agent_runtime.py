@@ -238,6 +238,8 @@ class AgentRuntime:
                   PRIMARY KEY(sender,channel,project));
                 CREATE TABLE IF NOT EXISTS message_evidence(
                   seq INTEGER PRIMARY KEY AUTOINCREMENT,message TEXT,state TEXT,code TEXT,created REAL);
+                CREATE TABLE IF NOT EXISTS session_recoveries(
+                  message TEXT PRIMARY KEY,session TEXT,created REAL);
             ''')
             CharacterMemory.initialize(db)
             if self.logical_projects:
@@ -257,6 +259,8 @@ class AgentRuntime:
                             'RECEIPT_RECOVERED' if restored is not None else 'RESTART_UNKNOWN', time.time()))
             db.execute("UPDATE messages SET state='uncertain',ended=? WHERE state='queued' "
                        "AND session IN (SELECT id FROM sessions WHERE blocked=1)", (time.time(),))
+            for session in db.execute('SELECT * FROM sessions WHERE blocked=1').fetchall():
+                self._recover_failed(db, session['id'])
         self.thread = threading.Thread(target=self._loop, name='agent-chat-lane', daemon=True)
         self.thread.start()
 
@@ -303,6 +307,30 @@ class AgentRuntime:
             db.execute('INSERT OR REPLACE INTO logical_heads VALUES (?,?,?,?)', (sender, channel, project, sid))
         return db.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
 
+    @staticmethod
+    def _record_failure(db, row):
+        db.execute("UPDATE messages SET state='failed',ended=? WHERE id=?", (time.time(), row['id']))
+        db.execute('INSERT INTO message_evidence(message,state,code,created) VALUES (?,?,?,?)',
+                   (row['id'], 'failed', 'MODEL_FAILED', time.time()))
+        db.execute('INSERT OR IGNORE INTO session_recoveries VALUES (?,?,?)',
+                   (row['id'], row['session'], time.time()))
+
+    def _recover_failed(self, db, session):
+        recover = getattr(type(self.runner), 'recover_failure', None)
+        if not recover:
+            return
+        rows = db.execute("SELECT * FROM messages WHERE session=? AND state='uncertain'", (session,)).fetchall()
+        for row in rows:
+            evidence = db.execute('SELECT code FROM message_evidence WHERE message=? ORDER BY seq DESC LIMIT 1',
+                                  (row['id'],)).fetchone()
+            # Queued inputs quarantined behind an unknown turn were never run.
+            if evidence and evidence['code'] in ('DRIVER_UNKNOWN', 'RESTART_UNKNOWN', 'CALL_UNKNOWN'):
+                if recover(self.runner, dict(row), legacy=True) is True:
+                    self._record_failure(db, row)
+        if not db.execute("SELECT 1 FROM messages WHERE session=? AND state IN ('uncertain','cancelled','running')",
+                          (session,)).fetchone():
+            db.execute('UPDATE sessions SET blocked=0 WHERE id=?', (session,))
+
     def submit(self, sender, channel, delivery, text, project):
         required(sender); required(channel); required(delivery, 128); required(text, 12000)
         fingerprint = hashlib.sha256(text.encode()).hexdigest()
@@ -320,7 +348,9 @@ class AgentRuntime:
             cwd = os.path.realpath(self.project(project))
             session = self._session(db, sender, channel, project, cwd)
             if session['blocked']:
-                raise AgentError('SESSION_UNCERTAIN', '上一轮结果未知；请先查询，或用 /agent new 开新会话')
+                self._recover_failed(db, session['id'])
+                if db.execute('SELECT blocked FROM sessions WHERE id=?', (session['id'],)).fetchone()[0]:
+                    raise AgentError('SESSION_UNCERTAIN', '上一轮结果仍不能确认；请先查询，或用 /agent new 开新会话')
             mid = uuid.uuid4().hex
             db.execute('INSERT INTO messages(id,sender,channel,delivery,digest,session,text,state,created) '
                        "VALUES (?,?,?,?,?,?,?,'queued',?)", (mid, sender, channel, delivery, fingerprint, session['id'], text, time.time()))
@@ -647,6 +677,9 @@ class AgentRuntime:
                     turn = {**dict(row), 'subject': {k: session[k] for k in ('sender', 'channel', 'project', 'cwd')},
                             'resume': db.execute("SELECT 1 FROM messages WHERE session=? AND state='done' LIMIT 1", (row['session'],)).fetchone() is not None}
                     turn['subject'].update(conversation=session['id'], session=session['id'], attempt=row['id'])
+                    turn['recoveries'] = [item[0] for item in db.execute(
+                        'SELECT message FROM session_recoveries WHERE session=? ORDER BY created,message', (session['id'],))]
+                    turn['resume'] = turn['resume'] or bool(turn['recoveries'])
                     from agent_services import reminder_context
                     turn['reminder_context'] = reminder_context(db, dict(row))
                     turn['persona'] = self.preferences.view(db, session['sender'])
@@ -680,7 +713,7 @@ class AgentRuntime:
                 code = exc.code if re.fullmatch('[A-Z_]{1,64}', exc.code) else 'CALL_UNKNOWN'
                 if exc.code == 'CANCELLED':
                     state = 'cancelled'
-                elif exc.code in ('PROJECT_CHANGED', 'NOT_STARTED'):
+                elif exc.code in ('PROJECT_CHANGED', 'NOT_STARTED', 'MODEL_FAILED'):
                     state = 'failed'
             except Exception:
                 pass
@@ -688,6 +721,9 @@ class AgentRuntime:
                 db.execute('UPDATE messages SET state=?,response=?,ended=? WHERE id=?', (state, reply, time.time(), row['id']))
                 db.execute('INSERT INTO message_evidence(message,state,code,created) VALUES (?,?,?,?)',
                            (row['id'], state, code, time.time()))
+                if state == 'failed' and code == 'MODEL_FAILED':
+                    db.execute('INSERT OR IGNORE INTO session_recoveries VALUES (?,?,?)',
+                               (row['id'], session['id'], time.time()))
                 if state == 'done' and turn.get('task_events'):
                     db.execute('INSERT OR REPLACE INTO task_cursors VALUES (?,?)',
                                (session['id'], max(event['seq'] for event in turn['task_events'])))
@@ -714,7 +750,7 @@ class NativeExecutor:
     def __init__(self, root, run_task, redact, tasks=None, services=None, file_reads=True, remote=None, snapshots=None):
         if type(file_reads) is not bool:
             raise ValueError('file_reads must be an explicit boolean')
-        self.root, self.run_task, self.redact = Path(root), run_task, redact
+        self.root, self.run_task, self.redact = Path(root).resolve(), run_task, redact
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         self.tasks = tasks
@@ -724,6 +760,158 @@ class NativeExecutor:
         self.snapshots = snapshots
         from agent_diagnostics import Diagnostics
         self.diagnostics = Diagnostics(self.root.parent / 'diagnostics')
+
+    @staticmethod
+    def _private_bytes(path, limit):
+        # Refuse symlinks in every component, not only the final file.
+        if any(part.is_symlink() for part in (path, *path.parents)):
+            raise ValueError('symlink in evidence path')
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_size > limit):
+                raise ValueError('unsafe evidence file')
+            return source.read(limit + 1)
+
+    def _persist_process_record(self, turn, kind, result=None):
+        directory = self.root / 'native' / kind
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        value = {key: turn[key] for key in ('id', 'session')}
+        value.update(digest=hashlib.sha256(turn['text'].encode()).hexdigest())
+        if result is not None:
+            value.update({key: result.get(key) for key in ('group_stopped', 'timed_out', 'cancelled', 'exit_code')})
+        temporary = directory / (turn['id'] + '.tmp')
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as output:
+            json.dump(value, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(temporary, directory / (turn['id'] + '.json'))
+        temporary.unlink()
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _native_failure(self, turn):
+        paths = list((self.root / 'native' / 'sessions').glob('*/' + turn['session'] + '/session.jsonl'))
+        if len(paths) != 1:
+            return None
+        raw = self._private_bytes(paths[0], 16 * 1024 * 1024)
+        if not raw.endswith(b'\n'):
+            return None
+        records = [json.loads(line) for line in raw.splitlines()]
+        header, events = records[0], records[1:]
+        if (header.get('type') != 'session' or header.get('version') != 0
+                or header.get('id') != turn['session'] or header.get('seedLength', 0) != 0):
+            return None
+        # Require a complete, ordered native log, including packed chunk runs.
+        seq = 0
+        inbox = {'next-turn': [], 'next-step': []}
+        for event in events:
+            if event['type'] in ('text-chunks', 'reasoning-chunks', 'tool-call-chunks'):
+                if event['seq0'] != seq:
+                    return None
+                key = 'args' if event['type'] == 'tool-call-chunks' else 'texts'
+                seq += len(event['data'][key])
+            else:
+                if event['seq'] != seq:
+                    return None
+                seq += 1
+            if event['type'] == 'agent/inbox/spliced':
+                data = event['data']
+                pending = inbox[data['target']]
+                start, count = data['start'], data.get('removedCount', 0)
+                if (type(start) is not int or type(count) is not int or start < 0 or count < 0
+                        or start + count > len(pending) or not isinstance(data['inserted'], list)):
+                    return None
+                pending[start:start + count] = data['inserted']
+        if any(inbox.values()) or not events or events[-1]['type'] != 'turn/end':
+            return None
+        end = events[-1]
+        reason = end['data']['reason']
+        error = reason.get('error', {})
+        status, code = error.get('status'), error.get('code')
+        expected = {'SERVER': range(500, 600), 'AUTH': (401, 403), 'RATE_LIMIT': (429,), 'INVALID_REQUEST': (400, 413)}
+        if reason.get('kind') != 'error' or code not in expected or type(status) is not int or status not in expected[code]:
+            return None
+        starts = [index for index, event in enumerate(events) if event['type'] == 'turn/start']
+        if not starts:
+            return None
+        tail = events[starts[-1]:]
+        if (tail[0]['data']['turn'] != end['data']['turn'] or tail[-2]['type'] != 'step/end'
+                or tail[-2]['data']['turn'] != end['data']['turn']):
+            return None
+        users = []
+        for event in tail:
+            if event['type'].startswith('tool/') or event['type'] == 'tool-call-chunks':
+                return None
+            if event['type'] == 'llm/chunk' and ('tool-call' in json.dumps(event['data'].get('chunk', {}))):
+                return None
+            if event['type'] == 'assistant/message' and any(
+                    block['type'] == 'tool-call' for block in event['data']['message']['content']):
+                return None
+            if event['type'] == 'user/message' and event['data']['source']['kind'] == 'user':
+                users.append(event['data'])
+        if len(users) != 1 or users[0]['content'] != [{'type': 'text', 'text': turn['text']}]:
+            return None
+        user_event = next(event for event in tail if event['type'] == 'user/message'
+                          and event['data']['source']['kind'] == 'user')
+        if (turn.get('created') is not None and user_event['time'] < turn['created'] * 1000
+                or turn.get('ended') is not None and end['time'] > turn['ended'] * 1000):
+            return None
+        return {'turn': end['data']['turn'], 'end_seq': end['seq'], 'error_code': code, 'http_status': status}
+
+    def recover_failure(self, turn, legacy=False):
+        """Read-only reconciliation. Never resume a native agent to inspect it."""
+        try:
+            if not all(re.fullmatch('[a-f0-9]{32}', turn[key]) for key in ('id', 'session')):
+                return False
+            digest = hashlib.sha256(turn['text'].encode()).hexdigest()
+            if turn.get('digest', digest) != digest:
+                return False
+            native = self._native_failure(turn)
+            if not native:
+                return False
+            success = self.root / 'native/receipts' / (turn['id'] + '.json')
+            if os.path.lexists(success):
+                return False
+            failure = self.root / 'native/failures' / (turn['id'] + '.json')
+            if os.path.lexists(failure):
+                data = json.loads(self._private_bytes(failure, 32768))
+                if (any(data.get(key) != value for key, value in native.items())
+                        or data.get('id') != turn['id'] or data.get('session') != turn['session']
+                        or data.get('digest') != digest or data.get('failed') is not True
+                        or data.get('side_effect_attempted') is not False or data.get('inbox_pending') is not False
+                        or data.get('stage') != 'turn/end'):
+                    return False
+            elif not legacy or os.path.lexists(self.root / 'native/attempts' / (turn['id'] + '.json')):
+                return False
+            stopped = self.root / 'native/stopped' / (turn['id'] + '.json')
+            if os.path.lexists(stopped):
+                data = json.loads(self._private_bytes(stopped, 32768))
+                return (data.get('id') == turn['id'] and data.get('session') == turn['session']
+                        and data.get('digest') == digest and data.get('group_stopped') is True
+                        and data.get('cancelled') is False and data.get('timed_out') is False
+                        and type(data.get('exit_code')) is int and data['exit_code'] == 1)
+            if not legacy:
+                return False
+            # Old executors have no stopped receipt. Require their exact
+            # supervisor terminal evidence, with no later start/conflict.
+            matches = []
+            for path in sorted(self.diagnostics.root.glob('diagnostic-????????.jsonl')):
+                raw = self._private_bytes(path, 16 * 1024 * 1024)
+                if not raw.endswith(b'\n'):
+                    return False
+                matches.extend(event for event in map(json.loads, raw.splitlines())
+                               if event.get('correlation') == turn['id'] and event.get('stage') == 'executor')
+            return (len(matches) == 2 and matches[0]['code'] == 'START' and matches[1]['code'] == 'UNKNOWN'
+                    and matches[1].get('process') == {'exit_code': 1, 'group_stopped': True,
+                                                     'cancelled': False, 'timed_out': False})
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError):
+            return False
 
     def recover(self, turn):
         if not re.fullmatch(r'[a-f0-9]{32}', turn['id']):
@@ -749,6 +937,7 @@ class NativeExecutor:
         payload['root'] = str(self.root / 'native')
         payload['python'] = sys.executable
         payload['runtime_info'] = turn.get('runtime_info', {'evidence': 'runtime release not supplied'})
+        payload['recoveries'] = turn.get('recoveries', [])
         from agent_reads import LEGACY_SCOPE, SOURCE_FILES
         payload['read_scope'] = {'scope': LEGACY_SCOPE, 'files': sorted(SOURCE_FILES)}
         if not self.file_reads:
@@ -781,6 +970,7 @@ class NativeExecutor:
         try:
             from process_supervisor import ProcessStartError
             try:
+                self._persist_process_record(turn, 'attempts')
                 self.diagnostics.emit('executor', turn['id'], 'START')
                 result = self.run_task(command, cwd=turn['subject']['cwd'], timeout=120,
                                        cancel_check=cancel.is_set)
@@ -795,6 +985,14 @@ class NativeExecutor:
             self.diagnostics.emit('receipt', turn['id'], 'OK' if recovered is not None else 'RECEIPT_MISSING')
             if recovered is not None and result.get('group_stopped', True):
                 return recovered
+            try:
+                self._persist_process_record(turn, 'stopped', result)
+            except (OSError, ValueError):
+                raise AgentError('DRIVER_UNKNOWN', '缺少持久进程停止证据') from None
+            if (result.get('group_stopped') is True and result.get('cancelled') is False
+                    and result.get('timed_out') is False and result.get('exit_code') == 1
+                    and self.recover_failure(turn)):
+                raise AgentError('MODEL_FAILED', '刚才模型服务出了点问题，那条没完成，你可以继续说')
             if result.get('exit_code') != 0 or result.get('timed_out') or result.get('out_truncated'):
                 raise AgentError('DRIVER_UNKNOWN', '对话进程未完整返回，不会自动重试')
             data = json.loads(result['stdout'])

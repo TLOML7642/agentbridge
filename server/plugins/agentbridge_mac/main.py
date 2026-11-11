@@ -298,6 +298,17 @@ class Main(star.Star):
             raise ValueError('stable adapter delivery id is required')
         return self._delivery(event, text, project)
 
+    @staticmethod
+    def _agent_failure_text(data):
+        if data.get('state') == 'failed' and (data.get('evidence') or {}).get('code') == 'MODEL_FAILED':
+            return '刚才模型服务出了点问题，那条没完成，你可以继续说。'
+        if data.get('state') == 'uncertain':
+            return ('上一条是否完成还不能确认，我不会自动重发。可用 /agent status 查询、'
+                    '/agent cancel <消息ID> 取消，或 /agent new 明确开启新会话。')
+        if data.get('state') == 'cancelled':
+            return '这轮已停止，不会自动重发。可用 /agent status 查询，或 /agent new 开新会话。'
+        return '这条消息没有完成。可用 /agent status 查看原因。'
+
     async def _agent_tick(self):
         with self._agent_db() as db:
             rows = [dict(row) for row in db.execute("SELECT * FROM agent_outbox WHERE state='watch' ORDER BY created LIMIT 50")]
@@ -321,8 +332,7 @@ class Main(star.Star):
                                      (data.get('evidence') or {}).get('code', 'HOST_STATUS'), data.get('message_id', ''))
             if data.get('state') not in ('done', 'failed', 'cancelled', 'uncertain'):
                 continue
-            text = data.get('reply') if data['state'] == 'done' else (
-                '这轮对话未完成，状态：' + data['state'] + '。不会自动重跑；可用 /agent status 查询，/agent new 开新会话。')
+            text = data.get('reply') if data['state'] == 'done' else self._agent_failure_text(data)
             key = (row['sender'], row['channel'], row['delivery'])
             with self._agent_db() as db:
                 claim = db.execute("UPDATE agent_outbox SET state='sending',message_id=? "
@@ -652,8 +662,16 @@ class Main(star.Star):
                 state = ('not_accepted' if code == 'NOT_ACCEPTED' else
                          'accept_unknown' if code in (None, 'ACCEPT_UNKNOWN', 'RESULT_UNKNOWN') else 'rejected')
                 self._agent_evidence(sender, channel, delivery, state, code)
-                await self._agent_local(event, ('连接未建立，这条消息未受理。' if state == 'not_accepted' else '消息受理未确认。')
-                                        + '不会自动补发或切换聊天模型；保留原编号查询对账。')
+                if code == 'SESSION_UNCERTAIN':
+                    reply = ('这条消息没有受理，因为上一条是否完成还不能确认。不会自动重发；'
+                             '可用 /agent status 查询、/agent cancel <消息ID> 取消，或 /agent new 明确开启新会话。')
+                elif state == 'not_accepted':
+                    reply = '连接未建立，这条消息没有受理，也没有调用模型。'
+                elif state == 'rejected':
+                    reply = '这条消息被入口拒绝，没有交给模型。可用 /agent status 查询。'
+                else:
+                    reply = '消息是否受理还不能确认，我不会自动重发。可用 /agent status 查询，或 /agent new 明确开启新会话。'
+                await self._agent_local(event, reply)
         except ReminderError as exc:
             await self._agent_local(event, str(exc))
         except Exception:

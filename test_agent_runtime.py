@@ -165,6 +165,276 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.root.stat().st_mode & 0o777, 0o700)
 
 
+class NativeFailureTests(unittest.TestCase):
+    def setUp(self):
+        node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
+        packages = os.environ.get('AGENTBRIDGE_TEST_NATIVE_PACKAGES')
+        if not node or not packages:
+            self.skipTest('explicit pinned native test runtime not supplied')
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='native-failure-'))).resolve()
+        self.workspace = self.root / 'workspace'
+        self.workspace.mkdir()
+        (self.workspace / 'README.md').write_text('synthetic read')
+        self.stack.enter_context(mock.patch.dict(os.environ, {'AGENTBRIDGE_AGENT_NODE': node,
+            'AGENTBRIDGE_AGENT_PACKAGES': packages}))
+        self.calls, self.options = [], {}
+
+        def run(command, **kwargs):
+            from process_supervisor import run_task
+            request = Path(command[-1])
+            data = json.loads(request.read_text())
+            self.calls.append(data)
+            data.update(synthetic=True, **self.options)
+            if data['text'] == 'fail':
+                data['syntheticFailure'] = {'code': 'SERVER', 'status': 500}
+            request.write_text(json.dumps(data))
+            return run_task(command, **kwargs)
+
+        self.executor = NativeExecutor(self.root / 'agent', run, lambda text: text)
+
+    def turn(self, text='fail'):
+        sid, mid = uuid.uuid4().hex, uuid.uuid4().hex
+        return dict(id=mid, session=sid, text=text, resume=False, recent_tasks=[], persona={},
+                    subject=dict(sender='owner', channel='channel', project='p', cwd=str(self.workspace),
+                                 session=sid, conversation=sid, attempt=mid))
+
+    def fail_turn(self, turn=None, code='MODEL_FAILED'):
+        turn = turn or self.turn()
+        with self.assertRaises(AgentError) as caught:
+            self.executor(turn, threading.Event())
+        self.assertEqual(caught.exception.code, code)
+        return turn
+
+    def path(self, turn, kind):
+        return self.root / 'agent/native' / kind / (turn['id'] + '.json')
+
+    def log(self, turn):
+        return next((self.root / 'agent/native/sessions').glob('*/' + turn['session'] + '/session.jsonl'))
+
+    def runtime(self):
+        runtime = AgentRuntime(self.root / 'agent', self.executor, lambda _: str(self.workspace), recover=self.executor.recover)
+        self.stack.callback(runtime.close)
+        return runtime
+
+    def wait(self, runtime, mid, state):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            result = runtime.control('owner', 'channel', 'agent.status', 'p', mid)
+            if result['state'] == state:
+                return result
+            time.sleep(.01)
+        self.fail('native synthetic turn did not reach ' + state)
+
+    def test_chat_error_next_chat_same_native_session_and_one_notice(self):
+        runtime = self.runtime()
+        one = runtime.submit('owner', 'channel', 'one', 'hello', 'p')
+        self.wait(runtime, one['message_id'], 'done')
+        failed = runtime.submit('owner', 'channel', 'failed', 'fail', 'p')
+        result = self.wait(runtime, failed['message_id'], 'failed')
+        self.assertEqual(result['evidence']['code'], 'MODEL_FAILED')
+        runtime.close()
+        runtime = self.runtime()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            rows = list(pool.map(lambda _: runtime.submit('owner', 'channel', 'next', 'new input', 'p'), range(8)))
+        two = rows[0]
+        result = self.wait(runtime, two['message_id'], 'done')
+        self.assertEqual(one['session_id'], failed['session_id'])
+        self.assertEqual(two['session_id'], one['session_id'])
+        self.assertEqual(len({row['message_id'] for row in rows}), 1)
+        self.assertEqual([call['text'] for call in self.calls], ['hello', 'fail', 'new input'])
+        native_reply = json.loads(result['reply'])
+        self.assertEqual(native_reply['turns'], 3)
+        self.assertEqual(native_reply['first'], 'hello')
+        self.assertEqual(native_reply['last'], 'new input')
+        third = runtime.submit('owner', 'channel', 'third', 'another input', 'p')
+        self.wait(runtime, third['message_id'], 'done')
+        events = [json.loads(line) for line in self.log(self.calls[-1]).read_text().splitlines()]
+        notices = [event for event in events if event['type'] == 'user/message'
+                   and event['data']['source'].get('plugin') == 'agentbridge-recovery']
+        self.assertEqual(len(notices), 1)
+        self.assertIn('不得自行补做旧请求', notices[0]['data']['content'][0]['text'])
+        with self.assertRaises(AgentError):
+            runtime.control('other', 'channel', 'agent.status', 'p', failed['message_id'])
+        with runtime.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM session_recoveries').fetchone()[0], 1)
+
+    def test_receipt_corruption_missing_and_conflict_fail_closed(self):
+        turn = self.fail_turn()
+        path = self.path(turn, 'failures')
+        original = path.read_bytes()
+        data = json.loads(original)
+        for field, value in [('digest', 'bad'), ('session', uuid.uuid4().hex), ('http_status', 502),
+                             ('side_effect_attempted', True), ('inbox_pending', True), ('end_seq', -1), ('failed', 1)]:
+            with self.subTest(field=field):
+                path.write_text(json.dumps({**data, field: value}))
+                self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+        path.write_text('{')
+        self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+        path.unlink()
+        self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+        path.write_bytes(original)
+        path.chmod(0o600)
+        self.assertTrue(self.executor.recover_failure(turn))
+        alternate = path.with_suffix('.original')
+        path.rename(alternate)
+        path.symlink_to(alternate)
+        self.assertFalse(self.executor.recover_failure(turn))
+        path.unlink()
+        alternate.rename(path)
+        path.chmod(0o644)
+        self.assertFalse(self.executor.recover_failure(turn))
+        path.chmod(0o600)
+        success = self.path(turn, 'receipts')
+        success.parent.mkdir(exist_ok=True)
+        success.write_text('{}')
+        self.assertFalse(self.executor.recover_failure(turn))
+
+    def test_native_pending_tools_torn_tail_and_wrong_input_fail_closed(self):
+        turn = self.fail_turn()
+        path = self.log(turn)
+        original = path.read_bytes()
+        records = [json.loads(line) for line in original.splitlines()]
+        variants = []
+        for kind in ('pending', 'tool', 'input', 'end'):
+            changed = json.loads(json.dumps(records))
+            if kind == 'pending':
+                event = next(e for e in changed if e['type'] == 'agent/inbox/spliced' and e['data'].get('removedCount'))
+                event['data']['removedCount'] = 0
+            elif kind == 'tool':
+                event = next(e for e in changed if e['type'] == 'step/end')
+                event['type'] = 'tool/call'
+            elif kind == 'input':
+                event = next(e for e in changed if e['type'] == 'user/message' and e['data']['source']['kind'] == 'user')
+                event['data']['content'][0]['text'] = 'other input'
+            else:
+                changed[-1]['data']['reason']['kind'] = 'aborted'
+            variants.append(('\n'.join(map(json.dumps, changed)) + '\n').encode())
+        for raw in [original[:-1], *variants]:
+            path.write_bytes(raw)
+            self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+        path.write_bytes(original)
+        stopped = self.path(turn, 'stopped')
+        stopped_data = json.loads(stopped.read_text())
+        for field, value in [('group_stopped', False), ('timed_out', True), ('cancelled', True), ('exit_code', -9)]:
+            stopped.write_text(json.dumps({**stopped_data, field: value}))
+            self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+
+    def test_tool_attempt_then_model_error_and_timeout_stay_unknown(self):
+        self.options = {'syntheticTools': [{'name': 'read_text', 'arguments': {'file': 'README.md'}}]}
+        turn = self.fail_turn(code='DRIVER_UNKNOWN')
+        self.assertTrue(json.loads(self.path(turn, 'failures').read_text())['side_effect_attempted'])
+        self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+        self.options = {'syntheticFailure': {'code': 'TIMEOUT'}}
+        turn = self.fail_turn(self.turn('timeout'), code='DRIVER_UNKNOWN')
+        self.assertFalse(self.path(turn, 'failures').exists())
+        self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+
+    def test_tools_in_earlier_turn_do_not_taint_new_failed_turn(self):
+        runtime = self.runtime()
+        self.options = {'syntheticTools': [{'name': 'read_text', 'arguments': {'file': 'README.md'}}]}
+        first = runtime.submit('owner', 'channel', 'read', 'read', 'p')
+        self.wait(runtime, first['message_id'], 'done')
+        self.options = {}
+        failed = runtime.submit('owner', 'channel', 'failed', 'fail', 'p')
+        self.wait(runtime, failed['message_id'], 'failed')
+        self.assertEqual(first['session_id'], failed['session_id'])
+
+    def test_legacy_log_reconciliation_is_read_only_idempotent_and_source_bound(self):
+        runtime = self.runtime()
+        failed = runtime.submit('owner', 'channel', 'failed', 'fail', 'p')
+        self.wait(runtime, failed['message_id'], 'failed')
+        runtime.close()
+        turn = self.calls[-1]
+        before = self.log(turn).read_bytes()
+        for kind in ('attempts', 'failures', 'stopped'):
+            self.path(turn, kind).unlink()
+        with runtime.db() as db:
+            db.execute("UPDATE messages SET state='uncertain' WHERE id=?", (turn['id'],))
+            db.execute('UPDATE sessions SET blocked=1')
+            db.execute('DELETE FROM session_recoveries')
+            db.execute("INSERT INTO message_evidence(message,state,code,created) VALUES (?,'uncertain','DRIVER_UNKNOWN',?)",
+                       (turn['id'], time.time()))
+        self.assertTrue(self.executor.recover_failure(turn, legacy=True))
+        runtime = self.runtime()
+        restored = self.wait(runtime, turn['id'], 'failed')
+        self.assertEqual(restored['evidence']['code'], 'MODEL_FAILED')
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(before, self.log(turn).read_bytes())
+        with runtime.db() as db:
+            runtime._recover_failed(db, turn['session'])
+            self.assertEqual(db.execute('SELECT count(*) FROM session_recoveries').fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT blocked FROM sessions').fetchone()[0], 0)
+            codes = [row[0] for row in db.execute('SELECT code FROM message_evidence')]
+            self.assertIn('DRIVER_UNKNOWN', codes)
+        other = runtime.submit('other', 'channel', 'new', 'hello', 'p')
+        self.assertNotEqual(other['session_id'], turn['session'])
+
+    def test_restart_before_stopped_proof_stays_locked_then_recovers_once(self):
+        runtime = self.runtime()
+        failed = runtime.submit('owner', 'channel', 'failed', 'fail', 'p')
+        self.wait(runtime, failed['message_id'], 'failed')
+        runtime.close()
+        turn = self.calls[-1]
+        stopped = self.path(turn, 'stopped')
+        saved = stopped.read_bytes()
+        stopped.unlink()
+        diagnostics = next(self.executor.diagnostics.root.glob('*.jsonl'))
+        diagnostics.write_text('')
+        with runtime.db() as db:
+            db.execute("UPDATE messages SET state='running' WHERE id=?", (turn['id'],))
+            db.execute('DELETE FROM session_recoveries')
+        runtime = self.runtime()
+        self.wait(runtime, turn['id'], 'uncertain')
+        with self.assertRaises(AgentError) as caught:
+            runtime.submit('owner', 'channel', 'new', 'hello', 'p')
+        self.assertEqual(caught.exception.code, 'SESSION_UNCERTAIN')
+        self.assertEqual(len(self.calls), 1)
+        stopped.write_bytes(saved)
+        stopped.chmod(0o600)
+        new = runtime.submit('owner', 'channel', 'new', 'hello', 'p')
+        self.wait(runtime, new['message_id'], 'done')
+        self.assertEqual(new['session_id'], turn['session'])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_legacy_requires_unique_supervisor_proof_and_message_time_binding(self):
+        turn = self.fail_turn()
+        for kind in ('attempts', 'failures', 'stopped'):
+            self.path(turn, kind).unlink()
+        path = next(self.executor.diagnostics.root.glob('*.jsonl'))
+        original = path.read_bytes()
+        self.assertTrue(self.executor.recover_failure(turn, legacy=True))
+        path.write_bytes(b'')
+        self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+        path.write_bytes(original + original)
+        self.assertFalse(self.executor.recover_failure(turn, legacy=True))
+        path.write_bytes(original)
+        self.assertFalse(self.executor.recover_failure({**turn, 'ended': 1}, legacy=True))
+        self.assertFalse(self.executor.recover_failure({**turn, 'created': time.time() + 60}, legacy=True))
+
+    def test_quarantined_other_input_remains_blocked_after_known_failure_recovers(self):
+        runtime = self.runtime()
+        failed = runtime.submit('owner', 'channel', 'failed', 'fail', 'p')
+        self.wait(runtime, failed['message_id'], 'failed')
+        runtime.close()
+        turn = self.calls[-1]
+        with runtime.db() as db:
+            db.execute("UPDATE messages SET state='uncertain' WHERE id=?", (turn['id'],))
+            db.execute('DELETE FROM session_recoveries')
+            db.execute('UPDATE sessions SET blocked=1')
+            db.execute("INSERT INTO message_evidence(message,state,code,created) VALUES (?,'uncertain','DRIVER_UNKNOWN',?)",
+                       (turn['id'], time.time()))
+            db.execute('INSERT INTO messages(id,sender,channel,delivery,digest,session,text,state,created) '
+                       "VALUES (?,'owner','channel','quarantined','x',?,'never replay','uncertain',?)",
+                       (uuid.uuid4().hex, turn['session'], time.time()))
+        runtime = self.runtime()
+        self.wait(runtime, turn['id'], 'failed')
+        with self.assertRaises(AgentError):
+            runtime.submit('owner', 'channel', 'new', 'hello', 'p')
+        self.assertEqual(len(self.calls), 1)
+
+
 class ReceiptTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='agent-receipt-test-')
@@ -504,6 +774,28 @@ class PluginAgentTests(unittest.TestCase):
             codes = [tuple(row) for row in db.execute('SELECT state,code FROM agent_delivery_evidence ORDER BY seq')]
         self.assertEqual(codes, [('calling', 'CALL_INTENT'), ('accept_unknown', 'TRANSPORT_UNKNOWN'), ('uncertain', 'DRIVER_UNKNOWN')])
         self.main._request.assert_awaited_once()
+
+    def test_definite_rejection_is_not_displayed_as_unknown_admission(self):
+        self.main._request = mock.AsyncMock(return_value=(409, {'error': {'code': 'SESSION_UNCERTAIN'}}))
+        self.main._control = mock.AsyncMock(return_value=(200, {'ok': False, 'code': 'NOT_FOUND'}))
+        asyncio.run(self.main.agent_message(self.event))
+        reply = self.main._send_notification.await_args.args[1]
+        self.assertIn('这条消息没有受理', reply)
+        self.assertNotIn('消息受理未确认', reply)
+        self.assertIn('/agent new', reply)
+        asyncio.run(self.main._agent_tick())
+        self.main._request.assert_awaited_once()
+
+    def test_model_failure_has_natural_continue_notice_and_no_resubmit(self):
+        self.main._request = mock.AsyncMock(return_value=(202, {'message_id': 'failed-model'}))
+        self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'message_id': 'failed-model',
+            'state': 'failed', 'evidence': {'code': 'MODEL_FAILED'}}))
+        asyncio.run(self.main.agent_message(self.event))
+        self.main._send_notification.assert_awaited_once_with(Event.unified_msg_origin,
+            '刚才模型服务出了点问题，那条没完成，你可以继续说。')
+        asyncio.run(self.main._agent_tick())
+        self.main._request.assert_awaited_once()
+        self.main._send_notification.assert_awaited_once()
 
     def test_restart_marks_only_latest_call_intent_unknown_and_keeps_legacy_watch(self):
         self.main._agent_evidence('owner', 'private', 'one', 'calling', 'CALL_INTENT')
