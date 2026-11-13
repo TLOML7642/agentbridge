@@ -7,11 +7,12 @@ from pathlib import Path
 import signal
 import sqlite3
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from agent_runtime import AgentError
+from agent_protocol import AgentError
 from agent_tasks import TaskRuntime
 from agent_task_executor import NativeTaskExecutor
 from executor_api import dispatch
@@ -72,6 +73,28 @@ class App:
             raise AgentError('NOT_FOUND', '旧只读项目绑定不存在')
         return rows[0]
 
+    def get_job(self, identifier):
+        rows = self.legacy_rows('SELECT * FROM jobs WHERE job_id=?', (identifier,))
+        reused = False
+        if not rows:
+            aliases = self.legacy_rows('SELECT job_id FROM aliases WHERE alias=?', (identifier,))
+            rows = self.legacy_rows('SELECT * FROM jobs WHERE job_id=?', (aliases[0]['job_id'],)) if aliases else []
+            reused = bool(rows)
+        if not rows:
+            return None
+        row = rows[0]
+        value = dict(ok=row['status'] == 'done', code=row['error_code'], reused=reused,
+                     job_id=row['job_id'], project=row['project'], backend=row['backend'], status=row['status'],
+                     exit_code=row['exit_code'], peak_rss_mb=row['peak_rss_mb'], message=row['result'] or '',
+                     attempt_id=row['attempt_id'], cancel_requested_at=row['cancel_requested_at'], phase=row['status'],
+                     elapsed_seconds=max(0, (row['ended_at'] or time.time()) - (row['started_at'] or row['created_at'])),
+                     events=self.legacy_rows('SELECT * FROM completion_events WHERE job_id=? ORDER BY seq', (row['job_id'],)))
+        if row['status'] == 'pending-confirm':
+            value.update(ok=False, code='LEGACY_DISABLED', message='旧执行入口已停用；旧待确认任务保留但不会运行。')
+        if reused:
+            value['requested_id'] = identifier
+        return value
+
     def close(self):
         self.agent_tasks.close()
 
@@ -107,8 +130,8 @@ def server(app, secret, senders, channels, port):
                 return self.reply(200, {'ok': True, 'role': app.role, 'boot_id': app.boot_id, 'legacy_execution': 'disabled'})
             if route.path == '/job':
                 identifier = parse_qs(route.query).get('id', [''])[0]
-                rows = app.legacy_rows('SELECT job_id,status,error_code FROM jobs WHERE job_id=?', (identifier,))
-                return self.reply(200 if rows else 404, {'ok': bool(rows), 'job': rows[0] if rows else None})
+                value = app.get_job(identifier)
+                return self.reply(200 if value else 404, value or {'ok': False, 'code': 'NOT_FOUND'})
             return self.reply(404, {'ok': False, 'code': 'NOT_FOUND'})
 
         def do_POST(self):

@@ -931,7 +931,7 @@ class PluginAgentTests(unittest.TestCase):
         self.event.stop_event.assert_not_called()
         self.main._request.assert_not_awaited()
 
-    def test_wake_prefix_stripped_mac_switch_stays_in_fixed_control_lane(self):
+    def test_wake_prefix_stripped_mac_switch_is_disabled_without_model_or_control(self):
         self.event.get_message_str = lambda: 'mac use bridge-canary'
         self.main._request = mock.AsyncMock()
         self.main._control = mock.AsyncMock(return_value=(200, {'ok': True, 'current': 'bridge-canary'}))
@@ -941,10 +941,9 @@ class PluginAgentTests(unittest.TestCase):
         # The real command filter receives the remainder after matching mac.
         replies = asyncio.run(collect(self.main.mac(self.event, 'use bridge-canary')))
         self.assertEqual(len(replies), 1)
-        payload = self.main._control.await_args.args[1]
-        self.assertEqual(payload['op'], 'use')
-        self.assertEqual(payload['project'], 'bridge-canary')
-        self.assertTrue(payload['delivery_id'])
+        self.main._control.assert_not_awaited()
+        self.event.stop_event.assert_called_once()
+        self.assertIn('停用', replies[0])
         self.main._request.assert_not_awaited()
 
     def test_wake_prefix_stripped_agent_memory_never_calls_model(self):

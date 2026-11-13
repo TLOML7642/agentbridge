@@ -12,6 +12,7 @@
 !/shim.py
 !/native_boundary.mjs
 !/agent_runtime.py
+!/agent_protocol.py
 !/agent_character.py
 !/agent_services.py
 !/agent_driver.mjs

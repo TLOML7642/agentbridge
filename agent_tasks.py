@@ -11,7 +11,7 @@ import time
 import uuid
 
 from agent_approvals import ApprovalAuthority, canonical, fingerprint
-from agent_runtime import AgentError, required
+from agent_protocol import AgentError, required
 from agent_actions import prepare
 from agent_diagnostics import Diagnostics
 from computer_actions import INPUTS as COMPUTER_TOOLS, AUTOMATIC, inspect as computer_inspect
@@ -299,6 +299,9 @@ class TaskRuntime:
             try:
                 actual_arguments = prepare(cwd, tool, arguments, prefixes)
             except (OSError, ValueError, TypeError):
+                if tool in ('computer_trash_file', 'computer_trash_files'):
+                    raise AgentError('INVALID_MESSAGE', '移入废纸篓只允许1至20个普通文件、合计不超过256 MiB；'
+                                     '目录、链接、重复文件或保护路径不允许，超限不会自动拆批。未登记动作') from None
                 raise AgentError('INVALID_MESSAGE', '目标、命令或参数不在已审核范围，未登记动作') from None
             identifier = uuid.uuid4().hex
             db.execute('INSERT INTO tasks(id,origin,delivery,sender,channel,conversation,project,cwd,device,inode,session,'
@@ -362,6 +365,7 @@ class TaskRuntime:
                     if row['state'] in ('queued', 'awaiting_confirmation'):
                         db.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (identifier,))
                         self.approvals.revoke(identifier)
+                        self.cancels.pop(identifier, None)
                         self._event(db, row, 'terminal', {'state': 'cancelled', 'result': None})
                     elif row['state'] == 'running':
                         self.cancels[identifier].set()
@@ -450,6 +454,7 @@ class TaskRuntime:
                 db.execute("UPDATE tasks SET state='denied',result=? WHERE id=? AND state='awaiting_confirmation'",
                            (canonical(result), row['id']))
                 self._event(db, row, 'terminal', {'state': 'denied', 'result': result})
+                self.cancels.pop(row['id'], None)
         return None, deadline
 
     @contextmanager

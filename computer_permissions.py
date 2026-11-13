@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 
-from agent_runtime import AgentError
+from agent_protocol import AgentError
 from agent_approvals import canonical, fingerprint
 
 
@@ -36,10 +36,20 @@ def create(db, subject, arguments):
 
 
 def matching(db, subject, arguments):
-    digest = fingerprint(binding(arguments))
-    row = db.execute("SELECT id FROM run_permissions WHERE sender=? AND channel=? AND digest=? AND state='active'",
-                     (subject['sender'], subject['channel'], digest)).fetchone()
-    return row['id'] if row else None
+    value = binding(arguments)
+    digest = fingerprint(value)
+    rows = db.execute("SELECT * FROM run_permissions WHERE sender=? AND channel=? AND state='active'",
+                      (subject['sender'], subject['channel'])).fetchall()
+    matched = None
+    for row in rows:
+        old = json.loads(row['binding'])
+        if (old['project_path'], old['configuration']) != (value['project_path'], value['configuration']):
+            continue
+        if row['digest'] == digest:
+            matched = row['id']
+        else:
+            db.execute("UPDATE run_permissions SET state='invalidated' WHERE id=?", (row['id'],))
+    return matched
 
 
 def listing(db, sender, channel):

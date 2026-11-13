@@ -27,7 +27,8 @@ async function action(args, execution) {
   const home = path.join(request.root, 'empty-home');
   await mkdir(home, { recursive: true, mode: 0o700 });
   const input = { root: execution.cwd, tool: request.tool, arguments: args, home,
-    private_prefixes: request.private_prefixes };
+    private_prefixes: request.private_prefixes,
+    journal: path.join(request.root, 'action-evidence', request.id + '.jsonl') };
   const result = await new Promise((resolve, reject) => {
     const script = path.join(import.meta.dirname, 'agent_actions.py');
     const code = 'import sys,runpy;sys.path.insert(0,sys.argv[1]);runpy.run_path(sys.argv[2],run_name="__main__")';

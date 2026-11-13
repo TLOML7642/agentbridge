@@ -5,7 +5,7 @@ from pathlib import Path
 import stat
 import sys
 
-from agent_runtime import AgentError
+from agent_protocol import AgentError
 from agent_diagnostics import Diagnostics
 
 

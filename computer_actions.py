@@ -12,6 +12,7 @@ import sys
 import uuid
 import xml.etree.ElementTree as ET
 import plistlib
+from agent_reads import DENIED
 
 
 INPUTS = {
@@ -24,7 +25,7 @@ INPUTS = {
 }
 AUTOMATIC = frozenset(('computer_open_project', 'computer_resize_image', 'computer_edit_image'))
 PROTECTED = frozenset(('Library', '.Trash', 'Applications'))
-MAX_FILE = 64 * 1024 * 1024
+MAX_FILE = 256 * 1024 * 1024
 
 
 def canonical(value):
@@ -41,7 +42,7 @@ def locate(root, value, private_prefixes=(), absent=False):
     if path == root or root not in path.parents:
         raise ValueError('path outside user files')
     parts = path.relative_to(root).parts
-    if any(part.startswith('.') for part in parts) or parts[0] in PROTECTED:
+    if any(part.startswith('.') for part in parts) or parts[0] in PROTECTED or DENIED.search(str(path)):
         raise ValueError('protected user data')
     if any(path == Path(prefix) or Path(prefix) in path.parents for prefix in private_prefixes):
         raise ValueError('protected bridge data')
@@ -71,7 +72,11 @@ def file_identity(path, directory=None):
         raise ValueError('only bounded regular files without hard links are supported')
     with os.fdopen(descriptor, 'rb') as source:
         digest = hashlib.sha256()
+        total = 0
         for chunk in iter(lambda: source.read(65536), b''):
+            total += len(chunk)
+            if total > MAX_FILE:
+                raise ValueError('source grew beyond the bounded file limit')
             digest.update(chunk)
         after = os.fstat(source.fileno())
         identity = lambda item: [item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns]
@@ -106,6 +111,16 @@ def pinned_identity(root, path):
         return file_identity(Path(path).name, directory)
 
 
+@contextmanager
+def pinned_directory(root, path):
+    with parent_descriptor(root, path) as parent:
+        directory = os.open(Path(path).name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            yield directory
+        finally:
+            os.close(directory)
+
+
 def read_pinned(root, path, limit=1048576):
     with parent_descriptor(root, path) as directory:
         fd = os.open(Path(path).name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
@@ -134,16 +149,45 @@ def move_exclusive(source_fd, source_name, target_fd, target_name):
 def projects(root, private_prefixes=()):
     project = locate(root, 'project', private_prefixes)
     result = []
-    for path in sorted(project.iterdir(), key=lambda item: item.name.casefold()):
-        if len(result) >= 100:
-            return {'projects': result, 'truncated': True}
-        try:
-            checked = locate(root, str(path), private_prefixes)
-            if checked.is_dir():
-                result.append({'name': path.name, 'pycharm_project': (path / '.idea').is_dir() and not (path / '.idea').is_symlink()})
-        except (OSError, ValueError):
-            continue
+    with pinned_directory(root, project) as directory:
+        for name in sorted(os.listdir(directory), key=str.casefold):
+            if len(result) >= 100:
+                return {'projects': result, 'truncated': True}
+            try:
+                locate(root, str(project / name), private_prefixes)
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                try:
+                    try:
+                        info = os.stat('.idea', dir_fd=child, follow_symlinks=False)
+                        ide = stat.S_ISDIR(info.st_mode)
+                    except FileNotFoundError:
+                        ide = False
+                    result.append({'name': name, 'pycharm_project': ide})
+                finally:
+                    os.close(child)
+            except (OSError, ValueError):
+                continue
     return {'projects': result, 'truncated': False}
+
+
+def journal(request, stage, body):
+    path = request.get('journal')
+    if path is None:
+        return
+    path = Path(path)
+    if not any(Path(prefix) in path.parents for prefix in request['private_prefixes']):
+        raise ValueError('action journal must be host-private')
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with parent_descriptor('/', path) as directory:
+        fd = os.open(path.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        with os.fdopen(fd, 'a') as output:
+            info = os.fstat(output.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+                raise ValueError('unsafe action journal')
+            output.write(canonical({'stage': stage, **body}) + '\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.fsync(directory)
 
 
 def project_path(root, name, private_prefixes):
@@ -255,23 +299,22 @@ def inspect(root, operation, value, private_prefixes=()):
     if operation != 'folder':
         raise ValueError('unsupported computer inspection')
     path = locate(root, value, private_prefixes)
-    if not path.is_dir():
-        raise ValueError('not a folder')
     entries = []
     truncated = False
-    for item in sorted(path.iterdir(), key=lambda item: item.name.casefold()):
-        try:
-            locate(root, str(item), private_prefixes)
-            info = item.lstat()
-            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+    with pinned_directory(root, path) as directory:
+        for name in sorted(os.listdir(directory), key=str.casefold):
+            try:
+                locate(root, str(path / name), private_prefixes)
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                    continue
+                if len(entries) == 100:
+                    truncated = True
+                    break
+                entries.append({'name': name, 'kind': 'folder' if stat.S_ISDIR(info.st_mode) else 'file',
+                                'bytes': info.st_size if stat.S_ISREG(info.st_mode) else None})
+            except (OSError, ValueError):
                 continue
-            if len(entries) == 100:
-                truncated = True
-                break
-            entries.append({'name': item.name, 'kind': 'folder' if stat.S_ISDIR(info.st_mode) else 'file',
-                            'bytes': info.st_size if stat.S_ISREG(info.st_mode) else None})
-        except (OSError, ValueError):
-            continue
     return {'path': str(path), 'entries': entries, 'truncated': truncated,
             'evidence': 'directory_listing_not_garbage_classification'}
 
@@ -381,12 +424,16 @@ def execute(request):
                     raise ValueError('source directory changed')
                 if file_identity(source.name, source_fd) != binding['source']:
                     raise ValueError('source changed at the pinned parent')
+                evidence = {'path': str(source), 'trash_path': str(target), 'source_identity': original,
+                            'permanently_deleted': False}
+                journal(request, 'trash-intent', evidence)
                 move_exclusive(source_fd, source.name, trash_fd, target.name)
                 os.fsync(source_fd)
                 os.fsync(trash_fd)
                 observed = file_identity(target.name, trash_fd)
                 if observed['sha256'] != original['sha256'] or observed['stat'][:3] != original['stat'][:3]:
                     raise ValueError('trash file identity changed')
+                journal(request, 'trash-verified', {**evidence, 'target_identity': observed})
             finally:
                 os.close(trash_fd)
         if source.exists() or target.is_symlink() or file_identity(target)['sha256'] != original['sha256']:

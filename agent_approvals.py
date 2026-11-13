@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 
-from agent_runtime import AgentError, required
+from agent_protocol import AgentError, required
 
 
 SUBJECT_KEYS = frozenset(('sender', 'channel', 'conversation', 'session', 'project', 'cwd', 'attempt'))

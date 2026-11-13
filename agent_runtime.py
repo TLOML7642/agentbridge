@@ -14,19 +14,7 @@ import time
 import uuid
 from agent_character import CharacterMemory
 from agent_diagnostics import Diagnostics, CODES, failure_metadata
-
-
-class AgentError(Exception):
-    def __init__(self, code, message, diagnostic=None):
-        super().__init__(message)
-        self.code, self.message = code, message
-        self.diagnostic = failure_metadata(diagnostic)
-
-
-def required(value, limit=256):
-    if not isinstance(value, str) or not value.strip() or len(value) > limit or '\0' in value:
-        raise AgentError('INVALID_MESSAGE', '消息字段缺失或格式错误')
-    return value
+from agent_protocol import AgentError, required
 
 
 class Preferences:

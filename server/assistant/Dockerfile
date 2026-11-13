@@ -8,6 +8,7 @@ COPY runtime/node/ /opt/node/
 COPY runtime/deps/ /opt/deps/
 COPY assistant.py assistant_projects.py assistant_executor.py agent_runtime.py agent_services.py process_supervisor.py agent_diagnostics.py ./
 COPY agent_character.py ./
+COPY agent_protocol.py ./
 COPY computer_actions.py ./
 COPY agent_driver.mjs agent_persona.mjs agent_rpc.mjs native_boundary.mjs agent_reads.py ./
 COPY model_budget.mjs ./

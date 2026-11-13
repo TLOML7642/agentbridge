@@ -2,7 +2,7 @@
 import os
 from pathlib import Path
 
-from agent_runtime import AgentError, required
+from agent_protocol import AgentError, required
 import agent_reads
 
 FIELDS = {

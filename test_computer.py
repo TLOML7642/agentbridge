@@ -12,6 +12,9 @@ import time
 import types
 import unittest
 import uuid
+import struct
+import zlib
+import subprocess
 from unittest import mock
 
 import computer_actions as actions
@@ -50,7 +53,8 @@ class ComputerFiles(unittest.TestCase):
         (self.root / '.ssh/id').write_text('synthetic credential')
         (self.root / 'Library').mkdir()
         (self.root / 'escape').symlink_to(self.root / 'Pictures')
-        for path in ('../outside', '/', '.ssh/id', 'Library', 'escape/input.png', 'project/demo/../../.ssh/id'):
+        for path in ('../outside', '/', '.ssh/id', 'Library', 'escape/input.png', 'project/demo/../../.ssh/id',
+                     'Pictures/credentials.json', 'Pictures/private.key', 'Pictures/chat.db'):
             with self.subTest(path=path), self.assertRaises((OSError, ValueError)):
                 actions.locate(self.root, path)
         with self.assertRaises(ValueError):
@@ -131,6 +135,31 @@ class ComputerFiles(unittest.TestCase):
             move.assert_not_called()
         self.assertEqual((self.root / 'Pictures/input.png').read_bytes(), PNG)
 
+    def test_batch_limits_are_not_automatically_split_and_partial_moves_are_journaled(self):
+        paths = []
+        for index in range(21):
+            name = 'Pictures/file-' + str(index)
+            (self.root / name).write_text('synthetic')
+            paths.append(name)
+        with self.assertRaises(ValueError):
+            self.prepared('computer_trash_files', {'paths': json.dumps(paths)})
+        request = self.prepared('computer_trash_files', {'paths': json.dumps(paths[:2])})
+        request['journal'] = str(self.root / '.runtime/journal.jsonl')
+        request['private_prefixes'] = [str(self.root / '.runtime')]
+        count = [0]
+        def partial(source_fd, source, target_fd, target):
+            count[0] += 1
+            if count[0] == 2:
+                raise OSError('synthetic interrupted batch')
+            os.rename(source, target, src_dir_fd=source_fd, dst_dir_fd=target_fd)
+        with mock.patch.object(actions.sys, 'platform', 'darwin'), mock.patch.object(actions, 'move_exclusive', partial):
+            with self.assertRaises(OSError):
+                actions.execute(request)
+        records = [json.loads(line) for line in Path(request['journal']).read_text().splitlines()]
+        self.assertEqual([row['stage'] for row in records], ['trash-intent', 'trash-verified', 'trash-intent'])
+        self.assertEqual(Path(records[1]['trash_path']).read_text(), 'synthetic')
+        self.assertTrue((self.root / paths[1]).exists())
+
     def test_rotation_and_crop_are_fixed_options_not_shell_commands(self):
         for operation, value, expected in [('rotate', '90', ['-r', '90']), ('crop', '100x200', ['--cropToHeightWidth', '100', '200'])]:
             self.assertEqual(actions.image_flags('computer_edit_image', {'operation': operation, 'value': value}), expected)
@@ -151,6 +180,25 @@ class ComputerFiles(unittest.TestCase):
         result = actions.execute(request)
         self.assertTrue(Path(result['trash_path']).is_file())
         self.assertFalse((self.root / 'Pictures/resized.png').exists())
+
+    def test_actual_macos_rotation_crop_and_resize_dimensions_preserve_original(self):
+        if sys.platform != 'darwin':
+            return
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+        data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 8, 6, 8, 2, 0, 0, 0))
+                + chunk(b'IDAT', zlib.compress((b'\0' + b'\x30\x80\xc0' * 8) * 6)) + chunk(b'IEND', b''))
+        source = self.root / 'Pictures/input.png'
+        source.write_bytes(data)
+        for operation, value, expected in [('rotate', '90', (6, 8)), ('crop', '2x4', (4, 2)), ('resize', '4', (4, 3))]:
+            destination = 'Pictures/' + operation + '.png'
+            result = actions.execute(self.prepared('computer_edit_image', {'source': 'Pictures/input.png',
+                'destination': destination, 'operation': operation, 'value': value}))
+            output = subprocess.check_output(['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', str(self.root / destination)], text=True)
+            dimensions = tuple(int(line.split(':')[1]) for line in output.splitlines() if 'pixelWidth:' in line or 'pixelHeight:' in line)
+            self.assertEqual(dimensions, expected)
+            self.assertEqual(source.read_bytes(), data)
+            self.assertTrue(result['original_preserved'])
 
     def configuration(self):
         directory = self.root / 'project/demo/.idea/runConfigurations'
