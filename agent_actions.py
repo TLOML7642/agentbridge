@@ -47,6 +47,9 @@ def parent(root, value, private_prefixes):
 
 
 def prepare(root, tool, arguments, private_prefixes=()):
+    if tool.startswith('computer_'):
+        from computer_actions import prepare as computer_prepare
+        return computer_prepare(root, tool, arguments, private_prefixes)
     if tool not in INPUTS or not isinstance(arguments, dict) or set(arguments) != INPUTS[tool]:
         raise ValueError('unreviewed tool or parameters')
     if any(not isinstance(value, str) or '\0' in value or len(value.encode()) > 16384 for value in arguments.values()):
@@ -82,6 +85,9 @@ def prepare(root, tool, arguments, private_prefixes=()):
 
 def execute(request):
     root, tool, arguments = request['root'], request['tool'], request['arguments']
+    if tool.startswith('computer_'):
+        from computer_actions import execute as computer_execute
+        return computer_execute(request)
     if tool not in INPUTS or set(arguments) != INPUTS[tool] | {'binding'}:
         raise ValueError('unreviewed action')
     binding = json.loads(arguments['binding'])

@@ -3,6 +3,8 @@
 !/worker.py
 !/worker_role.py
 !/executor_api.py
+!/executor_service.py
+!/computer_permissions.py
 !/assistant.py
 !/assistant_projects.py
 !/assistant_executor.py
@@ -19,6 +21,7 @@
 !/agent_reads.py
 !/agent_tasks.py
 !/agent_actions.py
+!/computer_actions.py
 !/agent_rpc.mjs
 !/agent_task_driver.mjs
 !/agent_task_executor.py

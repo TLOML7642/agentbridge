@@ -64,6 +64,8 @@ class ApprovalAuthority:
             ''')
             db.execute("UPDATE attempts SET state='interrupted' WHERE state='active'")
             db.execute("UPDATE approvals SET state='revoked',updated=? WHERE state IN ('pending','approved')", (self.clock(),))
+            import computer_permissions
+            computer_permissions.initialize(db)
 
     @contextmanager
     def db(self):
@@ -180,9 +182,9 @@ class ApprovalAuthority:
                 raise AgentError('NOT_FOUND', '审批不存在或不属于当前来源、会话和项目')
             return values[0] if identifier else {'ok': True, 'approvals': values}
 
-    def decide(self, sender, channel, conversation, project, identifier, delivery, allow):
+    def decide(self, sender, channel, conversation, project, identifier, delivery, allow, remember=False):
         required(delivery, 128)
-        if type(allow) is not bool:
+        if type(allow) is not bool or type(remember) is not bool or remember and not allow:
             raise AgentError('APPROVAL_DENIED', '审批决定无效')
         with self.db() as db:
             row = db.execute('SELECT * FROM approvals WHERE id=?', (identifier,)).fetchone()
@@ -191,7 +193,7 @@ class ApprovalAuthority:
             subject = json.loads(row['request'])['subject']
             if (subject['sender'], subject['channel'], subject['conversation'], subject['project']) != (sender, channel, conversation, project):
                 raise AgentError('APPROVAL_DENIED', '审批来源、会话或项目不匹配')
-            decision_digest = fingerprint([identifier, allow])
+            decision_digest = fingerprint([identifier, allow, True] if remember else [identifier, allow])
             old = db.execute('SELECT * FROM decisions WHERE sender=? AND channel=? AND delivery=?', (sender, channel, delivery)).fetchone()
             if old:
                 if old['digest'] != decision_digest:
@@ -201,9 +203,21 @@ class ApprovalAuthority:
             value = self._view(db, row)
             if value['state'] != 'pending':
                 raise AgentError('APPROVAL_DENIED', '审批已处理、撤销或过期')
+            if remember:
+                request = json.loads(row['request'])
+                if request['tool'] != 'computer_run_project' or request['epoch'] != 'host:' + self.boot:
+                    raise AgentError('APPROVAL_DENIED', '仅明确的已有运行配置审批可授予长期权限')
+                import computer_permissions
+                computer_permissions.create(db, subject, request['arguments'])
             db.execute('UPDATE approvals SET state=?,updated=? WHERE id=?', ('approved' if allow else 'denied', self.clock(), identifier))
             db.execute('INSERT INTO decisions VALUES (?,?,?,?,?)', (sender, channel, delivery, decision_digest, '{}'))
             return self._view(db, db.execute('SELECT * FROM approvals WHERE id=?', (identifier,)).fetchone())
+
+    def permissions(self, sender, channel, identifier=None):
+        import computer_permissions
+        with self.db() as db:
+            return (computer_permissions.listing(db, sender, channel) if identifier is None else
+                    computer_permissions.revoke(db, sender, channel, identifier))
 
     def consume(self, attempt, request, grant):
         with self.db() as db:

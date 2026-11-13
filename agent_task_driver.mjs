@@ -59,7 +59,8 @@ async function main() {
   assert.match(request.session, /^[a-f0-9]{32}$/);
   assert.equal(request.subject.attempt, request.id);
   assert.equal(request.subject.session, request.session);
-  assert.ok(['create_text', 'make_directory', 'run_command'].includes(request.tool));
+  assert.ok(['create_text', 'make_directory', 'run_command', 'computer_open_project',
+    'computer_resize_image', 'computer_edit_image', 'computer_trash_file', 'computer_run_project', 'computer_trash_files'].includes(request.tool));
   assert.ok(Object.values(request.arguments).every((value) => typeof value === 'string'));
   process.env.DSH_HOME = request.root;
   const packages = process.env.AGENTBRIDGE_AGENT_PACKAGES ?? path.join(os.homedir(),

@@ -14,16 +14,17 @@ from agent_approvals import ApprovalAuthority, canonical, fingerprint
 from agent_runtime import AgentError, required
 from agent_actions import prepare
 from agent_diagnostics import Diagnostics
+from computer_actions import INPUTS as COMPUTER_TOOLS, AUTOMATIC, inspect as computer_inspect
 
 
 TOOLS = {'create_text': {'path', 'text'}, 'make_directory': {'path'},
-         'run_command': {'program', 'argv'}}
+         'run_command': {'program', 'argv'}, **COMPUTER_TOOLS}
 TERMINAL = frozenset(('verified', 'process-ended', 'denied', 'cancelled', 'uncertain', 'failed'))
 
 
 class TaskRuntime:
     def __init__(self, root, runner, project, enabled=False, recover=lambda _row: None, check_external=lambda: None,
-                 allowed_projects=None):
+                 allowed_projects=None, computer_root=None, preflight=False):
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
@@ -32,7 +33,15 @@ class TaskRuntime:
         os.close(descriptor)
         self.path.chmod(0o600)
         self.enabled, self.runner, self.project = enabled, runner, project
+        self.preflight = preflight
         self.allowed_projects = None if allowed_projects is None else frozenset(allowed_projects)
+        self.computer_root = None
+        if computer_root is not None:
+            candidate = Path(computer_root)
+            if not candidate.is_absolute() or candidate.is_symlink() or candidate.resolve() != candidate or not candidate.is_dir():
+                raise ValueError('computer root must be an explicit canonical directory')
+            self.computer_root = str(candidate)
+            self.computer_identity = (candidate.stat().st_dev, candidate.stat().st_ino)
         self.check_external = check_external
         self.close_lock = threading.Lock()
         self.closed = False
@@ -59,6 +68,7 @@ class TaskRuntime:
                       sender TEXT,channel TEXT,delivery TEXT,digest TEXT,PRIMARY KEY(sender,channel,delivery));
                 ''')
                 columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+                db.execute('CREATE TABLE IF NOT EXISTS task_preflights(task TEXT PRIMARY KEY,request TEXT,approval TEXT,permission TEXT)')
                 for name, kind in (('exec_pgid', 'INTEGER'), ('exec_identity', 'TEXT'), ('exec_state', 'TEXT')):
                     if name not in columns:
                         db.execute('ALTER TABLE tasks ADD COLUMN ' + name + ' ' + kind)
@@ -73,6 +83,11 @@ class TaskRuntime:
                         state, result = 'uncertain', None
                     db.execute('UPDATE tasks SET state=?,result=? WHERE id=?', (state, canonical(result) if result else '', row['id']))
                     self._event(db, row, 'terminal', {'state': state, 'result': result})
+                # Pending work is never an offline spool across a Mac restart.
+                if preflight:
+                    for row in db.execute("SELECT * FROM tasks WHERE state IN ('queued','awaiting_confirmation')").fetchall():
+                        db.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (row['id'],))
+                        self._event(db, row, 'terminal', {'state': 'cancelled', 'result': None})
                 if db.execute("SELECT 1 FROM tasks WHERE state='uncertain' LIMIT 1").fetchone():
                     self.uncertain.set()
             # A unique unpredictable path avoids unlinking another process's
@@ -150,8 +165,29 @@ class TaskRuntime:
         return (self.enabled and not self.stop.is_set()
                 and (self.allowed_projects is None or project in self.allowed_projects))
 
-    def issue(self, kind, subject, ttl=120, cancel=None):
-        if not self.can_submit(subject.get('project')) or kind not in ('chat', 'task'):
+    def can_computer(self):
+        return self.enabled and self.computer_root is not None and not self.stop.is_set()
+
+    def _allowed(self, project, tool):
+        return self.can_computer() if tool in COMPUTER_TOOLS else self.can_submit(project)
+
+    def workspace(self, project, tool):
+        if tool in COMPUTER_TOOLS:
+            if not self.can_computer():
+                raise AgentError('WRITES_DISABLED', '电脑助手尚未启用')
+            info = os.stat(self.computer_root, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) != self.computer_identity or os.path.realpath(self.computer_root) != self.computer_root:
+                raise AgentError('PROJECT_CHANGED', '电脑文件根目录已改变')
+            return self.computer_root
+        return self.project(project)
+
+    def inspect_computer(self, operation, value):
+        root = self.workspace('', 'computer_open_project')
+        return computer_inspect(root, operation, value, [str(self.root.parent), str(self.root.parent.parent / 'control')])
+
+    def issue(self, kind, subject, ttl=120, cancel=None, tool=None):
+        if not (self._allowed(subject.get('project'), tool) if kind == 'task' else
+                self.can_submit(subject.get('project')) or self.can_computer()) or kind not in ('chat', 'task'):
             raise AgentError('WRITES_DISABLED', '后台动作尚未启用')
         token = secrets.token_hex(32)
         with self.lock:
@@ -173,7 +209,7 @@ class TaskRuntime:
             if not cap or not self.enabled or self.stop.is_set() or cap['cancel'].is_set() or time.monotonic() >= cap['expires']:
                 raise AgentError('AUTH_FAIL', '任务执行授权不存在或已撤销')
             subject = cap['subject']
-            if not self.can_submit(subject.get('project')):
+            if not (self.can_submit(subject.get('project')) or self.can_computer()):
                 raise AgentError('WRITES_DISABLED', '当前项目未启用后台动作灰度')
             if cap['kind'] == 'chat' and payload.get('op') == 'submit':
                 if set(payload) != {'capability', 'op', 'call_id', 'tool', 'arguments'}:
@@ -188,19 +224,49 @@ class TaskRuntime:
                 row = db.execute("SELECT * FROM tasks WHERE id=? AND state='running'", (subject['attempt'],)).fetchone()
                 if row is None or request.get('tool') != row['tool'] or request.get('arguments') != json.loads(row['arguments']):
                     raise AgentError('AUTH_FAIL', '任务工具或实际参数已改变')
+                if not self._allowed(subject['project'], row['tool']):
+                    raise AgentError('WRITES_DISABLED', '当前动作授权已关闭')
             if payload['op'] == 'consume':
                 if set(payload) != {'capability', 'op', 'request', 'grant'}:
                     raise AgentError('AUTH_FAIL', '消费字段错误')
+                if self.preflight:
+                    pre = self._preflight(row['id'])
+                    if pre:
+                        frozen = json.loads(pre['request'])
+                        if pre['permission']:
+                            import computer_permissions
+                            with self.approvals.db() as db:
+                                if computer_permissions.matching(db, subject, request['arguments']) != pre['permission']:
+                                    return {'ok': True, 'consumed': False}
+                        approved = self.approvals.request(row['id'], frozen)
+                        if not self.approvals.consume(row['id'], frozen, approved.get('grant')):
+                            return {'ok': True, 'consumed': False}
                 return {'ok': True, 'consumed': self.approvals.consume(subject['attempt'], request, payload.get('grant'))}
             if set(payload) != {'capability', 'op', 'request'}:
                 raise AgentError('AUTH_FAIL', '审批字段错误')
             value = self.approvals.request(subject['attempt'], request)
+            if self.preflight:
+                pre = self._preflight(row['id'])
+                if pre:
+                    frozen = json.loads(pre['request'])
+                    approved = self.approvals.request(row['id'], frozen)
+                    if approved['state'] == 'approved':
+                        if value['state'] == 'pending':
+                            value = self.approvals.decide(subject['sender'], subject['channel'], subject['conversation'],
+                                subject['project'], value['approval_id'], 'host-preflight:' + value['approval_id'], True)
+                        return value
+                    return {**value, 'state': 'denied', 'grant': None, 'reason': approved.get('reason')}
+            if row['tool'] in AUTOMATIC and self.can_computer():
+                if value['state'] == 'pending':
+                    value = self.approvals.decide(subject['sender'], subject['channel'], subject['conversation'],
+                        subject['project'], value['approval_id'], 'host-auto:' + value['approval_id'], True)
+                return value
             with self.db() as db:
                 self._event(db, row, 'approval', {key: value[key] for key in ('approval_id', 'state', 'tool', 'arguments', 'digest', 'expires')})
             return value
 
     def submit(self, subject, delivery, tool, arguments):
-        if not self.can_submit(subject.get('project')):
+        if not self._allowed(subject.get('project'), tool):
             raise AgentError('WRITES_DISABLED', '后台动作尚未启用')
         required(delivery, 128)
         if tool not in TOOLS or not isinstance(arguments, dict) or set(arguments) != TOOLS[tool]:
@@ -220,11 +286,11 @@ class TaskRuntime:
                 if old['digest'] != digest:
                     raise AgentError('DELIVERY_CONFLICT', '原调用已绑定其他动作')
                 return self._view(old, reused=True)
-            if db.execute("SELECT count(*) FROM tasks WHERE state IN ('queued','running')").fetchone()[0] >= 32:
+            if db.execute("SELECT count(*) FROM tasks WHERE state IN ('queued','running','awaiting_confirmation')").fetchone()[0] >= 32:
                 raise AgentError('BUSY', '后台队列已满')
             if db.execute("SELECT 1 FROM tasks WHERE state='uncertain' LIMIT 1").fetchone():
                 raise AgentError('TASK_UNCERTAIN', '存在结果未知的后台动作，请先在本机核查')
-            cwd = os.path.realpath(self.project(subject['project']))
+            cwd = os.path.realpath(self.workspace(subject['project'], tool))
             if cwd != subject['cwd']:
                 raise AgentError('PROJECT_CHANGED', '项目目录已改变')
             info = os.stat(cwd)
@@ -293,14 +359,98 @@ class TaskRuntime:
                     raise AgentError('DELIVERY_CONFLICT', '取消投递已绑定其他动作')
                 if not prior:
                     row = db.execute('SELECT * FROM tasks WHERE id=?', (identifier,)).fetchone()
-                    if row['state'] == 'queued':
+                    if row['state'] in ('queued', 'awaiting_confirmation'):
                         db.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (identifier,))
+                        self.approvals.revoke(identifier)
                         self._event(db, row, 'terminal', {'state': 'cancelled', 'result': None})
                     elif row['state'] == 'running':
                         self.cancels[identifier].set()
                         self.approvals.revoke(identifier)
                     db.execute('INSERT OR IGNORE INTO task_controls VALUES (?,?,?,?)', (sender, channel, delivery, digest))
+            self.wake.set()
             return self.inspect(sender, channel, conversation, project, identifier)
+
+    def decide(self, sender, channel, conversation, project, identifier, delivery, allow, remember=False):
+        # Serialize revocation, user decisions and execution-time consumption.
+        with self.lock:
+            if remember:
+                approval = self.approvals.inspect(sender, channel, conversation, project, identifier)
+                with self.db() as db:
+                    row = db.execute('SELECT * FROM tasks WHERE id=?', (approval['subject']['attempt'],)).fetchone()
+                if row is None or not self._unchanged(row):
+                    raise AgentError('PROJECT_CHANGED', '运行配置、目录或解释器已改变，不授予权限')
+            result = self.approvals.decide(sender, channel, conversation, project, identifier, delivery, allow, remember)
+            self.wake.set()
+            return result
+
+    def permissions(self, sender, channel, identifier=None):
+        with self.lock:
+            result = self.approvals.permissions(sender, channel, identifier)
+            self.wake.set()
+            return result
+
+    def _preflight(self, identifier):
+        with self.db() as db:
+            return db.execute('SELECT * FROM task_preflights WHERE task=?', (identifier,)).fetchone()
+
+    def _unchanged(self, row):
+        arguments = json.loads(row['arguments'])
+        raw = {key: value for key, value in arguments.items() if key != 'binding'}
+        private = self.root.parent
+        prefixes = [str(private), *[str(private.parent / name) for name in ('control', 'logs', 'audit')]]
+        try:
+            return prepare(row['cwd'], row['tool'], raw, prefixes) == arguments
+        except (OSError, ValueError, TypeError):
+            return False
+
+    def _await_confirmation(self, row, subject):
+        self.approvals.register(subject)
+        request = dict(version=1, epoch='host:' + self.approvals.boot, execution=row['id'], subject=subject,
+                       tool=row['tool'], arguments=json.loads(row['arguments']), callId='preflight',
+                       rootCallId='preflight', nested=False)
+        request['digest'] = fingerprint(request)
+        value = self.approvals.request(row['id'], request)
+        permission = None
+        if row['tool'] == 'computer_run_project':
+            import computer_permissions
+            with self.approvals.db() as db:
+                permission = computer_permissions.matching(db, subject, request['arguments'])
+        if permission:
+            self.approvals.decide(subject['sender'], subject['channel'], subject['conversation'], subject['project'],
+                                  value['approval_id'], 'host-permission:' + value['approval_id'], True)
+        with self.db() as db:
+            db.execute('INSERT INTO task_preflights VALUES (?,?,?,?)',
+                       (row['id'], canonical(request), value['approval_id'], permission))
+            db.execute("UPDATE tasks SET state='awaiting_confirmation' WHERE id=?", (row['id'],))
+            if not permission:
+                body = {key: value[key] for key in ('approval_id', 'state', 'tool', 'arguments', 'digest', 'expires')}
+                self._event(db, row, 'approval', {**body, 'state': 'pending'})
+        self.wake.set()
+
+    def _ready_confirmation(self):
+        with self.db() as db:
+            rows = db.execute("SELECT * FROM tasks WHERE state='awaiting_confirmation' ORDER BY seq").fetchall()
+        deadline = None
+        for row in rows:
+            pre = self._preflight(row['id'])
+            try:
+                value = self.approvals.request(row['id'], json.loads(pre['request']))
+            except AgentError:
+                value = {'state': 'revoked', 'reason': 'approval_revoked'}
+            state = value['state']
+            if state == 'pending':
+                seconds = max(.01, value['expires'] - time.time())
+                deadline = seconds if deadline is None else min(deadline, seconds)
+                continue
+            if state == 'approved':
+                return dict(row), deadline
+            self.approvals.revoke(row['id'])
+            result = {'completion': 'denied', 'evidence': 'tool_body_not_entered', 'reason': value.get('reason')}
+            with self.db() as db:
+                db.execute("UPDATE tasks SET state='denied',result=? WHERE id=? AND state='awaiting_confirmation'",
+                           (canonical(result), row['id']))
+                self._event(db, row, 'terminal', {'state': 'denied', 'result': result})
+        return None, deadline
 
     @contextmanager
     def execution_fence(self, cancel):
@@ -322,32 +472,52 @@ class TaskRuntime:
 
     def _loop(self):
         while not self.stop.is_set():
+            self.wake.clear()
+            ready, deadline = self._ready_confirmation() if self.preflight else (None, None)
             with self.db() as db:
-                row = db.execute("SELECT * FROM tasks WHERE state='queued' ORDER BY seq LIMIT 1").fetchone()
+                row = ready or db.execute("SELECT * FROM tasks WHERE state='queued' ORDER BY seq LIMIT 1").fetchone()
                 if row:
                     row = dict(row)
                     cancel = self.cancels.setdefault(row['id'], threading.Event())
-                    db.execute("UPDATE tasks SET state='running',exec_state='starting' WHERE id=?", (row['id'],))
+                    if db.execute('SELECT state FROM tasks WHERE id=?', (row['id'],)).fetchone()[0] == 'cancelled':
+                        continue
+                    needs_confirmation = (self.preflight and row['tool'] not in AUTOMATIC
+                                          and not db.execute('SELECT 1 FROM task_preflights WHERE task=?', (row['id'],)).fetchone())
+                    if not needs_confirmation:
+                        db.execute("UPDATE tasks SET state='running',exec_state='starting' WHERE id=?", (row['id'],))
             if not row:
-                self.wake.wait(.2)
-                self.wake.clear()
+                self.wake.wait(deadline)
                 continue
             subject = {key: row[key] for key in ('sender', 'channel', 'conversation', 'project', 'cwd', 'session')}
             subject['attempt'] = row['id']
+            if needs_confirmation:
+                with self.lock:
+                    if not cancel.is_set():
+                        try:
+                            self._await_confirmation(row, subject)
+                        except Exception:
+                            self.approvals.revoke(row['id'])
+                            with self.db() as db:
+                                db.execute("UPDATE tasks SET state='failed' WHERE id=?", (row['id'],))
+                                self._event(db, row, 'terminal', {'state': 'failed', 'result': None})
+                continue
             result, state, capability = None, 'uncertain', None
             started = False
             try:
                 with self.execution_fence(cancel):
-                    if not self.can_submit(row['project']):
+                    if not self._allowed(row['project'], row['tool']):
                         raise AgentError('WRITES_DISABLED', '当前项目未启用后台动作灰度')
                     if cancel.is_set():
                         raise AgentError('CANCELLED', '后台执行尚未开始')
                     info = os.stat(row['cwd'])
-                    if (os.path.realpath(self.project(row['project'])) != row['cwd']
+                    if (os.path.realpath(self.workspace(row['project'], row['tool'])) != row['cwd']
                             or (info.st_dev, info.st_ino) != (row['device'], row['inode'])):
                         raise AgentError('PROJECT_CHANGED', '项目目录已改变')
-                    self.approvals.register(subject)
-                    capability = self.issue('task', subject, ttl=300, cancel=cancel)
+                    if not self._preflight(row['id']):
+                        self.approvals.register(subject)
+                    if self.preflight and not self._unchanged(row):
+                        raise AgentError('PROJECT_CHANGED', '确认后目标已改变，没有启动工具')
+                    capability = self.issue('task', subject, ttl=300, cancel=cancel, tool=row['tool'])
                     started = True
                     try:
                         def register_executor(pgid, identity):

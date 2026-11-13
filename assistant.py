@@ -40,12 +40,13 @@ CONTROL_FIELDS = {
     'agent.service.requests': set(), 'agent.service.resolve': {'request_id', 'result'},
 }
 MAC_CONTROLS = frozenset(('agent.tasks', 'agent.task.cancel', 'agent.approvals',
-                          'agent.approve', 'agent.deny', 'agent.events'))
+                          'agent.approve', 'agent.deny', 'agent.events', 'agent.computer.permissions',
+                          'agent.computer.revoke', 'agent.computer.allow'))
 
 
 class App:
     def __init__(self, root, secret, senders, channels, services=False, runner=None,
-                 executor_url=None, executor_secret=None, task_projects=(), allow_personality=False):
+                 executor_url=None, executor_secret=None, task_projects=(), allow_personality=False, computer_enabled=False):
         required(secret, 512)
         if not senders or not channels or any(not isinstance(v, str) or not v.strip() for v in (*senders, *channels)):
             raise AgentError('AUTH_FAIL', '服务器助手须显式配置发送者和会话允许列表')
@@ -77,7 +78,8 @@ class App:
         if executor_url:
             from assistant_executor import Executor
             required(executor_secret, 512)
-            self.executor = Executor(self.root / 'tools', executor_url, executor_secret, self.projects, task_projects)
+            self.executor = Executor(self.root / 'tools', executor_url, executor_secret, self.projects, task_projects,
+                                     computer_enabled=computer_enabled)
         self.agent = None
         queue = ServiceQueue(self.root / 'agent/services', profile=self.profile_intent) if services else None
         try:
@@ -149,10 +151,12 @@ class App:
         op = payload.get('op')
         if isinstance(op, str) and op in MAC_CONTROLS:
             if self.executor is None:
-                raise AgentError('MAC_TOOLS_UNAVAILABLE', 'Mac工具尚未连接，未登记或排队执行；旧/mac仍走原链路')
+                raise AgentError('MAC_TOOLS_UNAVAILABLE', 'Mac工具尚未连接，没有登记或排队执行；旧/mac已停用')
             fields = {'agent.tasks': {'task_id'}, 'agent.task.cancel': {'task_id', 'delivery_id'},
                       'agent.approvals': {'approval_id'}, 'agent.approve': {'approval_id', 'delivery_id'},
-                      'agent.deny': {'approval_id', 'delivery_id'}, 'agent.events': {'after'}}
+                      'agent.deny': {'approval_id', 'delivery_id'}, 'agent.events': {'after'},
+                      'agent.computer.permissions': set(), 'agent.computer.revoke': {'permission_id', 'delivery_id'},
+                      'agent.computer.allow': {'approval_id', 'delivery_id'}}
             if set(payload) - fields[op] - {'op', 'sender', 'channel'} or any(not isinstance(v, str) for v in payload.values()):
                 raise AgentError('INVALID_MESSAGE', '工具控制字段无效')
             project = self.projects.current(sender, channel)
@@ -164,7 +168,9 @@ class App:
             subject = dict(sender=sender, channel=channel, conversation=conversation, project=project,
                            attempt='control')
             return self.executor.call(subject, {'agent.tasks': 'tasks', 'agent.task.cancel': 'cancel',
-                                      'agent.approvals': 'approvals', 'agent.approve': 'approve', 'agent.deny': 'deny'}[op],
+                                      'agent.approvals': 'approvals', 'agent.approve': 'approve', 'agent.deny': 'deny',
+                                      'agent.computer.permissions': 'permissions', 'agent.computer.revoke': 'revoke_permission',
+                                      'agent.computer.allow': 'approve_run'}[op],
                                       {field: payload.get(field, '') for field in fields[op]})
         if not isinstance(op, str) or op not in CONTROL_FIELDS:
             raise AgentError('INVALID_MESSAGE', '服务器助手不支持该控制操作')
@@ -304,7 +310,8 @@ def main():
               executor_secret=(private_credential(os.environ['AGENTBRIDGE_EXECUTOR_SECRET_FILE']).decode().strip()
                                if os.environ.get('AGENTBRIDGE_EXECUTOR_URL') else None),
               task_projects={v for v in os.environ.get('AGENTBRIDGE_AGENT_TASK_PROJECTS', '').split(',') if v},
-              allow_personality=os.environ.get('AGENTBRIDGE_PERSONALITY_GROWTH', '0') == '1')
+              allow_personality=os.environ.get('AGENTBRIDGE_PERSONALITY_GROWTH', '0') == '1',
+              computer_enabled=os.environ.get('AGENTBRIDGE_COMPUTER_ASSISTANT', '0') == '1')
     server = None
 
     def stop(*_):

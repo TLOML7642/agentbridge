@@ -1005,7 +1005,9 @@ class NativeExecutor:
             payload['task_events'] = turn.get('task_events', [])
             if self.tasks.can_submit(turn['subject']['project']):
                 payload['broker'] = self.tasks.issue('chat', turn['subject'], cancel=cancel)
-        for key in ('broker', 'remote_reads', 'services'):
+        if self.remote is not None and self.remote.can_computer():
+            payload['computer'] = self.remote.issue('chat', turn['subject'], cancel=cancel)
+        for key in ('broker', 'remote_reads', 'services', 'computer'):
             if payload.get(key):
                 payload[key] = {**payload[key], 'diagnostics': str(self.diagnostics.root), 'correlation': turn['id']}
         source = Path(__file__).with_name('agent_driver.mjs')
@@ -1066,4 +1068,6 @@ class NativeExecutor:
                 self.services.revoke_capability(payload['services']['capability'])
             if payload.get('remote_reads'):
                 self.remote.revoke_capability(payload['remote_reads']['capability'])
+            if payload.get('computer'):
+                self.remote.revoke_capability(payload['computer']['capability'])
             request.unlink(missing_ok=True)

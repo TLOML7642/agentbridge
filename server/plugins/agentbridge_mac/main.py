@@ -201,7 +201,15 @@ class Main(star.Star):
             db.execute('CREATE TABLE IF NOT EXISTS agent_delivery_evidence('
                        'seq INTEGER PRIMARY KEY AUTOINCREMENT,sender TEXT,channel TEXT,delivery TEXT,'
                        'state TEXT,code TEXT,message_id TEXT,created REAL)')
+            db.execute('CREATE TABLE IF NOT EXISTS agent_confirmation_context('
+                       'sender TEXT,channel TEXT,epoch INTEGER,shown_event TEXT,delivery TEXT,'
+                       'PRIMARY KEY(sender,channel))')
             yield db
+
+    def _advance_confirmation(self, sender, channel):
+        with self._agent_db() as db:
+            db.execute("INSERT INTO agent_confirmation_context VALUES (?,?,1,'','') ON CONFLICT(sender,channel) "
+                       "DO UPDATE SET epoch=epoch+1,shown_event='',delivery=''", (sender, channel))
 
     def _agent_evidence(self, sender, channel, delivery, state, code, message_id=''):
         # Only host state/codes, never chat text, exception strings or secrets.
@@ -412,10 +420,23 @@ class Main(star.Star):
                 visible['text_bytes'] = len(arguments['text'].encode())
                 visible['text_sha256'] = hashlib.sha256(arguments['text'].encode()).hexdigest()
                 visible['text_preview'] = arguments['text'][:300]
-            return (prefix + '实际动作需要确认，四分钟内仅授权本次调用。\n工具：' + body['tool']
+            risk = {'computer_trash_file': '将这个文件移入废纸篓，不永久删除。',
+                    'computer_trash_files': '将清单中这些文件一起移入废纸篓，本次只确认一次，不永久删除。',
+                    'computer_run_project': '运行已有PyCharm配置；项目代码可能写文件或访问网络。'}.get(body['tool'], '')
+            if body['tool'] in ('computer_trash_file', 'computer_trash_files'):
+                binding = json.loads(arguments['binding'])
+                items = binding.get('items', [arguments])
+                total = sum(json.loads(item['binding'])['source']['stat'][2] for item in items)
+                risk += '\n本批 ' + str(len(items)) + ' 个普通文件，共 ' + str(total) + ' 字节；超限不自动拆批。'
+            if body['tool'] == 'computer_run_project':
+                risk += ('\n如明确选择“以后允许此配置运行”：后续代码继承当前Mac账号权限，可能写文件或访问网络，'
+                         '不是沙箱；日常代码修改不撤销授权，配置或解释器变化需重新确认。'
+                         '\n长期允许请回复“以后允许此配置运行”，或发送 /agent computer allow ' + body['approval_id'])
+            return (prefix + risk + '\n实际动作需要确认，四分钟内仅授权本次调用。\n工具：' + body['tool']
                     + '\n参数：' + json.dumps(visible, ensure_ascii=False)
                     + '\n动作摘要：' + body['digest'] + '\n审批ID：' + body['approval_id']
-                    + '\n同意请单独发送下一行：\n/agent approve ' + body['approval_id']
+                    + '\n当前只有这一项待确认时，直接回复“同意”或“拒绝”即可。'
+                    + '\n多项待确认时，同意请单独发送下一行：\n/agent approve ' + body['approval_id']
                     + '\n拒绝请单独发送下一行：\n/agent deny ' + body['approval_id'])
         state = body.get('state', 'uncertain')
         if event['kind'] == 'cancel-request' and state == 'running':
@@ -426,8 +447,22 @@ class Main(star.Star):
                         'denied': '工具未获授权，未进入实际动作', 'cancelled': '执行器已停止，不撤销已发生的副作用',
                         'uncertain': '结果未知，不会自动重跑，执行通道已隔离', 'failed': '执行前检查未通过',
                         'queued': '任务已排队，尚未进入实际动作',
+                        'awaiting_confirmation': '等待微信确认，尚未启动任何执行工具',
                         'running': '执行器运行中，可能仍在等待审批，不代表动作体已进入'}
         result = body.get('result') or {}
+        if result.get('evidence') == 'application_open_request_only':
+            return '已向 PyCharm 请求打开项目“' + result.get('project', '') + '”，尚未运行项目。'
+        if result.get('evidence') == 'pycharm_exact_run_menu_requested':
+            return ('已向 PyCharm 的“' + result.get('project', '') + '”项目发起运行“'
+                    + result.get('configuration', '') + '”；尚未验证程序运行结果。')
+        if result.get('evidence') == 'pycharm_run_not_confirmed':
+            return '未能确认 PyCharm 已发起运行，请检查项目窗口、当前运行配置及 macOS 自动化/辅助功能权限。没有自动重试。'
+        if result.get('evidence') == 'new_image_copy_original_unchanged':
+            return '图片副本已生成，原图保持不变。\n' + str(result.get('path', ''))
+        if result.get('evidence') == 'moved_to_trash_content_verified':
+            return '文件已移入废纸篓，内容校验通过，没有永久删除。\n' + str(result.get('path', ''))
+        if result.get('evidence') == 'batch_moved_to_trash_content_verified':
+            return '已将清单中的 ' + str(result.get('count', 0)) + ' 个文件移入废纸篓，内容校验通过，没有永久删除。'
         description = descriptions.get(state, state)
         if state == 'denied':
             description = {'user_denied': '用户主动拒绝，未进入实际动作',
@@ -438,6 +473,65 @@ class Main(star.Star):
                            'boundary_denied': '执行边界未放行，未进入实际动作'}.get(result.get('reason'), description)
         evidence = {key: result[key] for key in ('evidence', 'path', 'sha256', 'exit_code') if key in result}
         return prefix + description + ('\n' + json.dumps(evidence, ensure_ascii=False) if evidence else '')
+
+    async def _agent_short_decision(self, event, text):
+        if not AGENT_TASKS or text not in ('同意', '确认', '确定', '拒绝', '以后允许此配置运行'):
+            return False
+        status, data = await self._control(event, {'op': 'agent.approvals'})
+        if status != 200 or data.get('ok') is not True:
+            await self._agent_local(event, '暂时无法核对待确认操作，没有执行。请稍后查询。')
+            return True
+        pending = [item for item in data.get('approvals', []) if item.get('state') == 'pending']
+        sender, channel = str(event.get_sender_id()), event.unified_msg_origin
+        with self._agent_db() as db:
+            prompts = [json.loads(row[0]) for row in db.execute(
+                "SELECT payload FROM agent_task_outbox WHERE sender=? AND channel=? AND state='api_returned'",
+                (sender, channel))]
+        shown = {item['body']['approval_id']: item for item in prompts if item.get('kind') == 'approval'}
+        if not pending:
+            if any(item['body'].get('expires', 0) > time.time() - 600 for item in shown.values()):
+                await self._agent_local(event, '刚才的确认已处理或过期，没有重复执行。请查询原任务。')
+                return True
+            return False
+        if len(pending) != 1:
+            await self._agent_local(event, '现在有多项操作待确认，请按对应提示的审批编号选择，不会猜测你同意哪一项。')
+            return True
+        approval = pending[0]
+        prompt = shown.get(approval.get('approval_id'))
+        subject = approval.get('subject') or {}
+        with self._agent_db() as db:
+            context = db.execute('SELECT shown_event FROM agent_confirmation_context WHERE sender=? AND channel=?',
+                                 (sender, channel)).fetchone()
+        if (not prompt or prompt.get('conversation') != subject.get('conversation')
+                or not context or context['shown_event'] != prompt.get('id')
+                or prompt.get('project') != subject.get('project') or prompt.get('sender') != sender
+                or prompt.get('task') != subject.get('attempt')
+                or prompt.get('channel') != channel or subject.get('sender') != sender or subject.get('channel') != channel
+                or prompt['body'].get('digest') != approval.get('digest')
+                or prompt['body'].get('arguments') != approval.get('arguments')
+                or type(approval.get('expires')) not in (int, float) or approval['expires'] <= time.time()):
+            await self._agent_local(event, '没有匹配到已发送且仍有效的操作确认，没有执行。请先查看原操作详情。')
+            return True
+        delivery, _ = self._agent_delivery(event, text, 'agent-control')
+        with self._agent_db() as db:
+            claim = db.execute("UPDATE agent_confirmation_context SET delivery=? WHERE sender=? AND channel=? "
+                               "AND shown_event=? AND delivery IN ('',?)", (delivery, sender, channel, prompt['id'], delivery))
+            claimed = claim.rowcount == 1
+        if not claimed:
+            await self._agent_local(event, '这项操作已有确认正在处理，没有重复提交。')
+            return True
+        allow = text != '拒绝'
+        remember = text == '以后允许此配置运行'
+        if remember and approval.get('tool') != 'computer_run_project':
+            await self._agent_local(event, '长期授权只适用于已展示风险说明的PyCharm运行配置，没有执行。')
+            return True
+        status, result = await self._control(event, {'op': 'agent.computer.allow' if remember else 'agent.approve' if allow else 'agent.deny',
+            'approval_id': approval['approval_id'], 'delivery_id': delivery})
+        if status == 200 and result.get('ok') is True:
+            await self._agent_local(event, '已同意本次操作，等待执行结果。' if allow else '已拒绝本次操作。')
+        else:
+            await self._agent_local(event, '确认未成功，操作可能已处理或过期；没有新增或重试任务。')
+        return True
 
     async def _agent_task_tick(self):
         with self._agent_db() as db:
@@ -472,6 +566,9 @@ class Main(star.Star):
             if not self._agent_allowed(row['sender'], row['channel']):
                 continue
             with self._agent_db() as db:
+                db.execute("INSERT OR IGNORE INTO agent_confirmation_context VALUES (?,?,0,'','')", (row['sender'], row['channel']))
+                epoch = db.execute('SELECT epoch FROM agent_confirmation_context WHERE sender=? AND channel=?',
+                                   (row['sender'], row['channel'])).fetchone()[0]
                 claim = db.execute("UPDATE agent_task_outbox SET state='sending' WHERE id=? AND state='pending'", (row['id'],))
                 if claim.rowcount != 1:
                     continue
@@ -488,6 +585,11 @@ class Main(star.Star):
                 continue
             with self._agent_db() as db:
                 db.execute('UPDATE agent_task_outbox SET state=? WHERE id=?', (state, row['id']))
+                event = json.loads(row['payload'])
+                if state == 'api_returned':
+                    db.execute("UPDATE agent_confirmation_context SET shown_event=?,delivery='' "
+                               "WHERE sender=? AND channel=? AND epoch=?",
+                               (event['id'] if event['kind'] == 'approval' else '', row['sender'], row['channel'], epoch))
 
     async def _agent_local(self, event, text):
         sender, channel = str(event.get_sender_id()), event.unified_msg_origin
@@ -540,13 +642,29 @@ class Main(star.Star):
         event.stop_event()
         delivery = None
         try:
+            if text not in ('同意', '确认', '确定', '拒绝', '以后允许此配置运行'):
+                self._advance_confirmation(sender, channel)
             components = getattr(event.message_obj, 'message', [])
             if not text or not components or any(type(part).__name__ != 'Plain' for part in components):
                 await self._agent_local(event, '当前统一入口仅支持文字，图片和语音暂不处理。')
                 return
+            if await self._agent_short_decision(event, text):
+                return
+            if text in ('查看电脑运行授权', '查看电脑长期授权', '查看运行权限'):
+                text = '/agent computer permissions'
+            revoke = re.fullmatch(r'撤销(?:电脑运行授权|电脑长期授权|运行权限)\s*([0-9a-f]{32})', text)
+            if revoke:
+                text = '/agent computer revoke ' + revoke[1]
             if text.startswith('/agent'):
                 parts = text.split()
-                if parts[:2] == ['/agent', 'reminders'] and len(parts) <= 3:
+                if parts == ['/agent', 'computer', 'permissions']:
+                    status, data = await self._control(event, {'op': 'agent.computer.permissions'})
+                elif parts[:3] in (['/agent', 'computer', 'revoke'], ['/agent', 'computer', 'allow']) and len(parts) == 4:
+                    delivery, _ = self._agent_delivery(event, text, 'agent-control')
+                    operation = parts[2]
+                    status, data = await self._control(event, {'op': 'agent.computer.' + operation,
+                        'permission_id' if operation == 'revoke' else 'approval_id': parts[3], 'delivery_id': delivery})
+                elif parts[:2] == ['/agent', 'reminders'] and len(parts) <= 3:
                     result = self._reminders().request(sender, channel, uuid.uuid4().hex,
                         'reminder_get' if len(parts) == 3 else 'reminder_list',
                         {'reminder_id': parts[2]} if len(parts) == 3 else {})
@@ -633,7 +751,13 @@ class Main(star.Star):
                                             + ('后台：/agent tasks [ID]；/agent task-cancel <ID>；/agent approvals [ID]；/agent approve <ID>；/agent deny <ID>。'
                                                if AGENT_TASKS else '当前后台动作未启用。'))
                     return
-                if data.get('projects') is not None:
+                if data.get('permissions') is not None:
+                    reply = '\n'.join(item['permission_id'] + ' ' + item['project_path'] + ' / ' + item['configuration']
+                                      for item in data['permissions']) or '当前来源没有长期运行授权。'
+                    reply += '\n' + data.get('warning', '')
+                elif data.get('permission_id'):
+                    reply = '长期运行授权已撤销：' + data['permission_id']
+                elif data.get('projects') is not None:
                     reply = '当前项目：' + data['current'] + '\n' + '\n'.join(
                         item['name'] + ' 工具目标：' + item['tool_target'] for item in data['projects'])
                 elif data.get('current'):
@@ -954,6 +1078,8 @@ class Main(star.Star):
         return "当前项目：" + str(data.get("current", data.get("project", "操作完成")))
 
     async def _confirm(self, event, token):
+        if AGENT_ENABLED:
+            return '旧/mac确认入口已停用，请直接在微信描述电脑任务。'
         jid, reused = self._delivery(event, "confirm " + token, "control")
         if NOTIFICATIONS_ENABLED:
             await self._prepare_subscription(event, jid)
@@ -971,6 +1097,10 @@ class Main(star.Star):
 
     @filter.command("mac")
     async def mac(self, event: AstrMessageEvent, task: GreedyStr):
+        if AGENT_ENABLED:
+            event.stop_event()
+            yield event.plain_result('旧/mac执行入口已停用，请直接在微信描述电脑任务；历史记录保留。')
+            return
         text = str(task or "").strip()
         if not text:
             yield event.plain_result(USAGE)

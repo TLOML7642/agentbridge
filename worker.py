@@ -874,7 +874,8 @@ class App:
                         raise AgentError('TASK_UNCERTAIN', '旧执行器隔离尚未核查，后台动作未放行')
                 self.agent_tasks = TaskRuntime(task_root, task_executor, lambda name: self.get_project(name)['dir'],
                                                enabled=True, recover=task_executor.recover, check_external=check_legacy_execution,
-                                               allowed_projects=AGENT_TASK_PROJECTS)
+                                               allowed_projects=AGENT_TASK_PROJECTS,
+                                               computer_root=os.environ.get('AGENTBRIDGE_COMPUTER_ROOT') or None)
             if self.role == 'executor_only':
                 return
             services = (ServiceQueue(os.path.join(root, 'services'), profile=lambda *args: self.agent.profile_intent(*args))
@@ -1329,6 +1330,9 @@ CONTROL_OPS = frozenset(CONTROL_FIELDS)
 
 
 def do_control(app: App, payload: dict) -> dict:
+    if getattr(app, 'role', '') == 'executor_only' and payload.get('op') in (
+            'confirm', 'force', 'project.add', 'project.rm', 'use'):
+        raise AgentBridgeError('LEGACY_DISABLED', '旧/mac执行入口已停用，请直接在微信描述电脑任务')
     sender = str(payload.get("sender") or "").strip()
     channel = str(payload.get("channel") or "").strip()
     if not sender or not channel or (ALLOWED_SENDERS and sender not in ALLOWED_SENDERS):
@@ -1496,6 +1500,8 @@ def _cancel_job(app: App, original, deny: bool) -> dict:
 
 
 def do_execute(app: App, payload: dict) -> dict:
+    if getattr(app, 'role', '') == 'executor_only':
+        raise AgentBridgeError('LEGACY_DISABLED', '旧/mac执行入口已停用，请直接在微信描述电脑任务')
     task = (payload.get("task") or "").strip()
     if not task:
         raise AgentBridgeError("EXEC_FAIL", "任务为空")
@@ -2295,6 +2301,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global APP  # noqa: PLW0603
+    if worker_role(BASE) == 'executor_only':
+        from executor_service import main as executor_main
+        return executor_main()
     if not SECRET:
         print("AGENTBRIDGE_SECRET 未设置，拒绝启动", file=sys.stderr)
         raise SystemExit(2)

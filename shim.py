@@ -152,6 +152,8 @@ def _accept_agent(payload, sender, channel):
 
 
 CONTROL_FIELDS = {
+    'agent.computer.permissions': set(), 'agent.computer.revoke': {'permission_id', 'delivery_id'},
+    'agent.computer.allow': {'approval_id', 'delivery_id'},
     'agent.projects': set(), 'agent.use': {'project', 'delivery_id'},
     "status": {"job_id"}, "confirm": {"token", "delivery_id"},
     "status.batch": {"job_ids"}, "diag": set(), "jobs": set(), "pending": set(),
@@ -251,6 +253,8 @@ def _accept_worker(task: str, meta: dict) -> dict:
     短暂对账（查询 /job），绝不误报 OFFLINE 诱导盲目重发造成重复执行。
     只有连接根本没建立（拒绝/连接超时）才返回普通 OFFLINE。
     """
+    if ASSISTANT:
+        return {'ok': False, 'code': 'LEGACY_DISABLED', 'message': '旧/mac执行入口已停用，请直接在微信描述电脑任务'}
     if not meta.get("job_id"):
         meta = dict(meta)
         meta["job_id"] = uuid.uuid4().hex[:32]

@@ -22,13 +22,16 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Executor:
-    def __init__(self, root, url, secret, projects, enabled_projects=()):
+    def __init__(self, root, url, secret, projects, enabled_projects=(), computer_enabled=False):
         parsed = urllib.parse.urlparse(url)
         if (parsed.scheme != 'http' or parsed.hostname != '127.0.0.1' or not parsed.port
                 or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('', '/')):
             raise ValueError('executor must use the existing fixed loopback interface')
         self.url, self.secret, self.projects = url.rstrip('/') + '/executor', secret, projects
         self.enabled_projects = frozenset(enabled_projects)
+        if type(computer_enabled) is not bool:
+            raise ValueError('computer enabled must be explicit boolean')
+        self.computer_enabled = computer_enabled
         self.root = Path(root)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.path = self.root / 'executor-calls.db'
@@ -68,6 +71,9 @@ class Executor:
     def can_submit(self, project):
         return project in self.enabled_projects and self.projects.target(project) == 'mac'
 
+    def can_computer(self):
+        return self.computer_enabled
+
     @contextmanager
     def db(self):
         db = sqlite3.connect(self.path)
@@ -97,10 +103,15 @@ class Executor:
         subject = cap[0]
         op = payload.get('op')
         allowed = {'submit': {'capability', 'op', 'call_id', 'tool', 'arguments'},
-                   'read': {'capability', 'op', 'operation', 'value', 'range'}}
+                   'read': {'capability', 'op', 'operation', 'value', 'range'},
+                   'computer_inspect': {'capability', 'op', 'operation', 'value'}}
         if op not in allowed or set(payload) != allowed[op]:
             raise AgentError('AUTH_FAIL', '执行接口用途或字段无效')
-        if op == 'submit' and not self.can_submit(subject['project']):
+        from computer_actions import INPUTS
+        computer_request = op == 'computer_inspect' or (op == 'submit' and payload.get('tool') in INPUTS)
+        if computer_request and not self.can_computer():
+            raise AgentError('WRITES_DISABLED', '电脑助手尚未启用')
+        if op == 'submit' and not computer_request and not self.can_submit(subject['project']):
             raise AgentError('WRITES_DISABLED', '该项目没有后台动作授权')
         fields = {key: value for key, value in payload.items() if key not in ('capability', 'op')}
         return self.call(subject, op, fields)
@@ -112,7 +123,7 @@ class Executor:
         digest = hashlib.sha256(body).hexdigest()
         identifier = hashlib.sha256(json.dumps([subject['sender'], subject['channel'], subject['attempt'], op,
                                     fields.get('call_id', fields.get('delivery_id', digest))]).encode()).hexdigest()
-        mutating = op in ('submit', 'approve', 'deny', 'cancel')
+        mutating = op in ('submit', 'approve', 'deny', 'cancel', 'approve_run', 'revoke_permission')
         # Commit intent before opening the socket. A crash here is unknown, not
         # evidence of no side effect. No background loop scans this table.
         with self.lock:
