@@ -48,6 +48,17 @@ class ComputerFiles(unittest.TestCase):
         self.assertEqual([item['name'] for item in result['projects']], ['demo', 'second'])
         self.assertTrue(result['projects'][0]['pycharm_project'])
 
+    def test_directory_identity_uses_portable_nofollow_stat(self):
+        directory = self.root / 'project/demo'
+        expected = directory.lstat()
+        self.assertEqual(actions.directory_identity(directory), [expected.st_dev, expected.st_ino])
+        link = self.root / 'directory-link'
+        link.symlink_to(directory)
+        with self.assertRaises(ValueError):
+            actions.directory_identity(link)
+        with self.assertRaises(ValueError):
+            actions.directory_identity(self.root / 'Pictures/input.png')
+
     def test_paths_protect_credentials_symlinks_runtime_and_existing_outputs(self):
         (self.root / '.ssh').mkdir()
         (self.root / '.ssh/id').write_text('synthetic credential')

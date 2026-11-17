@@ -86,7 +86,7 @@ def file_identity(path, directory=None):
 
 
 def directory_identity(path):
-    info = path.stat(follow_symlinks=False)
+    info = path.lstat()
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError('not a directory')
     return [info.st_dev, info.st_ino]
