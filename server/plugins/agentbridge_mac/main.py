@@ -456,6 +456,8 @@ class Main(star.Star):
             return ('已向 PyCharm 的“' + result.get('project', '') + '”项目发起运行“'
                     + result.get('configuration', '') + '”；尚未验证程序运行结果。')
         if result.get('evidence') == 'pycharm_run_not_confirmed':
+            if result.get('ui_code') == 'UI_BLOCKED':
+                return 'PyCharm 配置编辑器或其他弹窗阻挡，未点击运行。没有自动重试。'
             return '未能确认 PyCharm 已发起运行，请检查项目窗口、当前运行配置及 macOS 自动化/辅助功能权限。没有自动重试。'
         if result.get('evidence') == 'new_image_copy_original_unchanged':
             return '图片副本已生成，原图保持不变。\n' + str(result.get('path', ''))

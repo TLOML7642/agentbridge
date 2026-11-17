@@ -219,13 +219,14 @@ class ComputerFiles(unittest.TestCase):
                 mock.patch.object(actions.subprocess, 'run', return_value=types.SimpleNamespace(
                     returncode=0, stdout=b'{"ok":true,"stage":"run_requested"}')) as run:
             result = actions.execute(request)
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args[0][-3:], ['demo', 'demo-run', str(self.root / 'project/demo')])
         self.assertEqual(run.call_args.args[0][:5], ['/usr/bin/osascript', '-l', 'JavaScript', '-e', actions.PYCHARM_RUN])
         self.assertFalse(result['project_running_verified'])
         self.assertFalse(result['user_goal_verified'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 15)
 
-    def test_jxa_checks_project_header_path_and_exact_localized_lazy_menu_without_titles(self):
+    def test_jxa_checks_exact_path_localized_menu_and_dialogs_not_title_identity(self):
         node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
         if not node:
             self.skipTest('explicit native test runtime required')
@@ -243,7 +244,10 @@ function fixture(options={}) {
     for(let i=0;i<3;i++){const child=group;group={role:()=> 'AXGroup',uiElements:()=>[child]};}
     if(options.notification){const child=group.uiElements()[0];group={role:()=> 'AXGroup',
       uiElements:()=>[{role:()=> 'AXScrollArea',uiElements:()=>[]},child]};}
-    return {name:()=>{throw Error('window title must never be read');},uiElements:()=>[group],
+    return {name:()=>options.dialogName ?? 'untrusted window title',uiElements:()=>[group],
+      attributes:{byName:name=>({value:()=>{assert.equal(name,'AXModal');
+        return options.modal ?? (options.popupAfterMenu && menuOpened) ?? false;}})},
+      sheets:()=>options.sheet?[{}]:[],subrole:()=>options.subrole ?? 'AXStandardWindow',
       actions:{byName:name=>({perform:()=>{assert.equal(name,'AXRaise');raiseCount++;}})}};
   }
   const target=window(options.path ?? root,options.description);
@@ -258,14 +262,23 @@ function fixture(options={}) {
   return {ide,counts:()=>({runClicks,menuOpened,raiseCount})};
 }
 for(const options of [{},{english:true,description:'Project: demo, menu'},{notification:true},{delayedFocus:true}]){
-  const f=fixture(options);const result=context.requestRun(f.ide,'demo','demo-run',root);
+  const f=fixture(options);context.inspectRun(f.ide,'demo',root);
+  assert.deepEqual(f.counts(),{runClicks:0,menuOpened:false,raiseCount:0});
+  const result=context.requestRun(f.ide,'demo','demo-run',root);
   assert.equal(result.stage,'run_requested');assert.equal(f.counts().runClicks,1);assert.equal(f.counts().menuOpened,true);
 }
 for(const [options,error] of [
   [{path:'/other'},'PROJECT_IDENTITY_UNAVAILABLE'],
+  [{path:'/other',dialogName:'demo'},'PROJECT_IDENTITY_UNAVAILABLE'],
   [{path:root+'/nested'},'PROJECT_IDENTITY_UNAVAILABLE'],
   [{path:root+'-lookalike'},'PROJECT_IDENTITY_UNAVAILABLE'],
   [{description:'untrusted editor tooltip'},'PROJECT_IDENTITY_UNAVAILABLE'],
+  [{modal:true},'UI_BLOCKED'],
+  [{sheet:true},'UI_BLOCKED'],
+  [{popupAfterMenu:true},'UI_BLOCKED'],
+  [{subrole:'AXDialog'},'UI_BLOCKED'],
+  [{dialogName:'运行/调试配置'},'UI_BLOCKED'],
+  [{dialogName:'Run/Debug Configurations'},'UI_BLOCKED'],
   [{duplicate:true},'PROJECT_IDENTITY_AMBIGUOUS'],
   [{frontChanged:true},'FRONT_PROJECT_CHANGED'],
   [{item:"运行 'other'"},'RUN_CONFIGURATION_UNAVAILABLE'],
@@ -281,16 +294,27 @@ process.stdout.write('project identity and localized menu policy passed');
                                 text=True, env={**os.environ, 'ELECTRON_RUN_AS_NODE': '1'}, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_missing_interpreter_refuses_before_any_ui_action(self):
+        path = self.configuration()
+        path.write_text(path.read_text().replace(sys.executable, str(self.root / 'missing-python')))
+        with mock.patch.object(actions.subprocess, 'run') as run:
+            with self.assertRaises((ValueError, OSError)):
+                self.prepared('computer_run_project', {'project': 'demo', 'configuration': 'demo-run'})
+            run.assert_not_called()
+
     def test_unmatched_ui_receipt_never_reports_run_requested(self):
         self.configuration()
         request = self.prepared('computer_run_project', {'project': 'demo', 'configuration': 'demo-run'})
         for stdout in (b'', b'not-json', b'[]', b'null', b'{"code":[]}', b'{"ok":true}',
-                       b'{"ok":false,"code":"PROJECT_IDENTITY_UNAVAILABLE"}'):
+                       b'{"ok":false,"code":"PROJECT_IDENTITY_UNAVAILABLE"}',
+                       b'{"ok":false,"code":"UI_BLOCKED"}'):
             with mock.patch.object(actions.sys, 'platform', 'darwin'), \
                     mock.patch.object(actions.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=stdout)):
                 result = actions.execute(request)
             self.assertEqual(result['evidence'], 'pycharm_run_not_confirmed')
             self.assertNotEqual(result['exit_code'], 0)
+            if b'UI_BLOCKED' in stdout:
+                self.assertEqual(result['ui_code'], 'UI_BLOCKED')
 
     def test_changed_ambiguous_or_symlinked_configuration_does_not_run(self):
         path = self.configuration()
@@ -401,6 +425,16 @@ class ComputerPolicy(unittest.TestCase):
 
 class MobileConfirmation(unittest.TestCase):
     setUp = chat_tests.PluginAgentTests.setUp
+
+    def test_pycharm_popup_reason_does_not_claim_project_process_completed(self):
+        event = dict(task='synthetic-task', kind='terminal', conversation='synthetic-conversation',
+            project='assistant', body=dict(state='process-ended',
+            result=dict(evidence='pycharm_run_not_confirmed', ui_code='UI_BLOCKED')))
+        text = self.main._task_event_text(event)
+        self.assertIn('弹窗阻挡', text)
+        self.assertIn('未点击运行', text)
+        self.assertIn('没有自动重试', text)
+        self.assertNotIn('进程已结束', text)
 
     def prompt(self, state='api_returned', count=1):
         expires = time.time() + 120

@@ -386,18 +386,14 @@ def execute(request):
             if (version.get('CFBundleIdentifier') != 'com.jetbrains.pycharm'
                     or version.get('CFBundleShortVersionString') != '2026.1.2'):
                 raise ValueError('unreviewed PyCharm version')
-        process = subprocess.run(['/usr/bin/open', '-a', 'PyCharm', str(project)], stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=15)
         if tool == 'computer_run_project':
-            if process.returncode != 0:
-                raise ValueError('PyCharm could not open the project')
             if prepare(root, tool, raw, request['private_prefixes']) != args:
                 raise ValueError('run configuration changed after approval')
             # argv is data, never interpolated into JXA. Do not switch
             # configurations, send keyboard shortcuts, or trust window titles.
             process = subprocess.run(['/usr/bin/osascript', '-l', 'JavaScript', '-e', PYCHARM_RUN,
                                       raw['project'], raw['configuration'], str(project)], stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=25)
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=15)
             try:
                 outcome = json.loads(process.stdout)
                 if not isinstance(outcome, dict):
@@ -406,13 +402,16 @@ def execute(request):
                 outcome = {}
             requested = process.returncode == 0 and outcome == {'ok': True, 'stage': 'run_requested'}
             codes = {'PROJECT_IDENTITY_UNAVAILABLE', 'PROJECT_IDENTITY_AMBIGUOUS', 'FRONT_PROJECT_CHANGED',
-                     'RUN_MENU_UNAVAILABLE', 'RUN_CONFIGURATION_UNAVAILABLE', 'RUN_CONFIGURATION_DISABLED', 'UI_UNAVAILABLE'}
+                     'RUN_MENU_UNAVAILABLE', 'RUN_CONFIGURATION_UNAVAILABLE', 'RUN_CONFIGURATION_DISABLED',
+                     'UI_BLOCKED', 'UI_UNAVAILABLE'}
             return {'completion': 'process-ended', 'exit_code': 0 if requested else process.returncode or 1,
                     'evidence': 'pycharm_exact_run_menu_requested' if requested else 'pycharm_run_not_confirmed',
                     'ui_code': ('RUN_REQUESTED' if requested else outcome.get('code')
                                 if isinstance(outcome.get('code'), str) and outcome['code'] in codes else 'UI_UNAVAILABLE'),
                     'project': raw['project'], 'configuration': raw['configuration'],
                     'project_running_verified': False, 'user_goal_verified': False}
+        process = subprocess.run(['/usr/bin/open', '-a', 'PyCharm', str(project)], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=15)
         return {'completion': 'process-ended', 'exit_code': process.returncode,
                 'evidence': 'application_open_request_only', 'project': raw['project'],
                 'project_running_verified': False}
@@ -530,19 +529,33 @@ function projectHeaderMatches(window, projectName, projectPath) {
     } catch (_) { return false; }
 }
 
+function inspectRun(ide, projectName, projectPath) {
+    var windows = ide.windows();
+    // A dialog title is only a blocker, never evidence of project identity.
+    windows.forEach(function(window) {
+        if (window.attributes.byName('AXModal').value() !== false || window.sheets().length !== 0
+                || ['AXDialog', 'AXSystemDialog'].indexOf(window.subrole()) >= 0
+                || ['Run/Debug Configurations', '运行/调试配置'].indexOf(window.name()) >= 0) {
+            throw new Error('UI_BLOCKED');
+        }
+    });
+    var targets = windows.filter(function(window) { return projectHeaderMatches(window, projectName, projectPath); });
+    if (targets.length === 0) throw new Error('PROJECT_IDENTITY_UNAVAILABLE');
+    if (targets.length !== 1) throw new Error('PROJECT_IDENTITY_AMBIGUOUS');
+    return targets[0];
+}
+
 function requestRun(ide, projectName, configName, projectPath) {
     function fail(code) { throw new Error(code); }
-    var windows = ide.windows();
-    var targets = windows.filter(function(window) { return projectHeaderMatches(window, projectName, projectPath); });
-    if (targets.length === 0) fail('PROJECT_IDENTITY_UNAVAILABLE');
-    if (targets.length !== 1) fail('PROJECT_IDENTITY_AMBIGUOUS');
+    var target = inspectRun(ide, projectName, projectPath);
     ide.frontmost = true;
-    targets[0].actions.byName('AXRaise').perform();
+    target.actions.byName('AXRaise').perform();
     for (var retry = 0; retry < 8 && !projectHeaderMatches(ide.windows()[0], projectName, projectPath); retry++) {
         if (typeof delay === 'function') delay(0.15);
     }
     function checkFront() {
         if (!projectHeaderMatches(ide.windows()[0], projectName, projectPath)) fail('FRONT_PROJECT_CHANGED');
+        inspectRun(ide, projectName, projectPath);
     }
     checkFront();
     var bars = ide.menuBars();
@@ -565,10 +578,14 @@ function requestRun(ide, projectName, configName, projectPath) {
 
 function run(args) {
     var codes = ['PROJECT_IDENTITY_UNAVAILABLE', 'PROJECT_IDENTITY_AMBIGUOUS', 'FRONT_PROJECT_CHANGED',
-                 'RUN_MENU_UNAVAILABLE', 'RUN_CONFIGURATION_UNAVAILABLE', 'RUN_CONFIGURATION_DISABLED'];
+                 'RUN_MENU_UNAVAILABLE', 'RUN_CONFIGURATION_UNAVAILABLE', 'RUN_CONFIGURATION_DISABLED', 'UI_BLOCKED'];
     try {
         var processes = Application('System Events').applicationProcesses.whose({bundleIdentifier: 'com.jetbrains.pycharm'})();
         if (processes.length !== 1) throw new Error('UI_UNAVAILABLE');
+        if (args[3] === 'inspect') {
+            inspectRun(processes[0], args[0], args[2]);
+            return JSON.stringify({ok: true, stage: 'preflight_ready'});
+        }
         return JSON.stringify(requestRun(processes[0], args[0], args[1], args[2]));
     } catch (error) {
         return JSON.stringify({ok: false, code: codes.indexOf(error.message) >= 0 ? error.message : 'UI_UNAVAILABLE'});
