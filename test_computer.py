@@ -216,13 +216,81 @@ class ComputerFiles(unittest.TestCase):
         self.assertEqual(info['configurations'], [{'name': 'demo-run', 'type': 'PythonConfigurationType'}])
         request = self.prepared('computer_run_project', {'project': 'demo', 'configuration': 'demo-run'})
         with mock.patch.object(actions.sys, 'platform', 'darwin'), \
-                mock.patch.object(actions.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as run:
+                mock.patch.object(actions.subprocess, 'run', return_value=types.SimpleNamespace(
+                    returncode=0, stdout=b'{"ok":true,"stage":"run_requested"}')) as run:
             result = actions.execute(request)
         self.assertEqual(run.call_count, 2)
         self.assertEqual(run.call_args.args[0][-3:], ['demo', 'demo-run', str(self.root / 'project/demo')])
-        self.assertEqual(run.call_args.args[0][:3], ['/usr/bin/osascript', '-e', actions.PYCHARM_RUN])
+        self.assertEqual(run.call_args.args[0][:5], ['/usr/bin/osascript', '-l', 'JavaScript', '-e', actions.PYCHARM_RUN])
         self.assertFalse(result['project_running_verified'])
         self.assertFalse(result['user_goal_verified'])
+
+    def test_jxa_checks_project_header_path_and_exact_localized_lazy_menu_without_titles(self):
+        node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
+        if not node:
+            self.skipTest('explicit native test runtime required')
+        script = r'''
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const context = {};
+vm.runInNewContext(require('node:fs').readFileSync(0, 'utf8'), context);
+const root = '/synthetic/project/demo';
+function fixture(options={}) {
+  let menuOpened = false, runClicks = 0, raiseCount = 0;
+  function window(path=root, description='项目: demo，菜单') {
+    const button = {properties:()=>({role:'AXButton',description,help:path})};
+    let group = {role:()=> 'AXGroup',uiElements:()=>[button]};
+    for(let i=0;i<3;i++){const child=group;group={role:()=> 'AXGroup',uiElements:()=>[child]};}
+    if(options.notification){const child=group.uiElements()[0];group={role:()=> 'AXGroup',
+      uiElements:()=>[{role:()=> 'AXScrollArea',uiElements:()=>[]},child]};}
+    return {name:()=>{throw Error('window title must never be read');},uiElements:()=>[group],
+      actions:{byName:name=>({perform:()=>{assert.equal(name,'AXRaise');raiseCount++;}})}};
+  }
+  const target=window(options.path ?? root,options.description);
+  let windows=options.duplicate?[target,window()]:[target];
+  const runItem={name:()=>options.item ?? (options.english?"Run 'demo-run'":"运行 'demo-run'"),
+    enabled:()=>options.enabled ?? true,click:()=>{runClicks++;}};
+  const menu={name:()=>options.english?'Run':'运行',click:()=>{menuOpened=true;},
+    menus:()=>menuOpened?[{menuItems:()=>options.duplicateItem?[runItem,runItem]:[runItem]}]:[]};
+  let focusReads=0;
+  const ide={windows:()=>raiseCount&&(options.frontChanged||(options.delayedFocus&&focusReads++<3))?[window('/other')]:windows,
+    menuBars:()=>[{menuBarItems:()=>[menu]}]};
+  return {ide,counts:()=>({runClicks,menuOpened,raiseCount})};
+}
+for(const options of [{},{english:true,description:'Project: demo, menu'},{notification:true},{delayedFocus:true}]){
+  const f=fixture(options);const result=context.requestRun(f.ide,'demo','demo-run',root);
+  assert.equal(result.stage,'run_requested');assert.equal(f.counts().runClicks,1);assert.equal(f.counts().menuOpened,true);
+}
+for(const [options,error] of [
+  [{path:'/other'},'PROJECT_IDENTITY_UNAVAILABLE'],
+  [{path:root+'/nested'},'PROJECT_IDENTITY_UNAVAILABLE'],
+  [{path:root+'-lookalike'},'PROJECT_IDENTITY_UNAVAILABLE'],
+  [{description:'untrusted editor tooltip'},'PROJECT_IDENTITY_UNAVAILABLE'],
+  [{duplicate:true},'PROJECT_IDENTITY_AMBIGUOUS'],
+  [{frontChanged:true},'FRONT_PROJECT_CHANGED'],
+  [{item:"运行 'other'"},'RUN_CONFIGURATION_UNAVAILABLE'],
+  [{item:"调试 'demo-run'"},'RUN_CONFIGURATION_UNAVAILABLE'],
+  [{duplicateItem:true},'RUN_CONFIGURATION_UNAVAILABLE'],
+  [{enabled:false},'RUN_CONFIGURATION_DISABLED']]){
+  const f=fixture(options);assert.throws(()=>context.requestRun(f.ide,'demo','demo-run',root),new RegExp(error));
+  assert.equal(f.counts().runClicks,0);
+}
+process.stdout.write('project identity and localized menu policy passed');
+'''
+        result = subprocess.run([node, '-e', script], input=actions.PYCHARM_RUN, capture_output=True,
+                                text=True, env={**os.environ, 'ELECTRON_RUN_AS_NODE': '1'}, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unmatched_ui_receipt_never_reports_run_requested(self):
+        self.configuration()
+        request = self.prepared('computer_run_project', {'project': 'demo', 'configuration': 'demo-run'})
+        for stdout in (b'', b'not-json', b'[]', b'null', b'{"code":[]}', b'{"ok":true}',
+                       b'{"ok":false,"code":"PROJECT_IDENTITY_UNAVAILABLE"}'):
+            with mock.patch.object(actions.sys, 'platform', 'darwin'), \
+                    mock.patch.object(actions.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=stdout)):
+                result = actions.execute(request)
+            self.assertEqual(result['evidence'], 'pycharm_run_not_confirmed')
+            self.assertNotEqual(result['exit_code'], 0)
 
     def test_changed_ambiguous_or_symlinked_configuration_does_not_run(self):
         path = self.configuration()

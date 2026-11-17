@@ -393,13 +393,24 @@ def execute(request):
                 raise ValueError('PyCharm could not open the project')
             if prepare(root, tool, raw, request['private_prefixes']) != args:
                 raise ValueError('run configuration changed after approval')
-            # argv is data, never interpolated into AppleScript. Do not switch
-            # configurations, send keyboard shortcuts, or click an arbitrary window.
-            process = subprocess.run(['/usr/bin/osascript', '-e', PYCHARM_RUN,
+            # argv is data, never interpolated into JXA. Do not switch
+            # configurations, send keyboard shortcuts, or trust window titles.
+            process = subprocess.run(['/usr/bin/osascript', '-l', 'JavaScript', '-e', PYCHARM_RUN,
                                       raw['project'], raw['configuration'], str(project)], stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=25)
-            return {'completion': 'process-ended', 'exit_code': process.returncode,
-                    'evidence': 'pycharm_exact_run_menu_requested' if process.returncode == 0 else 'pycharm_run_not_confirmed',
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, timeout=25)
+            try:
+                outcome = json.loads(process.stdout)
+                if not isinstance(outcome, dict):
+                    outcome = {}
+            except (ValueError, TypeError, AttributeError):
+                outcome = {}
+            requested = process.returncode == 0 and outcome == {'ok': True, 'stage': 'run_requested'}
+            codes = {'PROJECT_IDENTITY_UNAVAILABLE', 'PROJECT_IDENTITY_AMBIGUOUS', 'FRONT_PROJECT_CHANGED',
+                     'RUN_MENU_UNAVAILABLE', 'RUN_CONFIGURATION_UNAVAILABLE', 'RUN_CONFIGURATION_DISABLED', 'UI_UNAVAILABLE'}
+            return {'completion': 'process-ended', 'exit_code': 0 if requested else process.returncode or 1,
+                    'evidence': 'pycharm_exact_run_menu_requested' if requested else 'pycharm_run_not_confirmed',
+                    'ui_code': ('RUN_REQUESTED' if requested else outcome.get('code')
+                                if isinstance(outcome.get('code'), str) and outcome['code'] in codes else 'UI_UNAVAILABLE'),
                     'project': raw['project'], 'configuration': raw['configuration'],
                     'project_running_verified': False, 'user_goal_verified': False}
         return {'completion': 'process-ended', 'exit_code': process.returncode,
@@ -491,37 +502,76 @@ def execute(request):
                 'evidence': 'new_image_copy_original_unchanged', 'original_preserved': True}
 
 
-PYCHARM_RUN = '''on run args
-set projectName to item 1 of args
-set configName to item 2 of args
-set projectPath to item 3 of args
-tell application "System Events"
-    set matches to application processes whose bundle identifier is "com.jetbrains.pycharm"
-    if (count matches) is not 1 then error "IDE identity ambiguous"
-    set ide to item 1 of matches
-    tell ide
-        set frontmost to true
-        repeat 40 times
-            set targets to {}
-            repeat with w in windows
-                try
-                    set documentPath to value of attribute "AXDocument" of w
-                    if documentPath is projectPath or documentPath starts with (projectPath & "/") or documentPath starts with ("file://" & projectPath & "/") then set end of targets to w
-                end try
-            end repeat
-            if (count targets) is not 0 then exit repeat
-            delay 0.25
-        end repeat
-        if (count targets) is not 1 then error "Project window not uniquely available"
-        perform action "AXRaise" of item 1 of targets
-        set documentPath to value of attribute "AXDocument" of front window
-        if not (documentPath starts with (projectPath & "/") or documentPath starts with ("file://" & projectPath & "/")) then error "Project document path not verified"
-        set runName to "Run '" & configName & "'"
-        set runItem to menu item runName of menu 1 of menu bar item "Run" of menu bar 1
-        if not (exists runItem) then error "Exact run configuration not selected"
-        if not enabled of runItem then error "Run action unavailable"
-        click runItem
-    end tell
-end tell
-return "run-requested"
-end run'''
+PYCHARM_RUN = r'''
+function projectHeaderMatches(window, projectName, projectPath) {
+    // Reviewed PyCharm 2026.1.2 new-UI project-switcher header, not editor
+    // contents, project files, window title or a generic tooltip elsewhere.
+    try {
+        var root = window.uiElements()[0];
+        if (root.role() !== 'AXGroup') return false;
+        var toolbars = root.uiElements().filter(function(element) { return element.role() === 'AXGroup'; });
+        var descriptions = ['项目: ' + projectName + '，菜单', 'Project: ' + projectName + ', menu'];
+        var count = 0;
+        toolbars.forEach(function(toolbar) {
+            try {
+                var group = toolbar;
+                for (var depth = 0; depth < 2; depth++) {
+                    group = group.uiElements()[0];
+                    if (group.role() !== 'AXGroup') return;
+                }
+                count += group.uiElements().filter(function(element) {
+                    var props = element.properties();
+                    return props.role === 'AXButton' && descriptions.indexOf(props.description) >= 0
+                        && props.help === projectPath;
+                }).length;
+            } catch (_) { /* Non-toolbar groups cannot supply project identity. */ }
+        });
+        return count === 1;
+    } catch (_) { return false; }
+}
+
+function requestRun(ide, projectName, configName, projectPath) {
+    function fail(code) { throw new Error(code); }
+    var windows = ide.windows();
+    var targets = windows.filter(function(window) { return projectHeaderMatches(window, projectName, projectPath); });
+    if (targets.length === 0) fail('PROJECT_IDENTITY_UNAVAILABLE');
+    if (targets.length !== 1) fail('PROJECT_IDENTITY_AMBIGUOUS');
+    ide.frontmost = true;
+    targets[0].actions.byName('AXRaise').perform();
+    for (var retry = 0; retry < 8 && !projectHeaderMatches(ide.windows()[0], projectName, projectPath); retry++) {
+        if (typeof delay === 'function') delay(0.15);
+    }
+    function checkFront() {
+        if (!projectHeaderMatches(ide.windows()[0], projectName, projectPath)) fail('FRONT_PROJECT_CHANGED');
+    }
+    checkFront();
+    var bars = ide.menuBars();
+    if (bars.length !== 1) fail('RUN_MENU_UNAVAILABLE');
+    var menus = bars[0].menuBarItems().filter(function(item) { return ['Run', '运行'].indexOf(item.name()) >= 0; });
+    if (menus.length !== 1) fail('RUN_MENU_UNAVAILABLE');
+    // JetBrains lazily populates native menus only after expansion.
+    menus[0].click();
+    if (typeof delay === 'function') delay(0.2);
+    var expanded = menus[0].menus();
+    if (expanded.length !== 1) fail('RUN_MENU_UNAVAILABLE');
+    var expected = menus[0].name() === '运行' ? "运行 '" + configName + "'" : "Run '" + configName + "'";
+    var items = expanded[0].menuItems().filter(function(item) { return item.name() === expected; });
+    if (items.length !== 1) fail('RUN_CONFIGURATION_UNAVAILABLE');
+    if (items[0].enabled() !== true) fail('RUN_CONFIGURATION_DISABLED');
+    checkFront();
+    items[0].click();
+    return {ok: true, stage: 'run_requested'};
+}
+
+function run(args) {
+    var codes = ['PROJECT_IDENTITY_UNAVAILABLE', 'PROJECT_IDENTITY_AMBIGUOUS', 'FRONT_PROJECT_CHANGED',
+                 'RUN_MENU_UNAVAILABLE', 'RUN_CONFIGURATION_UNAVAILABLE', 'RUN_CONFIGURATION_DISABLED'];
+    try {
+        var processes = Application('System Events').applicationProcesses.whose({bundleIdentifier: 'com.jetbrains.pycharm'})();
+        if (processes.length !== 1) throw new Error('UI_UNAVAILABLE');
+        return JSON.stringify(requestRun(processes[0], args[0], args[1], args[2]));
+    } catch (error) {
+        return JSON.stringify({ok: false, code: codes.indexOf(error.message) >= 0 ? error.message : 'UI_UNAVAILABLE'});
+    }
+}
+'''
