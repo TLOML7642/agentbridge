@@ -5,7 +5,7 @@ from pathlib import Path
 import stat
 import sys
 
-from agent_protocol import AgentError
+from agent_protocol import AgentError, bound_trash_progress
 from agent_diagnostics import Diagnostics
 
 
@@ -28,7 +28,8 @@ class NativeTaskExecutor:
             subject['attempt'] = task['id']
             if (data.get('id') != task['id'] or data.get('session') != task['session'] or data.get('digest') != task['digest']
                     or data.get('subject') != subject or not isinstance(data.get('result'), dict)
-                    or data['result'].get('completion') not in ('verified', 'process-ended', 'denied')):
+                    or (data['result'].get('completion') not in ('verified', 'process-ended', 'denied')
+                        and not bound_trash_progress(data['result'], task['tool'], task['arguments']))):
                 return None
             def sanitized(value):
                 if isinstance(value, str):

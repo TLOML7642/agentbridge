@@ -428,6 +428,7 @@ class Main(star.Star):
                 items = binding.get('items', [arguments])
                 total = sum(json.loads(item['binding'])['source']['stat'][2] for item in items)
                 risk += '\n本批 ' + str(len(items)) + ' 个普通文件，共 ' + str(total) + ' 字节；超限不自动拆批。'
+                risk += '\n如需恢复，请从废纸篓手动移回原位置。'
             if body['tool'] == 'computer_run_project':
                 risk += ('\n如明确选择“以后允许此配置运行”：后续代码继承当前Mac账号权限，可能写文件或访问网络，'
                          '不是沙箱；日常代码修改不撤销授权，配置或解释器变化需重新确认。'
@@ -461,10 +462,20 @@ class Main(star.Star):
             return '未能确认 PyCharm 已发起运行，请检查项目窗口、当前运行配置及 macOS 自动化/辅助功能权限。没有自动重试。'
         if result.get('evidence') == 'new_image_copy_original_unchanged':
             return '图片副本已生成，原图保持不变。\n' + str(result.get('path', ''))
+        if state == 'uncertain' and result.get('evidence') == 'trash_stopped_with_progress':
+            def show(paths):
+                return json.dumps(paths, ensure_ascii=False)
+            return (prefix + '废纸篓操作已停止，不会自动重试；执行通道已隔离。'
+                    + '\n已核对移入废纸篓：' + show(result['moved'])
+                    + '\n需要核查：' + show(result['needs_check'])
+                    + '\n本次未尝试：' + show(result['not_attempted']))
+        restore_note = ('\n恢复时请手动移回原位置，不依赖 Finder 的“放回原处”。'
+                        if result.get('staged_for_system_trash') is True else '')
         if result.get('evidence') == 'moved_to_trash_content_verified':
-            return '文件已移入废纸篓，内容校验通过，没有永久删除。\n' + str(result.get('path', ''))
+            return '文件已移入废纸篓，内容校验通过，没有永久删除。\n' + str(result.get('path', '')) + restore_note
         if result.get('evidence') == 'batch_moved_to_trash_content_verified':
-            return '已将清单中的 ' + str(result.get('count', 0)) + ' 个文件移入废纸篓，内容校验通过，没有永久删除。'
+            return ('已将清单中的 ' + str(result.get('count', 0))
+                    + ' 个文件移入废纸篓，内容校验通过，没有永久删除。' + restore_note)
         description = descriptions.get(state, state)
         if state == 'denied':
             description = {'user_denied': '用户主动拒绝，未进入实际动作',

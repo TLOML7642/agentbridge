@@ -147,7 +147,43 @@ def move_exclusive(source_fd, source_name, target_fd, target_name):
     function.restype = ctypes.c_int
     if function(source_fd, os.fsencode(source_name), target_fd, os.fsencode(target_name), 4) != 0:
         errno = ctypes.get_errno()
-        raise OSError(errno, 'exclusive Trash move failed')
+        raise OSError(errno, 'exclusive rename failed')
+
+
+def foundation_trash(root, source):
+    """Ask the OS to recycle one staged file; never open the Trash directory."""
+    import pwd
+    if root != pwd.getpwuid(os.getuid()).pw_dir:
+        raise ValueError('system Trash requires the bound account home')
+    ctypes.CDLL('/System/Library/Frameworks/Foundation.framework/Foundation')
+    objc = ctypes.CDLL('/usr/lib/libobjc.A.dylib')
+    pointer = ctypes.c_void_p
+    for function in (objc.objc_getClass, objc.sel_registerName):
+        function.argtypes, function.restype = [ctypes.c_char_p], pointer
+    address = ctypes.cast(objc.objc_msgSend, pointer).value
+
+    def send(result, receiver, selector, types=(), args=()):
+        method = ctypes.CFUNCTYPE(result, pointer, pointer, *types)(address)
+        return method(receiver, objc.sel_registerName(selector), *args)
+
+    pool = send(pointer, objc.objc_getClass(b'NSAutoreleasePool'), b'new')
+    try:
+        name = send(pointer, objc.objc_getClass(b'NSString'), b'stringWithUTF8String:',
+                    (ctypes.c_char_p,), (os.fsencode(source),))
+        url = send(pointer, objc.objc_getClass(b'NSURL'), b'fileURLWithPath:', (pointer,), (name,)) if name else None
+        manager = send(pointer, objc.objc_getClass(b'NSFileManager'), b'defaultManager')
+        destination, error = pointer(), pointer()
+        if not url or not send(ctypes.c_bool, manager, b'trashItemAtURL:resultingItemURL:error:',
+                               (pointer, ctypes.POINTER(pointer), ctypes.POINTER(pointer)),
+                               (url, ctypes.byref(destination), ctypes.byref(error))) or not destination.value:
+            raise ValueError('system Trash did not return a verified destination')
+        path = send(pointer, destination.value, b'path')
+        raw = send(ctypes.c_char_p, path, b'fileSystemRepresentation') if path else None
+        if not raw:
+            raise ValueError('system Trash returned no file path')
+        return Path(os.fsdecode(raw))
+    finally:
+        send(None, pool, b'drain')
 
 
 def projects(root, private_prefixes=()):
@@ -192,6 +228,105 @@ def journal(request, stage, body):
             output.flush()
             os.fsync(output.fileno())
         os.fsync(directory)
+
+
+def trash_item(request, root, item):
+    source = locate(root, item['path'], request['private_prefixes'])
+    binding = json.loads(item['binding'])
+    original = binding['source']
+    trash = Path(root) / '.Trash'
+    private = Path(request['journal']).parent
+    if not any(Path(prefix) in private.parents for prefix in request['private_prefixes']):
+        raise ValueError('Trash staging must be host-private')
+    private.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stage_name = '.trash-stage-' + uuid.uuid4().hex
+    staged = private / stage_name / source.name
+    evidence = {'path': str(source), 'staged_path': str(staged), 'source_identity': original,
+                'permanently_deleted': False}
+
+    with parent_descriptor(root, source) as parent, pinned_directory('/', private) as staging:
+        info, parent_info = os.fstat(staging), os.fstat(parent)
+        if (info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_dev != parent_info.st_dev
+                or [parent_info.st_dev, parent_info.st_ino] != binding['parent']):
+            raise ValueError('unsafe or cross-volume Trash staging')
+        os.mkdir(stage_name, mode=0o700, dir_fd=staging)
+        stage = os.open(stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=staging)
+        try:
+            os.fsync(staging)
+            journal(request, 'trash-stage-intent', evidence)
+            if file_identity(source.name, parent) != original:
+                raise ValueError('approved Trash file changed')
+            move_exclusive(parent, source.name, stage, source.name)
+            os.fsync(parent)
+            os.fsync(stage)
+            # There is no compare-and-rename syscall. A late replacement may have
+            # been staged, but it must never be presented to the system Trash API.
+            try:
+                candidate = file_identity(source.name, stage)
+                if candidate['stat'][:4] != original['stat'][:4] or candidate['sha256'] != original['sha256']:
+                    raise ValueError('staged file does not match the approved file')
+            except (OSError, ValueError):
+                # Never clobber a newer occupant. On conflict the evidence and
+                # staged entry remain private for reconciliation, with no replay.
+                move_exclusive(stage, source.name, parent, source.name)
+                os.fsync(parent)
+                os.fsync(stage)
+                journal(request, 'trash-stage-restored', evidence)
+                raise
+            journal(request, 'trash-intent', evidence)
+            stage_info = os.fstat(stage)
+            if (directory_identity(staged.parent) != [stage_info.st_dev, stage_info.st_ino]
+                    or file_identity(source.name, stage) != candidate):
+                raise ValueError('private Trash staging changed')
+            try:
+                target = foundation_trash(root, staged)
+            except (OSError, ValueError):
+                # Restore only an identical file still in the pinned staging dir.
+                # A missing staged file or a new source occupant stays unresolved.
+                if file_identity(source.name, stage) == candidate:
+                    move_exclusive(stage, source.name, parent, source.name)
+                    os.fsync(parent)
+                    os.fsync(stage)
+                    journal(request, 'trash-stage-restored', evidence)
+                raise
+            trash_info = trash.lstat()
+            if (target.parent != trash or not stat.S_ISDIR(trash_info.st_mode)
+                    or trash_info.st_uid != os.getuid() or trash_info.st_mode & 0o077):
+                raise ValueError('unexpected system Trash destination')
+            observed = file_identity(target)
+            if (observed['stat'][:4] != original['stat'][:4] or observed['sha256'] != original['sha256']
+                    or directory_identity(trash) != [trash_info.st_dev, trash_info.st_ino]
+                    or os.path.lexists(staged)):
+                raise ValueError('system Trash result did not match the approved file')
+            journal(request, 'trash-verified', {**evidence, 'trash_path': str(target), 'target_identity': observed})
+            os.fsync(stage)
+        finally:
+            os.close(stage)
+            try:
+                os.rmdir(stage_name, dir_fd=staging)
+                os.fsync(staging)
+            except OSError:
+                # In particular, never remove an unresolved staged file.
+                pass
+    return {'completion': 'verified', 'path': str(source), 'trash_path': str(target),
+            'sha256': original['sha256'], 'evidence': 'moved_to_trash_content_verified',
+            'permanently_deleted': False, 'staged_for_system_trash': True}
+
+
+def trash_items(request, root, tool, args):
+    items = json.loads(args['binding'])['items'] if tool == 'computer_trash_files' else [args]
+    results = []
+    for index, item in enumerate(items):
+        try:
+            results.append(trash_item(request, root, item))
+        except (OSError, ValueError):
+            return {'completion': 'uncertain', 'evidence': 'trash_stopped_with_progress',
+                    'moved': [previous['path'] for previous in items[:index]], 'needs_check': item['path'],
+                    'not_attempted': [later['path'] for later in items[index+1:]], 'permanently_deleted': False}
+    if tool == 'computer_trash_file':
+        return results[0]
+    return {'completion': 'verified', 'evidence': 'batch_moved_to_trash_content_verified',
+            'files': results, 'count': len(results), 'permanently_deleted': False, 'staged_for_system_trash': True}
 
 
 def project_path(root, name, private_prefixes):
@@ -377,11 +512,8 @@ def execute(request):
     if current != args:
         raise ValueError('computer target changed after authorization')
     env = {'PATH': '/usr/bin:/bin', 'HOME': root}
-    if tool == 'computer_trash_files':
-        items = json.loads(args['binding'])['items']
-        results = [execute({**request, 'tool': 'computer_trash_file', 'arguments': item}) for item in items]
-        return {'completion': 'verified', 'evidence': 'batch_moved_to_trash_content_verified',
-                'files': results, 'count': len(results), 'permanently_deleted': False}
+    if tool in ('computer_trash_file', 'computer_trash_files'):
+        return trash_items(request, root, tool, args)
     if tool in ('computer_open_project', 'computer_run_project'):
         project = locate(root, 'project/' + raw['project'], request['private_prefixes'])
         if tool == 'computer_run_project':
@@ -419,41 +551,6 @@ def execute(request):
         return {'completion': 'process-ended', 'exit_code': process.returncode,
                 'evidence': 'application_open_request_only', 'project': raw['project'],
                 'project_running_verified': False}
-    if tool == 'computer_trash_file':
-        source = locate(root, raw['path'], request['private_prefixes'])
-        trash = Path(root) / '.Trash'
-        trash.mkdir(mode=0o700, exist_ok=True)
-        info = trash.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ValueError('unsafe Trash directory')
-        target = trash / (source.stem[:80] + '-' + uuid.uuid4().hex + source.suffix[:20])
-        original = file_identity(source)
-        if original != json.loads(args['binding'])['source']:
-            raise ValueError('source changed before trash move')
-        with parent_descriptor(root, source) as source_fd:
-            trash_fd = os.open(trash, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                binding = json.loads(args['binding'])
-                if [os.fstat(source_fd).st_dev, os.fstat(source_fd).st_ino] != binding['parent']:
-                    raise ValueError('source directory changed')
-                if file_identity(source.name, source_fd) != binding['source']:
-                    raise ValueError('source changed at the pinned parent')
-                evidence = {'path': str(source), 'trash_path': str(target), 'source_identity': original,
-                            'permanently_deleted': False}
-                journal(request, 'trash-intent', evidence)
-                move_exclusive(source_fd, source.name, trash_fd, target.name)
-                os.fsync(source_fd)
-                os.fsync(trash_fd)
-                observed = file_identity(target.name, trash_fd)
-                if observed['sha256'] != original['sha256'] or observed['stat'][:3] != original['stat'][:3]:
-                    raise ValueError('trash file identity changed')
-                journal(request, 'trash-verified', {**evidence, 'target_identity': observed})
-            finally:
-                os.close(trash_fd)
-        if source.exists() or target.is_symlink() or file_identity(target)['sha256'] != original['sha256']:
-            raise ValueError('trash move verification failed')
-        return {'completion': 'verified', 'path': str(source), 'trash_path': str(target),
-                'sha256': original['sha256'], 'evidence': 'moved_to_trash_content_verified', 'permanently_deleted': False}
     source = locate(root, raw['source'], request['private_prefixes'])
     destination = locate(root, raw['destination'], request['private_prefixes'], absent=True)
     binding = json.loads(args['binding'])

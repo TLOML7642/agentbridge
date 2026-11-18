@@ -1,7 +1,9 @@
 """Synthetic lightweight service and preflight lifecycle. No production state."""
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -71,6 +73,45 @@ class Preflight(unittest.TestCase):
         return self.runtime.decide('owner', 'private', 'original', 'assistant', approval['approval_id'],
                                    uuid.uuid4().hex, True, remember)
 
+    @contextmanager
+    def native_trash_fixture(self, fail_name=None):
+        # Keep native approvals, the process gate and durable receipts real. Only
+        # substitute the OS Trash endpoint in this disposable driver's copy.
+        import agent_task_executor
+        from process_supervisor import run_task, _executor_identity
+        source = Path(agent_task_executor.__file__).resolve().parent
+        fixture = self.root / 'native-fixture'
+        fixture.mkdir()
+        for name in ('agent_task_driver.mjs', 'agent_rpc.mjs', 'native_boundary.mjs'):
+            shutil.copyfile(source / name, fixture / name)
+        (fixture / 'agent_actions.py').write_text(f'''
+import runpy, sys
+from pathlib import Path
+sys.path.insert(0, {str(source)!r})
+import computer_actions
+
+def recycle(root, staged):
+    assert root == {str(self.root)!r}
+    if staged.name == {fail_name!r}:
+        raise OSError('synthetic failure before move')
+    trash = Path(root) / '.Trash'
+    trash.mkdir(mode=0o700, exist_ok=True)
+    destination = trash / staged.name
+    assert not destination.exists()
+    staged.rename(destination)
+    return destination
+
+computer_actions.foundation_trash = recycle
+runpy.run_path({str(source / 'agent_actions.py')!r}, run_name='__main__')
+''')
+        executor = agent_task_executor.NativeTaskExecutor(self.runtime.root / 'native', run_task, _executor_identity, lambda _: 'dead')
+        self.runtime.runner = executor
+        with mock.patch.object(agent_task_executor, '__file__', str(fixture / 'agent_task_executor.py')), \
+                mock.patch.dict(os.environ, {
+                    'AGENTBRIDGE_AGENT_NODE': os.environ['AGENTBRIDGE_TEST_NATIVE_NODE'],
+                    'AGENTBRIDGE_AGENT_PACKAGES': os.environ['AGENTBRIDGE_TEST_NATIVE_PACKAGES']}):
+            yield executor
+
     def test_no_tool_before_decision_and_native_grant_is_still_single_use(self):
         row = self.submit()
         self.wait(row['task_id'], 'awaiting_confirmation')
@@ -82,13 +123,7 @@ class Preflight(unittest.TestCase):
     def test_real_native_guard_after_preflight_moves_only_synthetic_file(self):
         if sys.platform != 'darwin':
             self.skipTest('macOS native action acceptance is separate from Linux policy tests')
-        from agent_task_executor import NativeTaskExecutor
-        from process_supervisor import run_task, _executor_identity
-        executor = NativeTaskExecutor(self.runtime.root / 'native', run_task, _executor_identity, lambda _: 'dead')
-        self.runtime.runner = executor
-        with mock.patch.dict(os.environ, {
-                'AGENTBRIDGE_AGENT_NODE': os.environ['AGENTBRIDGE_TEST_NATIVE_NODE'],
-                'AGENTBRIDGE_AGENT_PACKAGES': os.environ['AGENTBRIDGE_TEST_NATIVE_PACKAGES']}):
+        with self.native_trash_fixture() as executor:
             row = self.submit()
             self.wait(row['task_id'], 'awaiting_confirmation')
             self.assertFalse((executor.root / (row['task_id'] + '.request.json')).exists())
@@ -97,20 +132,15 @@ class Preflight(unittest.TestCase):
         self.assertFalse((self.root / 'file.txt').exists())
         self.assertEqual(Path(result['result']['trash_path']).read_text(), 'synthetic')
         journal = executor.root / 'action-evidence' / (row['task_id'] + '.jsonl')
-        self.assertEqual([json.loads(line)['stage'] for line in journal.read_text().splitlines()], ['trash-intent', 'trash-verified'])
+        self.assertEqual([json.loads(line)['stage'] for line in journal.read_text().splitlines()],
+                         ['trash-stage-intent', 'trash-intent', 'trash-verified'])
 
     def test_real_native_preflight_batch_home_aliases_use_only_synthetic_trash(self):
         if sys.platform != 'darwin':
             self.skipTest('macOS native batch acceptance is separate from Linux policy tests')
-        from agent_task_executor import NativeTaskExecutor
-        from process_supervisor import run_task, _executor_identity
         (self.root / 'second.txt').write_text('synthetic second')
-        executor = NativeTaskExecutor(self.runtime.root / 'native', run_task, _executor_identity, lambda _: 'dead')
-        self.runtime.runner = executor
         arguments = {'paths': json.dumps(['~/file.txt', '~/second.txt'])}
-        with mock.patch.dict(os.environ, {
-                'AGENTBRIDGE_AGENT_NODE': os.environ['AGENTBRIDGE_TEST_NATIVE_NODE'],
-                'AGENTBRIDGE_AGENT_PACKAGES': os.environ['AGENTBRIDGE_TEST_NATIVE_PACKAGES']}):
+        with self.native_trash_fixture() as executor:
             row = self.submit('computer_trash_files', arguments)
             self.wait(row['task_id'], 'awaiting_confirmation')
             self.assertFalse((executor.root / (row['task_id'] + '.request.json')).exists())
@@ -128,7 +158,47 @@ class Preflight(unittest.TestCase):
                          ['synthetic', 'synthetic second'])
         journal = executor.root / 'action-evidence' / (row['task_id'] + '.jsonl')
         self.assertEqual([json.loads(line)['stage'] for line in journal.read_text().splitlines()],
-                         ['trash-intent', 'trash-verified', 'trash-intent', 'trash-verified'])
+                         ['trash-stage-intent', 'trash-intent', 'trash-verified'] * 2)
+
+    def test_native_partial_trash_receipt_preserves_fence_and_displays_exact_progress(self):
+        if sys.platform != 'darwin':
+            self.skipTest('macOS staging acceptance is separate from Linux policy tests')
+        paths = ['~/file.txt', '~/second.txt', '~/third.txt']
+        for name in ('second.txt', 'third.txt'):
+            (self.root / name).write_text(name)
+        with self.native_trash_fixture(fail_name='second.txt') as executor:
+            row = self.submit('computer_trash_files', {'paths': json.dumps(paths)})
+            self.approve(row['task_id'])
+            result = self.wait(row['task_id'], 'uncertain')['result']
+        self.assertEqual(result, {'completion': 'uncertain', 'evidence': 'trash_stopped_with_progress',
+                         'moved': paths[:1], 'needs_check': paths[1], 'not_attempted': paths[2:],
+                         'permanently_deleted': False})
+        self.assertFalse((self.root / 'file.txt').exists())
+        self.assertEqual((self.root / '.Trash/file.txt').read_text(), 'synthetic')
+        for name in ('second.txt', 'third.txt'):
+            self.assertEqual((self.root / name).read_text(), name)
+        with self.runtime.approvals.db() as db:
+            self.assertEqual([(r['state'], r['epoch'].startswith('host:'))
+                              for r in db.execute('SELECT state,epoch FROM approvals ORDER BY created')],
+                             [('consumed', True), ('consumed', False)])
+            self.assertEqual(sum(r['delivery'].startswith('host-preflight:')
+                                 for r in db.execute('SELECT delivery FROM decisions')), 1)
+        self.assertTrue(self.runtime.uncertain.is_set())
+        with self.assertRaises(AgentError) as error:
+            self.submit('computer_trash_file', {'path': 'third.txt'})
+        self.assertEqual(error.exception.code, 'TASK_UNCERTAIN')
+        # Model a crash after the receipt was saved, before the terminal commit.
+        with self.runtime.db() as db:
+            db.execute("DELETE FROM task_events WHERE task=? AND kind='terminal'", (row['task_id'],))
+            db.execute("UPDATE tasks SET state='running',result='' WHERE id=?", (row['task_id'],))
+        self.runtime.close()
+        self.runtime = TaskRuntime(self.runtime.root, mock.Mock(side_effect=AssertionError('no replay')),
+                                   lambda _: str(self.root), enabled=True, computer_root=str(self.root),
+                                   preflight=True, recover=executor.recover)
+        self.addCleanup(self.runtime.close)
+        self.assertEqual(self.wait(row['task_id'], 'uncertain')['result'], result)
+        self.assertTrue(self.runtime.uncertain.is_set())
+        self.runtime.runner.assert_not_called()
 
     def test_waiting_does_not_block_safe_task_and_cancel_never_runs(self):
         pending = self.submit()

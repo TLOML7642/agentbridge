@@ -11,7 +11,7 @@ import time
 import uuid
 
 from agent_approvals import ApprovalAuthority, canonical, fingerprint
-from agent_protocol import AgentError, required
+from agent_protocol import AgentError, bound_trash_progress, required
 from agent_actions import prepare
 from agent_diagnostics import Diagnostics
 from computer_actions import INPUTS as COMPUTER_TOOLS, AUTOMATIC, inspect as computer_inspect
@@ -89,7 +89,7 @@ class TaskRuntime:
                     except Exception:
                         result = None
                     state = result.get('completion') if isinstance(result, dict) else 'uncertain'
-                    if state not in ('verified', 'process-ended', 'denied'):
+                    if state not in ('verified', 'process-ended', 'denied') and not bound_trash_progress(result, row['tool'], row['arguments']):
                         state, result = 'uncertain', None
                     db.execute('UPDATE tasks SET state=?,result=? WHERE id=?', (state, canonical(result) if result else '', row['id']))
                     self._event(db, row, 'terminal', {'state': state, 'result': result})
@@ -551,7 +551,9 @@ class TaskRuntime:
                                     raise AgentError('TASK_UNCERTAIN', '后台执行登记失效')
                         result = self.runner({**row, 'subject': subject, 'broker': capability,
                                               'register_executor': register_executor}, cancel)
-                        if not isinstance(result, dict) or result.get('completion') not in ('verified', 'process-ended', 'denied'):
+                        if (not isinstance(result, dict) or
+                                (result.get('completion') not in ('verified', 'process-ended', 'denied')
+                                 and not bound_trash_progress(result, row['tool'], row['arguments']))):
                             raise AgentError('TASK_UNCERTAIN', '执行未返回匹配收据')
                         canonical(result)
                     except BaseException as error:
@@ -560,6 +562,8 @@ class TaskRuntime:
                             self.uncertain.set()
                         raise
                     state = result['completion']
+                    if state == 'uncertain':
+                        self.uncertain.set()
             except AgentError as error:
                 if error.code == 'CANCELLED':
                     state = 'cancelled'

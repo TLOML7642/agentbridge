@@ -49,7 +49,9 @@ async function action(args, execution) {
     child.stdin.end(JSON.stringify(input));
   });
   assert.equal(result.ok, true);
-  assert.ok(['verified', 'process-ended'].includes(result.result.completion));
+  const { completion, evidence } = result.result;
+  assert.ok(['verified', 'process-ended'].includes(completion) || (completion === 'uncertain'
+    && evidence === 'trash_stopped_with_progress' && ['computer_trash_file', 'computer_trash_files'].includes(request.tool)));
   receipt = result.result;
   return JSON.stringify(result.result);
 }

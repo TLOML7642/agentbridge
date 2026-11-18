@@ -19,12 +19,31 @@ from unittest import mock
 
 import computer_actions as actions
 from agent_approvals import fingerprint
+from agent_protocol import bound_trash_progress
 from agent_runtime import AgentError
 from agent_tasks import TaskRuntime
 import test_agent_runtime as chat_tests
 
 
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=')
+
+
+def synthetic_trash(root, staged):
+    trash = Path(root) / '.Trash'
+    trash.mkdir(mode=0o700, exist_ok=True)
+    destination = trash / staged.name
+    assert not os.path.lexists(destination)
+    staged.rename(destination)
+    return destination
+
+
+def synthetic_exclusive(source_fd, source, target_fd, target):
+    try:
+        os.stat(target, dir_fd=target_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.rename(source, target, src_dir_fd=source_fd, dst_dir_fd=target_fd)
+    else:
+        raise FileExistsError(target)
 
 
 class ComputerFiles(unittest.TestCase):
@@ -38,7 +57,10 @@ class ComputerFiles(unittest.TestCase):
         (self.root / 'Pictures/input.png').write_bytes(PNG)
 
     def prepared(self, tool, args):
-        return {'root': str(self.root), 'tool': tool, 'arguments': actions.prepare(str(self.root), tool, args), 'private_prefixes': []}
+        private = self.root / '.runtime'
+        prefixes = [str(private)]
+        return {'root': str(self.root), 'tool': tool, 'arguments': actions.prepare(str(self.root), tool, args, prefixes),
+                'private_prefixes': prefixes, 'journal': str(private / 'action-evidence/journal.jsonl')}
 
     def test_projects_are_discovered_by_folder_without_registration(self):
         (self.root / 'project/second').mkdir()
@@ -96,9 +118,9 @@ class ComputerFiles(unittest.TestCase):
 
     def test_trash_move_retains_synthetic_bytes_and_is_not_permanent_delete(self):
         request = self.prepared('computer_trash_file', {'path': 'Pictures/input.png'})
-        def synthetic_move(source_fd, source, target_fd, target):
-            os.rename(source, target, src_dir_fd=source_fd, dst_dir_fd=target_fd)
-        with mock.patch.object(actions.sys, 'platform', 'darwin'), mock.patch.object(actions, 'move_exclusive', synthetic_move):
+        with mock.patch.object(actions.sys, 'platform', 'darwin'), \
+                mock.patch.object(actions, 'move_exclusive', synthetic_exclusive), \
+                mock.patch.object(actions, 'foundation_trash', synthetic_trash):
             result = actions.execute(request)
         self.assertFalse(result['permanently_deleted'])
         self.assertEqual(Path(result['trash_path']).read_bytes(), PNG)
@@ -108,10 +130,75 @@ class ComputerFiles(unittest.TestCase):
     def test_trash_collision_or_cross_volume_failure_never_removes_source(self):
         request = self.prepared('computer_trash_file', {'path': 'Pictures/input.png'})
         with mock.patch.object(actions.sys, 'platform', 'darwin'), \
-                mock.patch.object(actions, 'move_exclusive', side_effect=OSError('synthetic move failure')):
-            with self.assertRaises(OSError):
-                actions.execute(request)
+                mock.patch.object(actions, 'move_exclusive', side_effect=OSError('synthetic move failure')), \
+                mock.patch.object(actions, 'foundation_trash') as recycle:
+            result = actions.execute(request)
+            recycle.assert_not_called()
+        self.assertEqual(result['completion'], 'uncertain')
+        self.assertEqual(result['moved'], [])
         self.assertEqual((self.root / 'Pictures/input.png').read_bytes(), PNG)
+
+    def test_replacement_at_staging_rename_is_not_sent_to_trash(self):
+        source = self.root / 'Pictures/input.png'
+        saved = source.with_name('approved-original.png')
+        request = self.prepared('computer_trash_file', {'path': 'Pictures/input.png'})
+        def substitute_once(source_fd, leaf, target_fd, target):
+            if not saved.exists():
+                source.rename(saved)
+                source.write_bytes(b'unapproved replacement')
+            synthetic_exclusive(source_fd, leaf, target_fd, target)
+        with mock.patch.object(actions.sys, 'platform', 'darwin'), \
+                mock.patch.object(actions, 'move_exclusive', substitute_once), \
+                mock.patch.object(actions, 'foundation_trash') as recycle:
+            result = actions.execute(request)
+            recycle.assert_not_called()
+        self.assertEqual(result['completion'], 'uncertain')
+        self.assertEqual(result['needs_check'], 'Pictures/input.png')
+        self.assertEqual(saved.read_bytes(), PNG)
+        self.assertEqual(source.read_bytes(), b'unapproved replacement')
+        records = [json.loads(line) for line in Path(request['journal']).read_text().splitlines()]
+        self.assertEqual([row['stage'] for row in records], ['trash-stage-intent', 'trash-stage-restored'])
+
+    def test_rollback_collision_never_overwrites_or_trashes_either_replacement(self):
+        source = self.root / 'Pictures/input.png'
+        saved = source.with_name('approved-original.png')
+        request = self.prepared('computer_trash_file', {'path': 'Pictures/input.png'})
+        def substitute_twice(source_fd, leaf, target_fd, target):
+            if not saved.exists():
+                source.rename(saved)
+                source.write_bytes(b'first unapproved replacement')
+                synthetic_exclusive(source_fd, leaf, target_fd, target)
+                source.write_bytes(b'second unapproved replacement')
+                return
+            synthetic_exclusive(source_fd, leaf, target_fd, target)
+        with mock.patch.object(actions.sys, 'platform', 'darwin'), \
+                mock.patch.object(actions, 'move_exclusive', substitute_twice), \
+                mock.patch.object(actions, 'foundation_trash') as recycle:
+            result = actions.execute(request)
+            recycle.assert_not_called()
+        self.assertEqual(result['completion'], 'uncertain')
+        self.assertEqual(saved.read_bytes(), PNG)
+        self.assertEqual(source.read_bytes(), b'second unapproved replacement')
+        record = json.loads(Path(request['journal']).read_text())
+        self.assertEqual(record['stage'], 'trash-stage-intent')
+        self.assertEqual(Path(record['staged_path']).read_bytes(), b'first unapproved replacement')
+
+    def test_system_recycle_sees_only_the_bound_file_after_public_path_changes(self):
+        source = self.root / 'Pictures/input.png'
+        request = self.prepared('computer_trash_file', {'path': 'Pictures/input.png'})
+        def replace_public_entry(root, staged):
+            self.assertNotEqual(staged, source)
+            self.assertEqual(staged.read_bytes(), PNG)
+            self.assertFalse(source.exists())
+            source.write_bytes(b'new public entry left alone')
+            return synthetic_trash(root, staged)
+        with mock.patch.object(actions.sys, 'platform', 'darwin'), \
+                mock.patch.object(actions, 'move_exclusive', synthetic_exclusive), \
+                mock.patch.object(actions, 'foundation_trash', replace_public_entry):
+            result = actions.execute(request)
+        self.assertEqual(result['completion'], 'verified')
+        self.assertEqual(Path(result['trash_path']).read_bytes(), PNG)
+        self.assertEqual(source.read_bytes(), b'new public entry left alone')
 
     def test_resize_creates_new_copy_and_keeps_source(self):
         request = self.prepared('computer_resize_image', {'source': 'Pictures/input.png',
@@ -136,9 +223,9 @@ class ComputerFiles(unittest.TestCase):
     def test_batch_trash_is_one_frozen_manifest_without_recursive_delete(self):
         (self.root / 'Pictures/second.png').write_bytes(PNG)
         request = self.prepared('computer_trash_files', {'paths': json.dumps(['Pictures/input.png', 'Pictures/second.png'])})
-        def synthetic_move(source_fd, source, target_fd, target):
-            os.rename(source, target, src_dir_fd=source_fd, dst_dir_fd=target_fd)
-        with mock.patch.object(actions.sys, 'platform', 'darwin'), mock.patch.object(actions, 'move_exclusive', synthetic_move):
+        with mock.patch.object(actions.sys, 'platform', 'darwin'), \
+                mock.patch.object(actions, 'move_exclusive', synthetic_exclusive), \
+                mock.patch.object(actions, 'foundation_trash', synthetic_trash):
             result = actions.execute(request)
         self.assertEqual(result['count'], 2)
         self.assertFalse(result['permanently_deleted'])
@@ -164,22 +251,28 @@ class ComputerFiles(unittest.TestCase):
             paths.append(name)
         with self.assertRaises(ValueError):
             self.prepared('computer_trash_files', {'paths': json.dumps(paths)})
-        request = self.prepared('computer_trash_files', {'paths': json.dumps(paths[:2])})
-        request['journal'] = str(self.root / '.runtime/journal.jsonl')
-        request['private_prefixes'] = [str(self.root / '.runtime')]
-        count = [0]
-        def partial(source_fd, source, target_fd, target):
-            count[0] += 1
-            if count[0] == 2:
+        request = self.prepared('computer_trash_files', {'paths': json.dumps(paths[:3])})
+        calls = []
+        def partial(root, staged):
+            calls.append(staged.name)
+            if len(calls) == 2:
                 raise OSError('synthetic interrupted batch')
-            os.rename(source, target, src_dir_fd=source_fd, dst_dir_fd=target_fd)
-        with mock.patch.object(actions.sys, 'platform', 'darwin'), mock.patch.object(actions, 'move_exclusive', partial):
-            with self.assertRaises(OSError):
-                actions.execute(request)
+            return synthetic_trash(root, staged)
+        with mock.patch.object(actions.sys, 'platform', 'darwin'), \
+                mock.patch.object(actions, 'move_exclusive', synthetic_exclusive), \
+                mock.patch.object(actions, 'foundation_trash', partial):
+            result = actions.execute(request)
+        self.assertEqual(result['completion'], 'uncertain')
+        self.assertEqual(result['moved'], paths[:1])
+        self.assertEqual(result['needs_check'], paths[1])
+        self.assertEqual(result['not_attempted'], paths[2:3])
+        self.assertEqual(calls, ['file-0', 'file-1'])
         records = [json.loads(line) for line in Path(request['journal']).read_text().splitlines()]
-        self.assertEqual([row['stage'] for row in records], ['trash-intent', 'trash-verified', 'trash-intent'])
-        self.assertEqual(Path(records[1]['trash_path']).read_text(), 'synthetic')
+        self.assertEqual([row['stage'] for row in records], ['trash-stage-intent', 'trash-intent', 'trash-verified',
+                                                           'trash-stage-intent', 'trash-intent', 'trash-stage-restored'])
+        self.assertEqual(Path(records[2]['trash_path']).read_text(), 'synthetic')
         self.assertTrue((self.root / paths[1]).exists())
+        self.assertTrue((self.root / paths[2]).exists())
 
     def test_rotation_and_crop_are_fixed_options_not_shell_commands(self):
         for operation, value, expected in [('rotate', '90', ['-r', '90']), ('crop', '100x200', ['--cropToHeightWidth', '100', '200'])]:
@@ -188,7 +281,7 @@ class ComputerFiles(unittest.TestCase):
             with self.assertRaises(ValueError):
                 actions.image_flags('computer_edit_image', {'operation': operation, 'value': value})
 
-    def test_actual_macos_sips_and_exclusive_trash_use_only_synthetic_home(self):
+    def test_actual_macos_sips_and_exclusive_staging_use_only_synthetic_home(self):
         if sys.platform != 'darwin':
             return  # Other platforms exercise the synthetic adapter, not Mac APIs.
         request = self.prepared('computer_resize_image', {'source': 'Pictures/input.png',
@@ -198,7 +291,8 @@ class ComputerFiles(unittest.TestCase):
         self.assertEqual((self.root / 'Pictures/input.png').read_bytes(), PNG)
         self.assertTrue((self.root / 'Pictures/resized.png').stat().st_size > 0)
         request = self.prepared('computer_trash_file', {'path': 'Pictures/resized.png'})
-        result = actions.execute(request)
+        with mock.patch.object(actions, 'foundation_trash', synthetic_trash):
+            result = actions.execute(request)
         self.assertTrue(Path(result['trash_path']).is_file())
         self.assertFalse((self.root / 'Pictures/resized.png').exists())
 
@@ -465,6 +559,24 @@ class ComputerPolicy(unittest.TestCase):
 
 class MobileConfirmation(unittest.TestCase):
     setUp = chat_tests.PluginAgentTests.setUp
+
+    def test_trash_partial_progress_must_match_the_exact_approved_order(self):
+        paths = ['one.txt', 'two.txt', 'three.txt']
+        args = json.dumps({'paths': json.dumps(paths)})
+        result = dict(completion='uncertain', evidence='trash_stopped_with_progress', moved=paths[:1],
+                      needs_check=paths[1], not_attempted=paths[2:], permanently_deleted=False)
+        self.assertTrue(bound_trash_progress(result, 'computer_trash_files', args))
+        self.assertFalse(bound_trash_progress(result, 'create_text', args))
+        for replacement in (dict(moved=['other.txt']), dict(needs_check=paths[0]), dict(not_attempted=[]),
+                            dict(not_attempted='three.txt'), dict(permanently_deleted=True), dict(extra='private')):
+            self.assertFalse(bound_trash_progress({**result, **replacement}, 'computer_trash_files', args))
+        event = dict(task='synthetic-task', conversation='original', project='assistant', kind='terminal',
+                     body=dict(state='uncertain', result=result))
+        text = self.main._task_event_text(event)
+        self.assertIn('已核对移入废纸篓：["one.txt"]', text)
+        self.assertIn('需要核查："two.txt"', text)
+        self.assertIn('本次未尝试：["three.txt"]', text)
+        self.assertIn('不会自动重试', text)
 
     def test_pycharm_popup_reason_does_not_claim_project_process_completed(self):
         event = dict(task='synthetic-task', kind='terminal', conversation='synthetic-conversation',
