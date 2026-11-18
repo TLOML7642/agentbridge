@@ -22,6 +22,16 @@ TOOLS = {'create_text': {'path', 'text'}, 'make_directory': {'path'},
 TERMINAL = frozenset(('verified', 'process-ended', 'denied', 'cancelled', 'uncertain', 'failed'))
 
 
+def _computer_target_error(error):
+    code = ('COMPUTER_TARGET_NOT_FOUND' if isinstance(error, FileNotFoundError) else
+            'COMPUTER_TARGET_DENIED' if isinstance(error, PermissionError) else
+            'COMPUTER_TARGET_INVALID' if isinstance(error, (ValueError, FileExistsError, NotADirectoryError, IsADirectoryError))
+            else 'EXECUTOR_UNKNOWN')
+    if code == 'EXECUTOR_UNKNOWN':
+        return AgentError(code, '电脑目标检查未能核实，未登记动作；没有自动重试')
+    return AgentError(code, '电脑目标或参数未通过检查，没有登记或执行动作；不代表执行端离线')
+
+
 class TaskRuntime:
     def __init__(self, root, runner, project, enabled=False, recover=lambda _row: None, check_external=lambda: None,
                  allowed_projects=None, computer_root=None, preflight=False):
@@ -183,7 +193,10 @@ class TaskRuntime:
 
     def inspect_computer(self, operation, value):
         root = self.workspace('', 'computer_open_project')
-        return computer_inspect(root, operation, value, [str(self.root.parent), str(self.root.parent.parent / 'control')])
+        try:
+            return computer_inspect(root, operation, value, [str(self.root.parent), str(self.root.parent.parent / 'control')])
+        except (OSError, ValueError, TypeError) as error:
+            raise _computer_target_error(error) from None
 
     def issue(self, kind, subject, ttl=120, cancel=None, tool=None):
         if not (self._allowed(subject.get('project'), tool) if kind == 'task' else
@@ -298,10 +311,13 @@ class TaskRuntime:
             prefixes = [str(private_root), *[str(private_root.parent / name) for name in ('control', 'logs', 'audit')]]
             try:
                 actual_arguments = prepare(cwd, tool, arguments, prefixes)
-            except (OSError, ValueError, TypeError):
-                if tool in ('computer_trash_file', 'computer_trash_files'):
-                    raise AgentError('INVALID_MESSAGE', '移入废纸篓只允许1至20个普通文件、合计不超过256 MiB；'
-                                     '目录、链接、重复文件或保护路径不允许，超限不会自动拆批。未登记动作') from None
+            except (OSError, ValueError, TypeError) as error:
+                if tool in COMPUTER_TOOLS:
+                    problem = _computer_target_error(error)
+                    if tool in ('computer_trash_file', 'computer_trash_files') and problem.code == 'COMPUTER_TARGET_INVALID':
+                        raise AgentError(problem.code, '移入废纸篓只允许1至20个普通文件、合计不超过256 MiB；'
+                                         '目录、链接、重复文件或保护路径不允许，超限不会自动拆批。未登记动作') from None
+                    raise problem from None
                 raise AgentError('INVALID_MESSAGE', '目标、命令或参数不在已审核范围，未登记动作') from None
             identifier = uuid.uuid4().hex
             db.execute('INSERT INTO tasks(id,origin,delivery,sender,channel,conversation,project,cwd,device,inode,session,'

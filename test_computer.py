@@ -59,6 +59,16 @@ class ComputerFiles(unittest.TestCase):
         with self.assertRaises(ValueError):
             actions.directory_identity(self.root / 'Pictures/input.png')
 
+    def test_home_alias_is_bound_to_explicit_root_not_process_home(self):
+        with mock.patch.dict(os.environ, {'HOME': '/synthetic-server-home'}):
+            self.assertEqual(actions.locate(self.root, '~/Pictures/input.png'), self.root / 'Pictures/input.png')
+        self.assertEqual(actions.locate(self.root, '~/Pictures/new.png', absent=True), self.root / 'Pictures/new.png')
+        for path in ('~', '~other/Pictures', '~/../outside', '~/.ssh/id', '~/Library', '~/Pictures/input.png'):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                actions.locate(self.root, path, absent=True)
+        with self.assertRaises(ValueError):
+            self.prepared('computer_trash_files', {'paths': json.dumps(['Pictures/input.png', '~/Pictures/input.png'])})
+
     def test_paths_protect_credentials_symlinks_runtime_and_existing_outputs(self):
         (self.root / '.ssh').mkdir()
         (self.root / '.ssh/id').write_text('synthetic credential')
@@ -203,8 +213,8 @@ class ComputerFiles(unittest.TestCase):
         source.write_bytes(data)
         for operation, value, expected in [('rotate', '90', (6, 8)), ('crop', '2x4', (4, 2)), ('resize', '4', (4, 3))]:
             destination = 'Pictures/' + operation + '.png'
-            result = actions.execute(self.prepared('computer_edit_image', {'source': 'Pictures/input.png',
-                'destination': destination, 'operation': operation, 'value': value}))
+            result = actions.execute(self.prepared('computer_edit_image', {'source': '~/Pictures/input.png',
+                'destination': '~/' + destination, 'operation': operation, 'value': value}))
             output = subprocess.check_output(['/usr/bin/sips', '-g', 'pixelWidth', '-g', 'pixelHeight', str(self.root / destination)], text=True)
             dimensions = tuple(int(line.split(':')[1]) for line in output.splitlines() if 'pixelWidth:' in line or 'pixelHeight:' in line)
             self.assertEqual(dimensions, expected)
@@ -357,8 +367,8 @@ process.stdout.write('project identity and localized menu policy passed');
         subject = dict(sender='owner', channel='private', conversation='original', project='assistant',
                        cwd=str(self.root), session=uuid.uuid4().hex, attempt=uuid.uuid4().hex)
         with mock.patch.dict(os.environ, {'AGENTBRIDGE_AGENT_NODE': node, 'AGENTBRIDGE_AGENT_PACKAGES': packages}):
-            task = runtime.submit(subject, 'native-copy', 'computer_resize_image', {'source': 'Pictures/input.png',
-                'destination': 'Pictures/native.png', 'max_pixels': '200'})
+            task = runtime.submit(subject, 'native-copy', 'computer_resize_image', {'source': '~/Pictures/input.png',
+                'destination': '~/Pictures/native.png', 'max_pixels': '200'})
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 result = runtime.inspect('owner', 'private', 'original', 'assistant', task['task_id'])
@@ -369,8 +379,8 @@ process.stdout.write('project identity and localized menu policy passed');
         self.assertEqual((self.root / 'Pictures/input.png').read_bytes(), PNG)
         self.assertTrue((self.root / 'Pictures/native.png').is_file())
         self.assertNotIn('approval', [event['kind'] for event in runtime.events('owner', 'private', 'original', 'assistant')['events']])
-        self.assertEqual(runtime.submit(subject, 'native-copy', 'computer_resize_image', {'source': 'Pictures/input.png',
-            'destination': 'Pictures/native.png', 'max_pixels': '200'})['task_id'], task['task_id'])
+        self.assertEqual(runtime.submit(subject, 'native-copy', 'computer_resize_image', {'source': '~/Pictures/input.png',
+            'destination': '~/Pictures/native.png', 'max_pixels': '200'})['task_id'], task['task_id'])
 
 
 class ComputerPolicy(unittest.TestCase):
@@ -432,6 +442,25 @@ class ComputerPolicy(unittest.TestCase):
         self.runtime.computer_root = None
         with self.assertRaises(AgentError):
             self.runtime.submit(self.subject, 'new', 'computer_open_project', {'project': 'demo'})
+
+    def test_alias_inspection_and_preflight_errors_are_not_executor_unknown(self):
+        self.assertEqual(self.runtime.inspect_computer('folder', '~/Pictures')['path'], str(self.root / 'Pictures'))
+        for value, code in [('~/missing-folder', 'COMPUTER_TARGET_NOT_FOUND'),
+                            ('~other/Pictures', 'COMPUTER_TARGET_INVALID'),
+                            ('~/.ssh', 'COMPUTER_TARGET_INVALID')]:
+            with self.subTest(path=value), self.assertRaises(AgentError) as error:
+                self.runtime.inspect_computer('folder', value)
+            self.assertEqual(error.exception.code, code)
+        with self.assertRaises(AgentError) as error:
+            self.runtime.submit(self.subject, 'missing-image', 'computer_edit_image',
+                dict(source='~/Pictures/missing.png', destination='~/Pictures/out.png', operation='rotate', value='90'))
+        self.assertEqual(error.exception.code, 'COMPUTER_TARGET_NOT_FOUND')
+        with mock.patch('agent_tasks.computer_inspect', side_effect=OSError('synthetic unexpected I/O')):
+            with self.assertRaises(AgentError) as error:
+                self.runtime.inspect_computer('folder', '~/Pictures')
+            self.assertEqual(error.exception.code, 'EXECUTOR_UNKNOWN')
+        with self.runtime.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM tasks').fetchone()[0], 0)
 
 
 class MobileConfirmation(unittest.TestCase):
@@ -510,6 +539,32 @@ class MobileConfirmation(unittest.TestCase):
 
 
 class ComputerTransport(unittest.TestCase):
+    def test_native_rpc_preserves_fixed_target_errors_not_untrusted_error_text(self):
+        from assistant_executor import Executor
+        node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
+        if not node:
+            self.skipTest('explicit native test runtime required')
+        with tempfile.TemporaryDirectory(prefix='computer-transport-') as scratch:
+            executor = Executor(Path(scratch).resolve(), 'http://127.0.0.1:12345', 'synthetic-secret',
+                                types.SimpleNamespace(target=lambda _: 'unavailable'), computer_enabled=True)
+            self.addCleanup(executor.close)
+            subject = dict(sender='owner', channel='private', project='assistant', conversation='original', attempt='turn')
+            broker = executor.issue('chat', subject)
+            script = '''
+import {rpc} from './agent_rpc.mjs';
+try {await rpc(JSON.parse(process.argv[1]),'computer_inspect',{operation:'folder',value:'~/missing'});
+  process.stdout.write('unexpected success');}
+catch(error){process.stdout.write(error.message);}
+'''
+            for code in ('COMPUTER_TARGET_NOT_FOUND', 'COMPUTER_TARGET_DENIED', 'COMPUTER_TARGET_INVALID', 'UNTRUSTED_ERROR_TEXT'):
+                executor.call = mock.Mock(return_value={'ok': False, 'code': code})
+                result = subprocess.run([node, '--input-type=module', '-e', script, json.dumps(broker)],
+                    cwd=Path(__file__).parent, capture_output=True, text=True,
+                    env={**os.environ, 'ELECTRON_RUN_AS_NODE': '1'}, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, code if code.startswith('COMPUTER_TARGET_') else 'TASK_RPC_DENIED')
+                self.assertEqual(executor.call.call_args.args[2]['value'], '~/missing')
+
     def test_explicit_computer_capability_does_not_enable_old_write_interface(self):
         from assistant_executor import Executor
         with tempfile.TemporaryDirectory(prefix='computer-transport-') as scratch:

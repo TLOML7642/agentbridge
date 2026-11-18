@@ -38,6 +38,10 @@ def locate(root, value, private_prefixes=(), absent=False):
         raise ValueError('computer root must be canonical')
     if not isinstance(value, str) or not value or '\0' in value or len(value) > 4096:
         raise ValueError('invalid path')
+    if value.startswith('~/'):
+        value = value[2:]
+    elif value.startswith('~'):
+        raise ValueError('only the bound user home alias is supported')
     path = Path(os.path.normpath(os.path.join(root, value)))
     if path == root or root not in path.parents:
         raise ValueError('path outside user files')

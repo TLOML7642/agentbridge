@@ -48,7 +48,8 @@ export function rpc(broker, op, fields, signal) {
           // Preserve only fixed host outcome codes, never remote prose or
           // model-supplied fields. Offline is not an approval rejection.
           const codes = ['MAC_OFFLINE', 'EXECUTOR_UNKNOWN', ...(purpose === 'SERVICE_RPC'
-            ? ['REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED', 'REMINDER_FOLLOWUP_CONFLICT'] : [])];
+            ? ['REMINDER_INTENT_REQUIRED', 'REMINDER_RECURRING_UNSUPPORTED', 'REMINDER_FOLLOWUP_CONFLICT']
+            : ['COMPUTER_TARGET_NOT_FOUND', 'COMPUTER_TARGET_DENIED', 'COMPUTER_TARGET_INVALID'])];
           const code = codes.includes(value?.code) ? value.code : purpose + '_DENIED';
           throw new Error(code);
         }
