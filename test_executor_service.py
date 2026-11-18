@@ -99,6 +99,37 @@ class Preflight(unittest.TestCase):
         journal = executor.root / 'action-evidence' / (row['task_id'] + '.jsonl')
         self.assertEqual([json.loads(line)['stage'] for line in journal.read_text().splitlines()], ['trash-intent', 'trash-verified'])
 
+    def test_real_native_preflight_batch_home_aliases_use_only_synthetic_trash(self):
+        if sys.platform != 'darwin':
+            self.skipTest('macOS native batch acceptance is separate from Linux policy tests')
+        from agent_task_executor import NativeTaskExecutor
+        from process_supervisor import run_task, _executor_identity
+        (self.root / 'second.txt').write_text('synthetic second')
+        executor = NativeTaskExecutor(self.runtime.root / 'native', run_task, _executor_identity, lambda _: 'dead')
+        self.runtime.runner = executor
+        arguments = {'paths': json.dumps(['~/file.txt', '~/second.txt'])}
+        with mock.patch.dict(os.environ, {
+                'AGENTBRIDGE_AGENT_NODE': os.environ['AGENTBRIDGE_TEST_NATIVE_NODE'],
+                'AGENTBRIDGE_AGENT_PACKAGES': os.environ['AGENTBRIDGE_TEST_NATIVE_PACKAGES']}):
+            row = self.submit('computer_trash_files', arguments)
+            self.wait(row['task_id'], 'awaiting_confirmation')
+            self.assertFalse((executor.root / (row['task_id'] + '.request.json')).exists())
+            self.assertEqual((self.root / 'file.txt').read_text(), 'synthetic')
+            self.assertEqual((self.root / 'second.txt').read_text(), 'synthetic second')
+            self.approve(row['task_id'])
+            result = self.wait(row['task_id'], 'verified')
+        self.assertEqual(result['result']['count'], 2)
+        self.assertFalse(result['result']['permanently_deleted'])
+        self.assertFalse((self.root / 'file.txt').exists())
+        self.assertFalse((self.root / 'second.txt').exists())
+        self.assertEqual([Path(item['trash_path']).parent for item in result['result']['files']],
+                         [self.root / '.Trash', self.root / '.Trash'])
+        self.assertEqual([Path(item['trash_path']).read_text() for item in result['result']['files']],
+                         ['synthetic', 'synthetic second'])
+        journal = executor.root / 'action-evidence' / (row['task_id'] + '.jsonl')
+        self.assertEqual([json.loads(line)['stage'] for line in journal.read_text().splitlines()],
+                         ['trash-intent', 'trash-verified', 'trash-intent', 'trash-verified'])
+
     def test_waiting_does_not_block_safe_task_and_cancel_never_runs(self):
         pending = self.submit()
         self.wait(pending['task_id'], 'awaiting_confirmation')
