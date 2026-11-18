@@ -193,6 +193,38 @@ class Preflight(unittest.TestCase):
 
 
 class Service(unittest.TestCase):
+    def test_fixed_legacy_read_uses_lightweight_host_and_keeps_private_paths_blocked(self):
+        from executor_api import dispatch
+        with tempfile.TemporaryDirectory(prefix='absvc-', dir='/private/tmp') as name:
+            root = Path(name).resolve()
+            (root / 'home').mkdir()
+            (root / 'safe.txt').write_text('synthetic read')
+            (root / 'agent').mkdir()
+            (root / 'agent/private.txt').write_text('synthetic private')
+            database = worker.DB(str(root / 'agentbridge.db'))
+            database.execute('INSERT INTO projects(name,dir,normalized,lock_key,created_at) VALUES(?,?,?,?,?)',
+                             ('legacy', str(root), str(root), 'synthetic', 1))
+            database.close()
+            before = (root / 'agentbridge.db').read_bytes()
+            with mock.patch.dict(os.environ, {'AGENTBRIDGE_WORKER_ROLE': 'executor_only'}):
+                app = executor_service.App(root, str(root / 'home'), runner=lambda *_: None)
+            try:
+                subject = dict(sender='owner', channel='private', project='legacy',
+                               conversation='synthetic', attempt='synthetic-read')
+                payload = dict(sender='owner', channel='private', op='read', subject=subject,
+                               operation='read_text', value='safe.txt', range={})
+                result = dispatch(app, payload, {'owner'}, {'private'})
+                self.assertTrue(result['ok'])
+                value = json.loads(result['value'])
+                self.assertEqual(value['text'], 'synthetic read')
+                self.assertEqual(value['bytes'], 14)
+                self.assertEqual(result['evidence_location'], 'mac_live')
+                with self.assertRaises(ValueError):
+                    dispatch(app, {**payload, 'value': 'agent/private.txt'}, {'owner'}, {'private'})
+            finally:
+                app.close()
+            self.assertEqual((root / 'agentbridge.db').read_bytes(), before)
+
     def test_legacy_job_queries_preserve_wire_shape_and_do_not_write_old_database(self):
         with tempfile.TemporaryDirectory(prefix='absvc-', dir='/private/tmp') as name:
             root = Path(name).resolve()

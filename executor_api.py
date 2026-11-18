@@ -48,9 +48,10 @@ def dispatch(app, payload, senders, channels):
         if not isinstance(payload['range'], dict) or set(payload['range']) - {'literal', 'max_matches', 'start_line', 'max_lines', 'expected_version'}:
             raise AgentError('INVALID_MESSAGE', '读取参数无效')
         info = os.stat(cwd)
+        private_root = Path(app.legacy).parent if hasattr(app, 'legacy') else Path(app.db.path).parent
         value = agent_reads.query({**payload['range'], 'root': cwd, 'value': payload['value'],
                                   'operation': payload['operation'], 'device': info.st_dev, 'inode': info.st_ino,
-                                  'private_prefixes': [str(Path(app.db.path).parent / name)
+                                  'private_prefixes': [str(private_root / name)
                                                        for name in ('agent', 'logs', 'audit', 'control')]})
         return {'ok': True, 'value': value, 'evidence_location': 'mac_live', 'boot_id': app.boot_id}
     if tasks is None:

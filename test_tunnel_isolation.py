@@ -152,7 +152,7 @@ LogLevel ERROR
                 sock.connect(str(local_path))
                 self.assertEqual(sock.recv(1), b'')
             self.assert_refusal(proc, b'open failed')
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(socket.timeout):
                 target.accept()
 
     def test_disconnect_listener_collision_and_clean_reconnect(self):
