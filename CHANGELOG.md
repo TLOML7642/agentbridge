@@ -1,5 +1,11 @@
 # 更新日志
 
+## 2026-11-18：验证 macOS 官方废纸篓接口，无需扩大现有权限（尚未接入）
+
+- 独立核对 GitHub 基线 `55f9722`，按 [Apple FileManager.trashItem 文档](https://developer.apple.com/documentation/foundation/filemanager/trashitem(at:resultingitemurl:))，在 macOS 26.4 先只读确认接口存在。沿用相同用户与 GUI launchd 域及原 Python → Electron → Python 执行链，但使用独立临时作业和一份新合成普通文件；未在正式作业上操作。
+- 只调用一次 `trashItem`，API 成功、作业退出码 0，源路径消失；系统返回目标位于用户废纸篓，目标设备号、inode 和 SHA-256 与原合成文件匹配。同身份第二个只读作业对确切目标再次核对 inode/内容通过，但直接打开 `.Trash` 目录仍被系统拒绝（EPERM）；不枚举废纸篓，也未新增完全磁盘访问。两临时作业均已注销，正式执行端 PID 未变。
+- 这是单份文件的系统接口验证，不是微信或生产批量验收。官方方法按 URL 调用，接入前仍需验证目标绑定、链接/换名竞态、部分成功对账及原一次性审批，不能只凭 API 成功报目标完成。未改产品代码或部署，旧两份合成文件原摘要未变，旧任务仍为 uncertain，未重放或解除隔离；未发送任何微信通知。
+
 ## 2026-11-18：废纸篓实测触发Mac系统隐私拒绝，未知隔离保留
 
 - 第一次真实微信批量请求准确列出2个合成普通文件、共58字节；等待确认时无执行器登记、原文件摘要未变。四分钟审批过期后终态denied/approval_expired/tool_body_not_entered，原文件保留；审批和过期通知API均返回，用户反馈手机收到过期说明。没有自动重提或代替用户批准。
