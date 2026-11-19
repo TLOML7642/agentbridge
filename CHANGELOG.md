@@ -1,5 +1,14 @@
 # 更新日志
 
+## 2026-11-19：Codex 等待通知未通过兼容门槛，24 小时观察进行中
+
+- 开始前独立核对 GitHub 开发分支 `f22ddb3` 与本地一致。使用空 `HOME`/`CODEX_HOME` 和 0700 临时目录验证实际 `codex-cli 0.170.0`。CLI 能生成正式审批、`item/tool/requestUserInput`、`serverRequest/resolved` 的协议定义，官方 app-server 也能创建私有 Unix socket。首轮绑定被沙箱拒绝；获准后在新临时目录复验，正常 CLI 的 `--add-dir` 通过参数检查（该无终端探针随后因非 TTY 退出），指定私有 socket 后同一参数在连接前即被明确拒绝。
+- [同版本 TUI 源码](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/tui/src/lib.rs#L1098-L1139) 将自选 Unix socket 归为远程工作区；[启动路径](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/tui/src/startup_orchestration.rs#L16-L24) 拒绝 `--add-dir`，[线程参数](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/tui/src/app_server_session.rs#L488-L503) 不传本地工作区根。`unix://` 默认地址指向共享控制 socket，不是单次监测会话的独立入口。这不是 socket 不可用，也不是审批被关闭；是未满足“不改变原 TUI 行为”的门槛。按计划停在兼容验证，不连接共享 daemon、不读取截图或聊天日志，不接入监测或微信发送器；15 秒等待、断线清除、去重、发送超时及真实终端/手机对照均未运行。
+- 隔离 `tools/check_background.py --modules test_tunnel_isolation test_assistant test_assistant_migration test_reminders test_executor_service` 共 **83 项通过（32.583 秒，无跳过）**。覆盖独立 SSH 隧道断线、监听冲突和恢复；Mac 不可达时服务器合成聊天受理并可查到完成、提醒循环仍能投递给合成发送器；动作结果未知后重启不重发。未用真实生产任务注入故障，未重跑已通过的目录、图片、废纸篓或去重手机验收。
+- 北京时间 **16:17:52** 启动 `cf9be82` 独立 24 小时只读窗口：服务端每分钟采集 assistant、服务器→Mac 和 shim 认证健康，核对实例及静态配置漂移；计划 1,441 样本，脱敏结果经既有 SSH 流式保留在本机。初次分离启动无样本，不计入窗口；当前独立窗口已有成功样本，尚未完成。采样缺口或 SSH 流中断不当作成功，不改 SSH、电源或网络设置，也不以健康探测代替微信、聊天或实机动作验收。
+- **尚未部署。** PyCharm 旧实机合成夹具位于执行器允许范围外，需确认微信可达的合成项目及配置，等用户手机发起后再核对受理、待确认取消、进程退出码、独立新标记、查询、长期授权查看和撤销；运行中取消另待合适场景。此次没有生产通知或真实模型调用；手机实收及普通聊天自然接话未验。沿用原性格记忆，无新档案、话术、后台模型或配置修改。
+- 公开检查：`git diff --check` 通过；两份变更仅含文档，路径白名单不变。审查 106 个历史路径、713 个历史 blob 及两份修改文档的高特异凭据模式，未检出；模式扫描不等于穷尽式审计。探针证据不入 Git。
+
 ## 2026-11-19：真实微信废纸篓去重验收通过
 
 - 手机发起新一批两份合成文件并确认一次。后台核对一次批量工具调用、原生和宿主授权消费、Mac 终态 `verified`、执行进程组已退出、两份源路径消失；废纸篓目标设备号、inode、内容 SHA 与持久收据及逐项日志一致，没有永久删除。旧失败夹具不变，原 55 条消息逐行保留。登记至终态 13.817 秒含确认等待，不是手机或文件操作耗时。
