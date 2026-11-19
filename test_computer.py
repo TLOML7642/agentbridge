@@ -571,7 +571,7 @@ class MobileConfirmation(unittest.TestCase):
         event = self.trash_approval_event(['~/Pictures/demo/a.txt', '~/Pictures/demo/b.txt'])
         original = json.dumps(event)
         self.assertEqual(self.main._task_event_text(event),
-                         '把这 2 个文件移入废纸篓？\n目录：~/Pictures/demo\n· a.txt\n· b.txt\n回复「同意」或「拒绝」。')
+                         '移入废纸篓：2 个文件\n目录：~/Pictures/demo\n· a.txt\n· b.txt\n回复「同意」或「拒绝」。')
         detail = self.main._task_event_text(event, details=True)
         for field in ('~/Pictures/demo/a.txt', '~/Pictures/demo/b.txt', '58 字节', '四分钟',
                       '/agent approve ' + 'a'*32, '/agent deny ' + 'a'*32):
@@ -605,7 +605,7 @@ class MobileConfirmation(unittest.TestCase):
                       files=[dict(path='/synthetic/a'), dict(path='/synthetic/b')])
         event = dict(task='synthetic-task', conversation='original', project='assistant', kind='terminal',
                      body=dict(state='verified', result=result))
-        self.assertEqual(self.main._task_event_text(event), '这 2 个文件已移入废纸篓。')
+        self.assertEqual(self.main._task_event_text(event), '已移入废纸篓：2 个文件。')
         detail = self.main._task_event_text(event, details=True)
         self.assertIn('/synthetic/a', detail)
         self.assertIn('/synthetic/b', detail)
@@ -672,7 +672,7 @@ class MobileConfirmation(unittest.TestCase):
         self.assertEqual(payload['op'], 'agent.approve')
         self.assertEqual(payload['approval_id'], approval['approval_id'])
         self.main._request.assert_not_awaited()
-        self.assertEqual(self.main._send_notification.await_args.args[1], '收到，等执行结果。')
+        self.assertEqual(self.main._send_notification.await_args.args[1], '确认已收到，结果以完成通知为准。')
 
     def test_ambiguous_unshown_or_unknown_delivery_never_grants(self):
         self.prompt(state='unknown')

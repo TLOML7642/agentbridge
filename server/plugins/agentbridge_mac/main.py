@@ -430,7 +430,7 @@ class Main(star.Star):
                     names = [part[2] for part in parts]
                 else:
                     location, names = '', paths
-                return (f'把这 {len(paths)} 个文件移入废纸篓？' + location
+                return (f'移入废纸篓：{len(paths)} 个文件' + location
                         + ''.join('\n· ' + cls._trash_display_path(name) for name in names)
                         + '\n回复「同意」或「拒绝」。')
             visible = {key: value for key, value in arguments.items() if key not in ('text', 'binding')}
@@ -491,7 +491,7 @@ class Main(star.Star):
                     + '\n本次未尝试：' + show(result['not_attempted']))
         if state == 'verified' and result.get('evidence') in ('moved_to_trash_content_verified', 'batch_moved_to_trash_content_verified'):
             count = result.get('count') if result['evidence'] == 'batch_moved_to_trash_content_verified' else 1
-            text = f'这 {count} 个文件已移入废纸篓。'
+            text = f'已移入废纸篓：{count} 个文件。'
             if details:
                 files = result.get('files', [result])
                 text += ''.join('\n· ' + cls._trash_display_path(item['path']) for item in files if item.get('path'))
@@ -564,7 +564,7 @@ class Main(star.Star):
             'approval_id': approval['approval_id'], 'delivery_id': delivery})
         if status == 200 and result.get('ok') is True:
             if approval.get('tool') in ('computer_trash_file', 'computer_trash_files'):
-                await self._agent_local(event, '收到，等执行结果。' if allow else '好，不移动。')
+                await self._agent_local(event, '确认已收到，结果以完成通知为准。' if allow else '已拒绝，本次操作未执行。')
             else:
                 await self._agent_local(event, '已同意本次操作，等待执行结果。' if allow else '已拒绝本次操作。')
         else:
