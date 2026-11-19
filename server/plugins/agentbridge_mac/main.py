@@ -349,6 +349,29 @@ class Main(star.Star):
             return '这轮已停止，不会自动重发。可用 /agent status 查询，或 /agent new 开新会话。' + suffix
         return '这条消息没有完成。可用 /agent status 查看原因。' + suffix
 
+    @staticmethod
+    def _approval_card_delivery(db, row, data):
+        task = data.get('approval_card_task')
+        if (not AGENT_TASKS or data.get('state') != 'done' or not isinstance(task, dict)
+                or task.get('tool') not in ('computer_trash_file', 'computer_trash_files')
+                or not isinstance(task.get('task_id'), str) or not re.fullmatch('[a-f0-9]{32}', task['task_id'])
+                or (row['message_id'] and row['message_id'] != data.get('message_id'))):
+            return None
+        rows = db.execute("SELECT payload,state FROM agent_task_outbox WHERE sender=? AND channel=? AND "
+                          "json_extract(payload,'$.task')=? AND json_extract(payload,'$.kind')='approval' LIMIT 2",
+                          (row['sender'], row['channel'], task['task_id'])).fetchall()
+        if len(rows) == 1:
+            card = json.loads(rows[0]['payload'])
+            if (card.get('sender') == row['sender'] and card.get('channel') == row['channel']
+                    and card.get('conversation') == data.get('session_id') and card.get('project') == data.get('project')
+                    and card['body'].get('tool') == task['tool'] and card['body'].get('state') == 'pending'):
+                if rows[0]['state'] == 'api_returned':
+                    return 'covered_by_approval'
+                if rows[0]['state'] == 'unknown':
+                    return 'card_unconfirmed'
+        created = (data.get('evidence') or {}).get('created')
+        return 'wait_for_card' if type(created) in (int, float) and 0 <= time.time() - created < 12 else 'card_unconfirmed'
+
     async def _agent_tick(self):
         with self._agent_db() as db:
             rows = [dict(row) for row in db.execute("SELECT * FROM agent_outbox WHERE state='watch' ORDER BY created LIMIT 50")]
@@ -375,6 +398,18 @@ class Main(star.Star):
             text = data.get('reply') if data['state'] == 'done' else self._agent_failure_text(data)
             key = (row['sender'], row['channel'], row['delivery'])
             with self._agent_db() as db:
+                try:
+                    card_delivery = self._approval_card_delivery(db, row, data)
+                except (sqlite3.Error, ValueError, KeyError, TypeError, AttributeError):
+                    card_delivery = None
+                if card_delivery == 'wait_for_card':
+                    continue
+                if card_delivery == 'covered_by_approval':
+                    db.execute("UPDATE agent_outbox SET state='covered_by_approval',message_id=? "
+                               "WHERE sender=? AND channel=? AND delivery=? AND state='watch'", (data['message_id'], *key))
+                    continue
+                if card_delivery == 'card_unconfirmed':
+                    text = '操作已登记，但还不能确认审批卡是否送达。请先发「/agent approvals」查看，不要重复提交。'
                 claim = db.execute("UPDATE agent_outbox SET state='sending',message_id=? "
                                    "WHERE sender=? AND channel=? AND delivery=? AND state='watch'", (data['message_id'], *key))
                 if claim.rowcount != 1:

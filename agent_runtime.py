@@ -364,8 +364,7 @@ class AgentRuntime:
         self.export_profile(sender)
         return result
 
-    @staticmethod
-    def _result(db, row, reused=False):
+    def _result(self, db, row, reused=False):
         session = db.execute('SELECT * FROM sessions WHERE id=?', (row['session'],)).fetchone()
         evidence = db.execute('SELECT state,code,created FROM message_evidence WHERE message=? ORDER BY seq DESC LIMIT 1',
                               (row['id'],)).fetchone()
@@ -374,6 +373,11 @@ class AgentRuntime:
                 'reply': row['response'] or '', 'reused': reused,
                 'completion': 'model_turn_completed' if row['state'] == 'done' else row['state'],
                 'evidence': dict(evidence) if evidence else None}
+        covered_task = getattr(self.tasks, 'covered_trash_task', None)
+        if row['state'] == 'done' and callable(covered_task):
+            covered = covered_task(row['id'], row['sender'], row['channel'], row['session'], session['project'], row['text'])
+            if covered:
+                result['approval_card_task'] = covered
         if row['state'] in ('failed', 'uncertain', 'cancelled'):
             saved = db.execute('SELECT details FROM message_diagnostics WHERE message=?', (row['id'],)).fetchone()
             try:

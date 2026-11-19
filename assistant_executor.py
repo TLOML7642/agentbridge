@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socketserver
 import sqlite3
@@ -14,6 +15,38 @@ import urllib.request
 from contextlib import contextmanager
 
 from agent_runtime import AgentError
+
+
+TRASH_TOOLS = frozenset(('computer_trash_file', 'computer_trash_files'))
+
+
+def _only_trash_request(text, tool, arguments):
+    """Recognize only exact, standalone requests. Ambiguity keeps the DS reply."""
+    if not isinstance(text, str) or len(text) > 2048 or not isinstance(arguments, dict):
+        return False
+    try:
+        paths = [arguments['path']] if tool == 'computer_trash_file' else json.loads(arguments['paths'])
+    except (KeyError, ValueError, TypeError):
+        return False
+    if (not isinstance(paths, list) or not 1 <= len(paths) <= 20
+            or any(not isinstance(p, str) or not p or not p.isprintable() or p != p.strip() for p in paths)):
+        return False
+
+    def literal(values):
+        return '(?:' + '|'.join(re.escape(value) for value in values) + ')'
+
+    paths = [p.removeprefix('~/') for p in paths]
+    target = []
+    for index, path in enumerate(paths):
+        full = {path} if path.startswith('/') else {path, '~/' + path}
+        forms = [literal(sorted({value for p in full for value in (p, '`' + p + '`')}))]
+        parent, sep, leaf = path.rpartition('/')
+        if index and sep and leaf and parent == paths[0].rpartition('/')[0]:
+            forms.append('同目录(?:里|下)?的?[ ]*' + literal([leaf, '`' + leaf + '`']))
+        target.append('(?:' + '|'.join(forms) + ')')
+    return re.fullmatch(r'(?:请[ ]*)?(?:帮我[ ]*)?(?:把|将)[ ]*(?:电脑(?:上|里)?(?:的)?[ ]*)?'
+                        + r'[ ]*(?:、|和|以及|与)[ ]*'.join(target)
+                        + r'[ ]*(?:一起[ ]*)?(?:移入|移到|放进)废纸篓[。！!.]?', text.strip()) is not None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -38,6 +71,9 @@ class Executor:
         self.lock, self.capabilities = threading.RLock(), {}
         with self.db() as db:
             db.execute('CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY,digest TEXT,state TEXT,response TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS chat_submissions('
+                       'message TEXT,sender TEXT,channel TEXT,call_id TEXT UNIQUE,tool TEXT,'
+                       'PRIMARY KEY(message,sender,channel,call_id))')
         self.path.chmod(0o600)
         self.socket_path = str(self.root / ('exec-' + secrets.token_hex(4) + '.sock'))
         owner = self
@@ -137,6 +173,9 @@ class Executor:
                             return json.loads(old[2])
                         raise AgentError('EXECUTOR_UNKNOWN', '原电脑动作未确认，须查询原调用，不自动重试')
                     db.execute('INSERT INTO calls VALUES (?,?,?,?)', (identifier, digest, 'calling', ''))
+                    if op == 'submit':
+                        db.execute('INSERT INTO chat_submissions VALUES (?,?,?,?,?)',
+                                   (subject['attempt'], subject['sender'], subject['channel'], identifier, fields['tool']))
             state, result = 'unknown', None
             try:
                 request = urllib.request.Request(self.url, data=body,
@@ -163,6 +202,29 @@ class Executor:
                     with self.db() as db:
                         db.execute('UPDATE calls SET state=?,response=? WHERE id=?',
                                    (state, json.dumps(result, ensure_ascii=False) if result else '', identifier))
+
+    def covered_trash_task(self, message, sender, channel, conversation, project, text):
+        if not self.computer_enabled:
+            return None
+        try:
+            with self.db() as db:
+                rows = db.execute('SELECT s.tool,c.state,c.response FROM chat_submissions s JOIN calls c ON c.id=s.call_id '
+                                  'WHERE s.message=? AND s.sender=? AND s.channel=? LIMIT 2', (message, sender, channel)).fetchall()
+            if len(rows) != 1:
+                return None
+            tool, state, raw = rows[0]
+            if tool not in TRASH_TOOLS or state != 'returned':
+                return None
+            value = json.loads(raw)
+            if (value.get('ok') is not True or value.get('reused') is not False or value.get('state') != 'queued'
+                    or value.get('conversation') != conversation or value.get('project') != project or value.get('tool') != tool
+                    or not re.fullmatch('[a-f0-9]{32}', value.get('task_id', ''))
+                    or not _only_trash_request(text, tool, value.get('arguments'))):
+                return None
+            return {'task_id': value['task_id'], 'tool': tool}
+        except (sqlite3.Error, ValueError, TypeError, AttributeError):
+            # Failure to obtain evidence must not drop a chat reply.
+            return None
 
     def events(self, sender, channel, conversation='', project='', after=0):
         if not conversation or not project:

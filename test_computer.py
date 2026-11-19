@@ -560,6 +560,59 @@ class ComputerPolicy(unittest.TestCase):
 class MobileConfirmation(unittest.TestCase):
     setUp = chat_tests.PluginAgentTests.setUp
 
+    def watch_trash_reply(self, card_state=None, age=0, mixed=False, foreign=False):
+        task, message = 'a'*32, 'b'*32
+        channel = self.event.unified_msg_origin
+        reply = '这是 DS 自己组织的回复。'
+        data = dict(ok=True, message_id=message, state='done', session_id='original', project='assistant', reply=reply,
+                    evidence=dict(created=time.time()-age))
+        if not mixed:
+            data['approval_card_task'] = dict(task_id=task, tool='computer_trash_files')
+        self.stack.enter_context(mock.patch.object(self.plugin, 'AGENT_TASKS', True))
+        self.main._control = mock.AsyncMock(return_value=(200, data))
+        with self.main._agent_db() as db:
+            db.execute("INSERT INTO agent_outbox VALUES (?,?,?,?,'watch',0)", ('owner',channel,'delivery',message))
+            if card_state:
+                event = self.trash_approval_event(['a.txt', 'b.txt'])
+                event.update(task=task, conversation='different' if foreign else 'original', sender='owner', channel=channel)
+                db.execute('INSERT INTO agent_task_outbox VALUES (?,?,?,?,?)', ('card','owner',channel,json.dumps(event),card_state))
+        return reply
+
+    def test_successful_matching_card_covers_one_reply_without_replay(self):
+        self.watch_trash_reply('api_returned')
+        asyncio.run(self.main._agent_tick())
+        restarted = self.plugin.Main(self.main.context)
+        restarted._control = self.main._control
+        restarted._send_notification = self.main._send_notification
+        asyncio.run(restarted._agent_tick())
+        restarted._send_notification.assert_not_awaited()
+        self.main._control.assert_awaited_once()
+        with self.main._agent_db() as db:
+            self.assertEqual(db.execute('SELECT state FROM agent_outbox').fetchone()[0], 'covered_by_approval')
+            self.assertEqual(db.execute('SELECT state FROM agent_task_outbox').fetchone()[0], 'api_returned')
+
+    def test_reply_waits_for_card_but_stays_safe_on_unknown_send(self):
+        self.watch_trash_reply('pending')
+        asyncio.run(self.main._agent_tick())
+        self.main._send_notification.assert_not_awaited()
+        with self.main._agent_db() as db:
+            self.assertEqual(db.execute('SELECT state FROM agent_outbox').fetchone()[0], 'watch')
+            db.execute("UPDATE agent_task_outbox SET state='unknown'")
+        asyncio.run(self.main._agent_tick())
+        asyncio.run(self.main._agent_tick())
+        self.main._send_notification.assert_awaited_once()
+        self.assertIn('还不能确认审批卡是否送达', self.main._send_notification.await_args.args[1])
+
+    def test_other_conversation_card_cannot_cover_reply_after_deadline(self):
+        self.watch_trash_reply('api_returned', age=30, foreign=True)
+        asyncio.run(self.main._agent_tick())
+        self.assertIn('不要重复提交', self.main._send_notification.await_args.args[1])
+
+    def test_mixed_request_keeps_ds_reply_even_with_a_matching_card(self):
+        reply = self.watch_trash_reply('api_returned', mixed=True)
+        asyncio.run(self.main._agent_tick())
+        self.main._send_notification.assert_awaited_once_with(self.event.unified_msg_origin, reply)
+
     def trash_approval_event(self, paths):
         frozen = json.dumps({'source': {'stat': [1, 2, 29]}})
         return dict(task='internal-task', project='assistant', conversation='internal-conversation', kind='approval',
@@ -710,6 +763,74 @@ class MobileConfirmation(unittest.TestCase):
 
 
 class ComputerTransport(unittest.TestCase):
+    def test_only_exact_standalone_trash_requests_can_be_covered(self):
+        from assistant_executor import _only_trash_request
+        single = 'computer_trash_file'
+        batch = 'computer_trash_files'
+        args = dict(paths=json.dumps(['~/Pictures/demo/a.txt', '~/Pictures/demo/b.txt']))
+        self.assertTrue(_only_trash_request('把电脑 ~/Pictures/demo/a.txt 和同目录的 b.txt 一起移入废纸篓。', batch, args))
+        self.assertTrue(_only_trash_request('请把 `Pictures/demo/a.txt` 以及 `~/Pictures/demo/b.txt` 放进废纸篓', batch, args))
+        self.assertTrue(_only_trash_request('帮我把电脑上的 ~/Pictures/demo/a.txt 移到废纸篓。', single, {'path': 'Pictures/demo/a.txt'}))
+        for text in ('上次的任务怎么样？顺便把电脑 ~/Pictures/demo/a.txt 和同目录 b.txt 移入废纸篓。',
+                     '把电脑 ~/Pictures/demo/a.txt 和同目录的 b.txt 一起移入废纸篓。然后说说怎么恢复。',
+                     '把电脑 ~/Pictures/demo/a.txt 和 b.txt 一起移入废纸篓。',
+                     '把电脑 ~/Pictures/demo/a.txt 和同目录的 c.txt 一起移入废纸篓。'):
+            self.assertFalse(_only_trash_request(text, batch, args), text)
+
+    def test_card_hint_uses_the_durable_exact_source_bound_submit_receipt(self):
+        from assistant_executor import Executor
+        with tempfile.TemporaryDirectory(prefix='computer-transport-') as scratch:
+            executor = Executor(Path(scratch).resolve(), 'http://127.0.0.1:12345', 'synthetic-secret',
+                                types.SimpleNamespace(target=lambda _: 'mac'), computer_enabled=True)
+            self.addCleanup(executor.close)
+            subject = dict(sender='owner',channel='private',conversation='original',project='assistant',attempt='turn')
+            tool = 'computer_trash_file'
+            args = dict(path='Pictures/demo/a.txt')
+            fields = dict(call_id='one-call',tool=tool,arguments=args)
+            value = dict(ok=True,reused=False,state='queued',conversation='original',project='assistant',tool=tool,
+                         task_id='a'*32,arguments=args)
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps(value).encode()
+            with mock.patch('assistant_executor.urllib.request.build_opener') as opener:
+                opener.return_value.open.return_value = response
+                self.assertEqual(executor.call(subject, 'submit', fields), value)
+                self.assertEqual(executor.call(subject, 'submit', fields), value)
+                opener.return_value.open.assert_called_once()
+                check = ('turn','owner','private','original','assistant','把电脑 Pictures/demo/a.txt 移入废纸篓。')
+                self.assertEqual(executor.covered_trash_task(*check), dict(tool=tool,task_id='a'*32))
+                for foreign in range(5):
+                    parts = list(check);parts[foreign] = 'wrong'
+                    self.assertIsNone(executor.covered_trash_task(*parts))
+                self.assertIsNone(executor.covered_trash_task(*check[:-1],check[-1]+' 怎么恢复？'))
+                executor.call(subject,'submit',{**fields,'call_id':'another-call'})
+                self.assertIsNone(executor.covered_trash_task(*check))
+
+    def test_completed_chat_status_carries_host_hint_without_rewriting_model_reply(self):
+        from agent_runtime import AgentRuntime
+        with tempfile.TemporaryDirectory(prefix='computer-status-') as scratch:
+            root = Path(scratch).resolve()
+            task = {'task_id': 'a'*32, 'tool': 'computer_trash_file'}
+            broker = types.SimpleNamespace(events=mock.Mock(return_value={'events': []}),
+                                           covered_trash_task=mock.Mock(return_value=task))
+            runtime = AgentRuntime(root/'agent', lambda *_: 'DS 的原回复', lambda _: str(root), tasks=broker)
+            try:
+                text = '把电脑 Pictures/a.txt 移入废纸篓。'
+                queued = runtime.submit('owner', 'private', 'delivery-1', text, 'p')
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    status = runtime.control('owner','private','agent.status','p',message_id=queued['message_id'])
+                    if status['state'] == 'done':
+                        break
+                    time.sleep(.01)
+                self.assertEqual(status['state'], 'done')
+                self.assertEqual(status['reply'], 'DS 的原回复')
+                self.assertEqual(status['approval_card_task'], task)
+                broker.covered_trash_task.assert_called_once_with(queued['message_id'],'owner','private',queued['session_id'],'p',text)
+                with self.assertRaises(AgentError):
+                    runtime.control('other','private','agent.status','p',message_id=queued['message_id'])
+            finally:
+                runtime.close()
+
     def test_native_rpc_preserves_fixed_target_errors_not_untrusted_error_text(self):
         from assistant_executor import Executor
         node = os.environ.get('AGENTBRIDGE_TEST_NATIVE_NODE')
