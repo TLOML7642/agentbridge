@@ -409,12 +409,30 @@ class Main(star.Star):
                 pass
 
     @staticmethod
-    def _task_event_text(event):
+    def _trash_display_path(path):
+        # Keep invisible controls from making a filename look like another line.
+        return path if path.isprintable() and path == path.strip() else ascii(path)
+
+    @classmethod
+    def _task_event_text(cls, event, details=False):
         body = event['body']
         origin = event['conversation'][:8]
         prefix = f"后台任务 {event['task']} @{event['project']}，原会话 {origin}。\n"
         if event['kind'] == 'approval':
             arguments = body['arguments']
+            if not details and body['tool'] in ('computer_trash_file', 'computer_trash_files'):
+                paths = ([arguments['path']] if body['tool'] == 'computer_trash_file'
+                         else json.loads(arguments['paths']))
+                parts = [path.rpartition('/') for path in paths]
+                parent = parts[0][0]
+                if len(paths) > 1 and parent and all(part[0] == parent and part[2] for part in parts):
+                    location = '\n目录：' + cls._trash_display_path(parent)
+                    names = [part[2] for part in parts]
+                else:
+                    location, names = '', paths
+                return (f'把这 {len(paths)} 个文件移入废纸篓？' + location
+                        + ''.join('\n· ' + cls._trash_display_path(name) for name in names)
+                        + '\n回复「同意」或「拒绝」。')
             visible = {key: value for key, value in arguments.items() if key not in ('text', 'binding')}
             if 'text' in arguments:
                 visible['text_bytes'] = len(arguments['text'].encode())
@@ -462,20 +480,24 @@ class Main(star.Star):
             return '未能确认 PyCharm 已发起运行，请检查项目窗口、当前运行配置及 macOS 自动化/辅助功能权限。没有自动重试。'
         if result.get('evidence') == 'new_image_copy_original_unchanged':
             return '图片副本已生成，原图保持不变。\n' + str(result.get('path', ''))
+        if state == 'process-ended' and result.get('evidence') == 'trash_no_move_host_reconciled':
+            return '已核对：那次操作没有移动文件，也没有自动重试。'
         if state == 'uncertain' and result.get('evidence') == 'trash_stopped_with_progress':
             def show(paths):
-                return json.dumps(paths, ensure_ascii=False)
-            return (prefix + '废纸篓操作已停止，不会自动重试；执行通道已隔离。'
+                return '\n' + '\n'.join('· ' + cls._trash_display_path(path) for path in paths) if paths else '无'
+            return ((prefix if details else '') + '操作已停止，不会自动重试；暂不能执行新的电脑动作。'
                     + '\n已核对移入废纸篓：' + show(result['moved'])
-                    + '\n需要核查：' + show(result['needs_check'])
+                    + '\n需要核查：' + cls._trash_display_path(result['needs_check'])
                     + '\n本次未尝试：' + show(result['not_attempted']))
-        restore_note = ('\n恢复时请手动移回原位置，不依赖 Finder 的“放回原处”。'
-                        if result.get('staged_for_system_trash') is True else '')
-        if result.get('evidence') == 'moved_to_trash_content_verified':
-            return '文件已移入废纸篓，内容校验通过，没有永久删除。\n' + str(result.get('path', '')) + restore_note
-        if result.get('evidence') == 'batch_moved_to_trash_content_verified':
-            return ('已将清单中的 ' + str(result.get('count', 0))
-                    + ' 个文件移入废纸篓，内容校验通过，没有永久删除。' + restore_note)
+        if state == 'verified' and result.get('evidence') in ('moved_to_trash_content_verified', 'batch_moved_to_trash_content_verified'):
+            count = result.get('count') if result['evidence'] == 'batch_moved_to_trash_content_verified' else 1
+            text = f'这 {count} 个文件已移入废纸篓。'
+            if details:
+                files = result.get('files', [result])
+                text += ''.join('\n· ' + cls._trash_display_path(item['path']) for item in files if item.get('path'))
+                if result.get('staged_for_system_trash') is True:
+                    text += '\n如需恢复，请从废纸篓手动移回原位置。'
+            return text
         description = descriptions.get(state, state)
         if state == 'denied':
             description = {'user_denied': '用户主动拒绝，未进入实际动作',
@@ -507,7 +529,7 @@ class Main(star.Star):
                 return True
             return False
         if len(pending) != 1:
-            await self._agent_local(event, '现在有多项操作待确认，请按对应提示的审批编号选择，不会猜测你同意哪一项。')
+            await self._agent_local(event, '有多项操作待确认，这次没有执行。发「/agent approvals」查看并选择。')
             return True
         approval = pending[0]
         prompt = shown.get(approval.get('approval_id'))
@@ -541,7 +563,10 @@ class Main(star.Star):
         status, result = await self._control(event, {'op': 'agent.computer.allow' if remember else 'agent.approve' if allow else 'agent.deny',
             'approval_id': approval['approval_id'], 'delivery_id': delivery})
         if status == 200 and result.get('ok') is True:
-            await self._agent_local(event, '已同意本次操作，等待执行结果。' if allow else '已拒绝本次操作。')
+            if approval.get('tool') in ('computer_trash_file', 'computer_trash_files'):
+                await self._agent_local(event, '收到，等执行结果。' if allow else '好，不移动。')
+            else:
+                await self._agent_local(event, '已同意本次操作，等待执行结果。' if allow else '已拒绝本次操作。')
         else:
             await self._agent_local(event, '确认未成功，操作可能已处理或过期；没有新增或重试任务。')
         return True
@@ -779,16 +804,18 @@ class Main(star.Star):
                     reply = '\n'.join(f"{item['task_id']} {item['state']} @{item['project']}" for item in data['tasks']) or '当前会话没有后台任务。'
                 elif data.get('approvals') is not None:
                     reply = '\n'.join(f"{item['approval_id']} {item['state']} {item['tool']}" for item in data['approvals']) or '当前会话没有工具审批。'
+                    if data['approvals']:
+                        reply += '\n查看某项清单：/agent approvals <审批编号>'
                 elif data.get('approval_id'):
                     reply = self._task_event_text({'task': data['subject']['attempt'], 'project': data['subject']['project'],
-                                                  'conversation': data['subject']['conversation'], 'kind': 'approval', 'body': data})
+                                                  'conversation': data['subject']['conversation'], 'kind': 'approval', 'body': data}, details=True)
                     if data['state'] != 'pending':
                         reply = f"审批 {data['approval_id']}：{data['state']}，仅限该动作；执行结果请查 /agent tasks {data['subject']['attempt']}。"
                 elif data.get('task_id'):
                     kind = ('cancel-request' if parts[:2] == ['/agent', 'task-cancel']
                             and status == 200 and data.get('ok') is True else 'snapshot')
                     reply = self._task_event_text({'task': data['task_id'], 'project': data['project'],
-                                                  'conversation': data['conversation'], 'kind': kind, 'body': data})
+                                                  'conversation': data['conversation'], 'kind': kind, 'body': data}, details=True)
                 elif data.get('personality') is not None and data.get('preferences') is None:
                     reply = data.get('display') or data['personality']['display']
                     if data.get('message'):

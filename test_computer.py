@@ -560,6 +560,64 @@ class ComputerPolicy(unittest.TestCase):
 class MobileConfirmation(unittest.TestCase):
     setUp = chat_tests.PluginAgentTests.setUp
 
+    def trash_approval_event(self, paths):
+        frozen = json.dumps({'source': {'stat': [1, 2, 29]}})
+        return dict(task='internal-task', project='assistant', conversation='internal-conversation', kind='approval',
+                    body=dict(tool='computer_trash_files', approval_id='a'*32, digest='internal-digest',
+                              state='pending', arguments=dict(paths=json.dumps(paths), binding=json.dumps({
+                                  'items': [{'path': path, 'binding': frozen} for path in paths]}))))
+
+    def test_trash_approval_default_is_exact_file_scope_and_a_short_decision(self):
+        event = self.trash_approval_event(['~/Pictures/demo/a.txt', '~/Pictures/demo/b.txt'])
+        original = json.dumps(event)
+        self.assertEqual(self.main._task_event_text(event),
+                         '把这 2 个文件移入废纸篓？\n目录：~/Pictures/demo\n· a.txt\n· b.txt\n回复「同意」或「拒绝」。')
+        detail = self.main._task_event_text(event, details=True)
+        for field in ('~/Pictures/demo/a.txt', '~/Pictures/demo/b.txt', '58 字节', '四分钟',
+                      '/agent approve ' + 'a'*32, '/agent deny ' + 'a'*32):
+            self.assertIn(field, detail)
+        self.assertEqual(json.dumps(event), original)
+
+    def test_paths_in_different_directories_or_with_controls_stay_unambiguous(self):
+        event = self.trash_approval_event(['folder-one/same.txt', 'folder-two/same.txt', 'folder-one/a\n\u202eb.txt'])
+        compact = self.main._task_event_text(event)
+        self.assertIn('· folder-one/same.txt\n· folder-two/same.txt', compact)
+        self.assertIn(r"folder-one/a\n\u202eb.txt", compact)
+        self.assertNotIn('\u202e', compact)
+        self.assertNotIn('目录：', compact)
+
+    def test_explicit_approval_lookup_shows_commands_but_cannot_approve(self):
+        event = self.trash_approval_event(['~/Pictures/demo/a.txt', '~/Pictures/demo/b.txt'])
+        approval = {**event['body'], 'ok': True, 'subject': dict(attempt=event['task'], project=event['project'],
+                                                               conversation=event['conversation'])}
+        self.main._control = mock.AsyncMock(return_value=(200, approval))
+        self.main._request = mock.AsyncMock()
+        self.event.get_message_str = lambda: '/agent approvals ' + approval['approval_id']
+        asyncio.run(self.main.agent_message(self.event))
+        self.assertEqual(self.main._control.await_count, 1)
+        self.assertEqual(self.main._control.await_args.args[1],
+                         {'op': 'agent.approvals', 'approval_id': approval['approval_id']})
+        self.main._request.assert_not_awaited()
+        self.assertIn('/agent approve ' + approval['approval_id'], self.main._send_notification.await_args.args[1])
+
+    def test_trash_success_is_one_sentence_but_details_show_recovery(self):
+        result = dict(evidence='batch_moved_to_trash_content_verified', count=2, staged_for_system_trash=True,
+                      files=[dict(path='/synthetic/a'), dict(path='/synthetic/b')])
+        event = dict(task='synthetic-task', conversation='original', project='assistant', kind='terminal',
+                     body=dict(state='verified', result=result))
+        self.assertEqual(self.main._task_event_text(event), '这 2 个文件已移入废纸篓。')
+        detail = self.main._task_event_text(event, details=True)
+        self.assertIn('/synthetic/a', detail)
+        self.assertIn('/synthetic/b', detail)
+        self.assertIn('手动移回原位置', detail)
+        event['body']['state'] = 'process-ended'
+        self.assertNotIn('已移入废纸篓', self.main._task_event_text(event))
+
+    def test_reconciled_no_move_is_not_described_as_unknown(self):
+        event = dict(task='synthetic-task', conversation='original', project='assistant', kind='snapshot',
+                     body=dict(state='process-ended', result=dict(evidence='trash_no_move_host_reconciled', exit_code=1)))
+        self.assertEqual(self.main._task_event_text(event), '已核对：那次操作没有移动文件，也没有自动重试。')
+
     def test_trash_partial_progress_must_match_the_exact_approved_order(self):
         paths = ['one.txt', 'two.txt', 'three.txt']
         args = json.dumps({'paths': json.dumps(paths)})
@@ -573,9 +631,9 @@ class MobileConfirmation(unittest.TestCase):
         event = dict(task='synthetic-task', conversation='original', project='assistant', kind='terminal',
                      body=dict(state='uncertain', result=result))
         text = self.main._task_event_text(event)
-        self.assertIn('已核对移入废纸篓：["one.txt"]', text)
-        self.assertIn('需要核查："two.txt"', text)
-        self.assertIn('本次未尝试：["three.txt"]', text)
+        self.assertIn('已核对移入废纸篓：\n· one.txt', text)
+        self.assertIn('需要核查：two.txt', text)
+        self.assertIn('本次未尝试：\n· three.txt', text)
         self.assertIn('不会自动重试', text)
 
     def test_pycharm_popup_reason_does_not_claim_project_process_completed(self):
@@ -593,7 +651,7 @@ class MobileConfirmation(unittest.TestCase):
         subject = {'sender': 'owner', 'channel': self.event.unified_msg_origin,
                    'conversation': 'original', 'project': 'assistant', 'attempt': 'task-one'}
         approval = dict(approval_id='a' * 32, state='pending', subject=subject, expires=expires,
-                        digest='fixed-digest', arguments={'path': 'Pictures/unused.png', 'binding': 'frozen'})
+                        tool='computer_trash_file', digest='fixed-digest', arguments={'path': 'Pictures/unused.png', 'binding': 'frozen'})
         event = dict(id='event-one', task='task-one', kind='approval', conversation='original', project='assistant',
                      sender='owner', channel=self.event.unified_msg_origin, body={**approval, 'tool': 'computer_trash_file'})
         with self.main._agent_db() as db:
@@ -614,7 +672,7 @@ class MobileConfirmation(unittest.TestCase):
         self.assertEqual(payload['op'], 'agent.approve')
         self.assertEqual(payload['approval_id'], approval['approval_id'])
         self.main._request.assert_not_awaited()
-        self.assertIn('等待执行结果', self.main._send_notification.await_args.args[1])
+        self.assertEqual(self.main._send_notification.await_args.args[1], '收到，等执行结果。')
 
     def test_ambiguous_unshown_or_unknown_delivery_never_grants(self):
         self.prompt(state='unknown')
@@ -629,6 +687,7 @@ class MobileConfirmation(unittest.TestCase):
         self.assertEqual(self.main._control.await_count, 1)
         self.main._request.assert_not_awaited()
         self.assertIn('多项', self.main._send_notification.await_args.args[1])
+        self.assertIn('/agent approvals', self.main._send_notification.await_args.args[1])
 
     def test_changed_or_foreign_prompt_cannot_be_approved(self):
         self.prompt()
